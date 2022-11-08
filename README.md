@@ -29,7 +29,6 @@ The following is key values in the TOML configuration file.
 * `agent_id`: a unique identifier for the agent on the host where the agent is
   running.
 
-
 Example
 
 ```toml
