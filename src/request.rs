@@ -79,8 +79,7 @@ async fn connect(
     server_name: &str,
     agent_id: &str,
 ) -> Result<()> {
-    let conn = endpoint.connect(server_address, server_name)?.await?;
-    let connection = conn.connection;
+    let connection = endpoint.connect(server_address, server_name)?.await?;
 
     handshake(&connection, agent_id, REVIEW_PROTOCOL_VERSION)
         .await
