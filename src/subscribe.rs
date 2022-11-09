@@ -108,7 +108,7 @@ async fn connect(
     version: &str,
 ) -> Result<()> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
-    let (mut send, mut recv) = conn.connection.open_bi().await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
 
     if let Err(e) = client_handshake(version, &mut send, &mut recv).await {
         error!("Giganto handshake failed: {:#}", e);

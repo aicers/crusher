@@ -34,7 +34,7 @@ pub fn config_client(
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
 
     let mut config = ClientConfig::new(Arc::new(tls_config));
-    config.transport = Arc::new(transport);
+    config.transport_config(Arc::new(transport));
 
     let mut endpoint =
         quinn::Endpoint::client("[::]:0".parse().expect("Failed to parse Endpoint addr"))
