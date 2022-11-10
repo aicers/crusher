@@ -1,13 +1,19 @@
 use crate::client::{config_client, SERVER_RETRY_INTERVAL};
 use anyhow::{bail, Result};
+use chrono::{TimeZone, Utc};
 use quinn::{ConnectionError, Endpoint, RecvStream, SendStream};
 use rustls::{Certificate, PrivateKey};
-use std::{net::SocketAddr, process::exit};
+use std::{mem, net::SocketAddr, process::exit};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
 const INGESTION_PROTOCOL_VERSION: &str = "0.4.0";
 const PUBLISH_PROTOCOL_VERSION: &str = "0.4.0";
+
+const NETWORK_STREAM_CONN: u32 = 0x00; // temporary use `conn` because request msg not implemented from `review`
+                                       // const NETWORK_STREAM_DNS: u32 = 0x01;
+                                       // const NETWORK_STREAM_RDP: u32 = 0x02;
+                                       // const NETWORK_STREAM_HTTP: u32 = 0x03;
 
 #[derive(Debug, Clone, Copy)]
 enum ServerType {
@@ -101,7 +107,7 @@ async fn connection_control(
 }
 
 async fn connect(
-    _server_type: ServerType,
+    server_type: ServerType,
     endpoint: &Endpoint,
     server_address: SocketAddr,
     server_name: &str,
@@ -116,6 +122,29 @@ async fn connect(
     }
 
     info!("Connection established to server {}", server_address);
+    match server_type {
+        ServerType::Publish => {
+            // temporary using msg because request msg not implemented from `review`
+            let tmp_msg_code = NETWORK_STREAM_CONN;
+            let tmp_source = "einsis";
+            let tmp_start = Utc.ymd(2022, 10, 10).and_hms(0, 0, 0).timestamp_nanos();
+
+            request_network_stream(&mut send, tmp_msg_code, tmp_source, tmp_start).await?;
+            tokio::spawn(async move {
+                if let Ok(mut recv) = conn.accept_uni().await {
+                    loop {
+                        match recv_network_stream(&mut recv).await {
+                            Ok(_) => {}
+                            Err(e) => error!("recv stream error: {:?}", e),
+                        }
+                    }
+                }
+            })
+            .await?;
+        }
+        ServerType::Ingestion => {}
+    }
+
     Ok(())
 }
 
@@ -145,8 +174,46 @@ async fn client_handshake(
         .unwrap()
         .is_none()
     {
-        bail!("Incompitable version");
+        bail!("Incompatible version");
     }
+
+    Ok(())
+}
+
+async fn request_network_stream(
+    send: &mut SendStream,
+    msg_code: u32,
+    source: &str,
+    start: i64,
+) -> Result<()> {
+    let mut req_data: Vec<u8> = Vec::new();
+    req_data.extend(msg_code.to_le_bytes());
+
+    let mut request_msg = bincode::serialize(&(source.to_string(), start))?;
+    let frame_len: u32 = request_msg.len().try_into()?;
+    req_data.extend(frame_len.to_le_bytes());
+    req_data.append(&mut request_msg);
+
+    send.write_all(&req_data).await?;
+
+    Ok(())
+}
+
+async fn recv_network_stream(recv: &mut RecvStream) -> Result<()> {
+    let mut ts_buf = [0; mem::size_of::<u64>()];
+    let mut len_buf = [0; mem::size_of::<u32>()];
+    let mut body_buf: Vec<u8> = Vec::new();
+
+    recv.read_exact(&mut ts_buf).await?;
+    let timestamp = i64::from_le_bytes(ts_buf);
+
+    recv.read_exact(&mut len_buf).await?;
+
+    let len: usize = u32::from_le_bytes(len_buf).try_into()?;
+    body_buf.resize(len, 0);
+    recv.read_exact(body_buf.as_mut_slice()).await?;
+
+    info!("timestamp: {}, event_data: {:?}", timestamp, body_buf);
 
     Ok(())
 }
