@@ -1,9 +1,15 @@
 use crate::client::{config_client, SERVER_RETRY_INTERVAL};
 use anyhow::{bail, Result};
 use chrono::{TimeZone, Utc};
+use num_enum::TryFromPrimitive;
 use quinn::{ConnectionError, Endpoint, RecvStream, SendStream};
 use rustls::{Certificate, PrivateKey};
-use std::{mem, net::SocketAddr, process::exit};
+use serde::{Deserialize, Serialize};
+use std::{
+    mem,
+    net::{IpAddr, SocketAddr},
+    process::exit,
+};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
@@ -19,6 +25,62 @@ const NETWORK_STREAM_CONN: u32 = 0x00; // temporary use `conn` because request m
 enum ServerType {
     Ingestion,
     Publish,
+}
+
+#[derive(Debug, PartialEq, Eq, TryFromPrimitive)]
+#[repr(u32)]
+enum MessageCode {
+    Conn = 0,
+    Dns = 1,
+    Rdp = 2,
+    Http = 3,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Conn {
+    orig_addr: IpAddr,
+    resp_addr: IpAddr,
+    orig_port: u16,
+    resp_port: u16,
+    proto: u8,
+    duration: i64,
+    orig_bytes: u64,
+    resp_bytes: u64,
+    orig_pkts: u64,
+    resp_pkts: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DnsConn {
+    orig_addr: IpAddr,
+    resp_addr: IpAddr,
+    orig_port: u16,
+    resp_port: u16,
+    proto: u8,
+    query: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RdpConn {
+    orig_addr: IpAddr,
+    resp_addr: IpAddr,
+    orig_port: u16,
+    resp_port: u16,
+    cookie: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HttpConn {
+    orig_addr: IpAddr,
+    resp_addr: IpAddr,
+    orig_port: u16,
+    resp_port: u16,
+    method: String,
+    host: String,
+    uri: String,
+    referrer: String,
+    user_agent: String,
+    status_code: u16,
 }
 
 pub struct Client {
@@ -125,7 +187,7 @@ async fn connect(
     match server_type {
         ServerType::Publish => {
             // temporary using msg because request msg not implemented from `review`
-            let tmp_msg_code = NETWORK_STREAM_CONN;
+            let tmp_msg_code: u32 = NETWORK_STREAM_CONN;
             let tmp_source = "einsis";
             let tmp_start = Utc.ymd(2022, 10, 10).and_hms(0, 0, 0).timestamp_nanos();
 
@@ -134,8 +196,43 @@ async fn connect(
                 if let Ok(mut recv) = conn.accept_uni().await {
                     loop {
                         match recv_network_stream(&mut recv).await {
-                            Ok(_) => {}
-                            Err(e) => error!("recv stream error: {:?}", e),
+                            Ok((timestamp, raw_event)) => {
+                                match MessageCode::try_from(tmp_msg_code) {
+                                    Ok(MessageCode::Conn) => {
+                                        info!(
+                                            "Msg: Conn, timestamp: {}, body: {:?}",
+                                            Utc.timestamp_nanos(timestamp),
+                                            bincode::deserialize::<Conn>(&raw_event)
+                                        );
+                                    }
+                                    Ok(MessageCode::Dns) => {
+                                        info!(
+                                            "Msg: Dns, timestamp: {}, body: {:?}",
+                                            Utc.timestamp_nanos(timestamp),
+                                            bincode::deserialize::<DnsConn>(&raw_event)
+                                        );
+                                    }
+                                    Ok(MessageCode::Rdp) => {
+                                        info!(
+                                            "Msg: Rdp, timestamp: {}, body: {:?}",
+                                            Utc.timestamp_nanos(timestamp),
+                                            bincode::deserialize::<RdpConn>(&raw_event)
+                                        );
+                                    }
+                                    Ok(MessageCode::Http) => {
+                                        info!(
+                                            "Msg: Http, timestamp: {}, body: {:?}",
+                                            Utc.timestamp_nanos(timestamp),
+                                            bincode::deserialize::<HttpConn>(&raw_event)
+                                        );
+                                    }
+                                    Err(_) => error!("unknown message code"),
+                                }
+                            }
+                            Err(e) => {
+                                error!("recv stream error: {:?}", e);
+                                break;
+                            }
                         }
                     }
                 }
@@ -199,7 +296,7 @@ async fn request_network_stream(
     Ok(())
 }
 
-async fn recv_network_stream(recv: &mut RecvStream) -> Result<()> {
+async fn recv_network_stream(recv: &mut RecvStream) -> Result<(i64, Vec<u8>)> {
     let mut ts_buf = [0; mem::size_of::<u64>()];
     let mut len_buf = [0; mem::size_of::<u32>()];
     let mut body_buf: Vec<u8> = Vec::new();
@@ -213,7 +310,5 @@ async fn recv_network_stream(recv: &mut RecvStream) -> Result<()> {
     body_buf.resize(len, 0);
     recv.read_exact(body_buf.as_mut_slice()).await?;
 
-    info!("timestamp: {}, event_data: {:?}", timestamp, body_buf);
-
-    Ok(())
+    Ok((timestamp, body_buf))
 }
