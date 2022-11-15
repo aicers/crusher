@@ -1,4 +1,5 @@
 mod client;
+mod model;
 mod request;
 mod settings;
 mod subscribe;
