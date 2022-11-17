@@ -226,6 +226,7 @@ dependencies = [
  "chrono",
  "config",
  "directories",
+ "lazy_static",
  "num-traits",
  "num_enum",
  "oinq",

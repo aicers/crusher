@@ -1,6 +1,6 @@
 use super::subscribe::{Event, MessageCode};
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
 use num_enum::IntoPrimitive;
 use num_traits::ToPrimitive;
 use std::net::IpAddr;
@@ -29,7 +29,6 @@ pub enum Period {
 pub(crate) struct Model {
     id: String,
     kind: MessageCode,
-    start: DateTime<Utc>,
     interval: Interval,
     period: Period,
     offset: i32,
@@ -64,7 +63,6 @@ pub(crate) fn test_conn_model() -> (Model, TimeSeries) {
         Model {
             id: "0".to_string(),
             kind: MessageCode::Conn,
-            start: Utc::now(),
             interval: Interval::FifteenMinutes,
             period: Period::OneDay,
             offset: 32_400,
@@ -73,7 +71,7 @@ pub(crate) fn test_conn_model() -> (Model, TimeSeries) {
             node: None,
             sum_column: None,
         },
-        TimeSeries::new("0".to_string(), Utc::now(), 96),
+        TimeSeries::new("0".to_string(), Utc.ymd(2022, 11, 17).and_hms(0, 0, 0), 96),
     )
 }
 
