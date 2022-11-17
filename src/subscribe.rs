@@ -5,7 +5,7 @@ use super::model::time_series;
 use crate::client::{config_client, SERVER_RETRY_INTERVAL};
 use anyhow::{bail, Error, Result};
 use chrono::{TimeZone, Utc};
-use num_enum::TryFromPrimitive;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 use num_traits::ToPrimitive;
 use quinn::{ConnectionError, Endpoint, RecvStream, SendStream};
 use rustls::{Certificate, PrivateKey};
@@ -20,11 +20,7 @@ use tracing::{error, info};
 
 const INGESTION_PROTOCOL_VERSION: &str = "0.4.0";
 const PUBLISH_PROTOCOL_VERSION: &str = "0.4.0";
-
-const NETWORK_STREAM_CONN: u32 = 0x00; // temporary use `conn` because request msg not implemented from `review`
-                                       // const NETWORK_STREAM_DNS: u32 = 0x01;
-                                       // const NETWORK_STREAM_RDP: u32 = 0x02;
-                                       // const NETWORK_STREAM_HTTP: u32 = 0x03;
+const CRUSHER_CODE: u8 = 0x01;
 
 #[derive(Debug, Clone, Copy)]
 enum ServerType {
@@ -32,7 +28,7 @@ enum ServerType {
     Publish,
 }
 
-#[derive(Debug, PartialEq, Eq, TryFromPrimitive)]
+#[derive(Debug, PartialEq, Eq, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
 #[repr(u32)]
 pub(crate) enum MessageCode {
     Conn = 0,
@@ -235,91 +231,81 @@ async fn connect(
     info!("Connection established to server {}", server_address);
     match server_type {
         ServerType::Publish => {
-            // temporary using msg because request msg not implemented from `review`
-            let tmp_msg_code: u32 = NETWORK_STREAM_CONN;
-            let tmp_source = "einsis";
-
             // TODO: Read the recently saved time of period and send it to giganto (issue #13)
-            let tmp_start = Utc.ymd(2022, 10, 10).and_hms(0, 0, 0).timestamp_nanos();
+            let tmp_start = Utc.ymd(2022, 11, 10).and_hms(0, 0, 0).timestamp_nanos();
 
             // TODO: `models` should be transferred from `review` and `series` should be initialized accordingly (issue #14)
             let (model, mut series) = super::model::test_conn_model();
 
             // TODO: Establish the channel by model (issue #15)
-            request_network_stream(&mut send, tmp_msg_code, tmp_source, tmp_start).await?;
+            request_network_stream(
+                &mut send,
+                model.kind.into(),
+                tmp_start,
+                &model.id,
+                model.src_ip,
+                model.dst_ip,
+                model.node.clone(),
+            )
+            .await?;
             tokio::spawn(async move {
                 if let Ok(mut recv) = conn.accept_uni().await {
                     loop {
                         match recv_network_stream(&mut recv).await {
-                            Ok((timestamp, raw_event)) => {
-                                match MessageCode::try_from(tmp_msg_code) {
-                                    Ok(MessageCode::Conn) => {
-                                        let (time, Ok(event)) = (
+                            Ok((timestamp, raw_event)) => match model.kind {
+                                MessageCode::Conn => {
+                                    let (time, Ok(event)) = (
                                             Utc.timestamp_nanos(timestamp),
                                             bincode::deserialize::<Conn>(&raw_event),
                                         ) else {
                                             continue;
                                         };
-                                        if let Err(e) = time_series(
-                                            &model,
-                                            &mut series,
-                                            time,
-                                            &Event::Conn(event),
-                                        ) {
-                                            error_in_ts(&e);
-                                        }
+                                    if let Err(e) =
+                                        time_series(&model, &mut series, time, &Event::Conn(event))
+                                    {
+                                        error_in_ts(&e);
                                     }
-                                    Ok(MessageCode::Dns) => {
-                                        let (time, Ok(event)) = (
+                                }
+                                MessageCode::Dns => {
+                                    let (time, Ok(event)) = (
                                             Utc.timestamp_nanos(timestamp),
                                             bincode::deserialize::<DnsConn>(&raw_event),
                                         ) else {
                                             continue;
                                         };
-                                        if let Err(e) = time_series(
-                                            &model,
-                                            &mut series,
-                                            time,
-                                            &Event::Dns(event),
-                                        ) {
-                                            error_in_ts(&e);
-                                        }
+                                    if let Err(e) =
+                                        time_series(&model, &mut series, time, &Event::Dns(event))
+                                    {
+                                        error_in_ts(&e);
                                     }
-                                    Ok(MessageCode::Rdp) => {
-                                        let (time, Ok(event)) = (
+                                }
+                                MessageCode::Rdp => {
+                                    let (time, Ok(event)) = (
                                             Utc.timestamp_nanos(timestamp),
                                             bincode::deserialize::<RdpConn>(&raw_event),
                                         ) else {
                                             continue;
                                         };
-                                        if let Err(e) = time_series(
-                                            &model,
-                                            &mut series,
-                                            time,
-                                            &Event::Rdp(event),
-                                        ) {
-                                            error_in_ts(&e);
-                                        }
+                                    if let Err(e) =
+                                        time_series(&model, &mut series, time, &Event::Rdp(event))
+                                    {
+                                        error_in_ts(&e);
                                     }
-                                    Ok(MessageCode::Http) => {
-                                        let (time, Ok(event)) = (
+                                }
+                                MessageCode::Http => {
+                                    let (time, Ok(event)) = (
                                             Utc.timestamp_nanos(timestamp),
                                             bincode::deserialize::<HttpConn>(&raw_event),
                                         ) else {
                                             continue;
                                         };
-                                        if let Err(e) = time_series(
-                                            &model,
-                                            &mut series,
-                                            time,
-                                            &Event::Http(event),
-                                        ) {
-                                            error_in_ts(&e);
-                                        }
+                                    if let Err(e) =
+                                        time_series(&model, &mut series, time, &Event::Http(event))
+                                    {
+                                        error_in_ts(&e);
                                     }
-                                    Err(_) => error!("unknown message code"),
                                 }
-                            }
+                            },
                             Err(e) => {
                                 error!("recv stream error: {:?}", e);
                                 break;
@@ -375,14 +361,19 @@ async fn client_handshake(
 
 async fn request_network_stream(
     send: &mut SendStream,
-    msg_code: u32,
-    source: &str,
+    protocol: u32,
     start: i64,
+    model_id: &str,
+    src_ip: Option<IpAddr>,
+    dst_ip: Option<IpAddr>,
+    node_id: Option<String>,
 ) -> Result<()> {
     let mut req_data: Vec<u8> = Vec::new();
-    req_data.extend(msg_code.to_le_bytes());
+    req_data.extend(CRUSHER_CODE.to_le_bytes());
+    req_data.extend(protocol.to_le_bytes());
 
-    let mut request_msg = bincode::serialize(&(source.to_string(), start))?;
+    let mut request_msg =
+        bincode::serialize(&(start, model_id.to_string(), src_ip, dst_ip, node_id))?;
     let frame_len: u32 = request_msg.len().try_into()?;
     req_data.extend(frame_len.to_le_bytes());
     req_data.append(&mut request_msg);
