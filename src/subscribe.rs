@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use super::model::time_series;
 use crate::client::{config_client, SERVER_RETRY_INTERVAL};
 use anyhow::{bail, Error, Result};
