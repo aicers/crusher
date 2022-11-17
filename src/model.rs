@@ -27,14 +27,14 @@ pub enum Period {
 
 #[allow(dead_code)] // TODO: Since this is in temporary use, remove it later.
 pub(crate) struct Model {
-    id: String,
-    kind: MessageCode,
+    pub id: String,
+    pub kind: MessageCode,
     interval: Interval,
     period: Period,
     offset: i32,
-    src_ip: Option<IpAddr>,
-    dst_ip: Option<IpAddr>,
-    node: Option<String>,
+    pub src_ip: Option<IpAddr>,
+    pub dst_ip: Option<IpAddr>,
+    pub node: Option<String>,
     sum_column: Option<usize>,
 }
 
@@ -68,7 +68,7 @@ pub(crate) fn test_conn_model() -> (Model, TimeSeries) {
             offset: 32_400,
             src_ip: None,
             dst_ip: None,
-            node: None,
+            node: Some("einsis".to_string()),
             sum_column: None,
         },
         TimeSeries::new("0".to_string(), Utc.ymd(2022, 11, 17).and_hms(0, 0, 0), 96),
