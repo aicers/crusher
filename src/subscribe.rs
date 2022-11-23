@@ -2,12 +2,17 @@
 mod tests;
 
 use super::model::time_series;
-use crate::client::{config_client, SERVER_RETRY_INTERVAL};
+use crate::{
+    client::{config_client, SERVER_RETRY_INTERVAL},
+    model::{convert_policy, Policy, TimeSeries},
+    request::{RequestedKind, RequestedPolicy},
+};
 use anyhow::{bail, Error, Result};
+use async_channel::Receiver;
 use chrono::{TimeZone, Utc};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use num_traits::ToPrimitive;
-use quinn::{ConnectionError, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream};
 use rustls::{Certificate, PrivateKey};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,10 +20,13 @@ use std::{
     net::{IpAddr, SocketAddr},
     process::exit,
 };
-use tokio::time::{sleep, Duration};
+use tokio::{
+    task,
+    time::{sleep, Duration},
+};
 use tracing::{error, info};
 
-const INGESTION_PROTOCOL_VERSION: &str = "0.4.0";
+const INGESTION_PROTOCOL_VERSION: &str = "0.5.0";
 const PUBLISH_PROTOCOL_VERSION: &str = "0.4.0";
 const CRUSHER_CODE: u8 = 0x01;
 
@@ -28,13 +36,24 @@ enum ServerType {
     Publish,
 }
 
-#[derive(Debug, PartialEq, Eq, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, TryFromPrimitive, IntoPrimitive, Clone, Copy, Deserialize)]
 #[repr(u32)]
-pub(crate) enum MessageCode {
+pub(crate) enum Kind {
     Conn = 0,
     Dns = 1,
     Rdp = 2,
     Http = 3,
+}
+
+impl From<RequestedKind> for Kind {
+    fn from(k: RequestedKind) -> Self {
+        match k {
+            RequestedKind::Conn => Self::Conn,
+            RequestedKind::Dns => Self::Dns,
+            RequestedKind::Http => Self::Http,
+            RequestedKind::Rdp => Self::Rdp,
+        }
+    }
 }
 
 pub(crate) enum Event {
@@ -132,6 +151,7 @@ pub struct Client {
     publish_addr: SocketAddr,
     server_name: String,
     endpoint: Endpoint,
+    request_recv: Receiver<RequestedPolicy>,
 }
 
 impl Client {
@@ -142,6 +162,7 @@ impl Client {
         certs: Vec<Certificate>,
         key: PrivateKey,
         files: Vec<Vec<u8>>,
+        request_recv: Receiver<RequestedPolicy>,
     ) -> Self {
         let endpoint = config_client(certs, key, files)
             .expect("server configuration error with cert, key or root");
@@ -150,6 +171,7 @@ impl Client {
             publish_addr,
             server_name,
             endpoint,
+            request_recv,
         }
     }
 
@@ -158,16 +180,18 @@ impl Client {
             connection_control(
                 ServerType::Ingestion,
                 self.ingestion_addr,
-                self.server_name.clone(),
-                self.endpoint.clone(),
+                &self.server_name,
+                &self.endpoint,
                 INGESTION_PROTOCOL_VERSION,
+                &self.request_recv,
             ),
             connection_control(
                 ServerType::Publish,
                 self.publish_addr,
-                self.server_name,
-                self.endpoint,
+                &self.server_name,
+                &self.endpoint,
                 PUBLISH_PROTOCOL_VERSION,
+                &self.request_recv,
             )
         ) {
             error!("giganto connection error occur : {}", e);
@@ -178,12 +202,22 @@ impl Client {
 async fn connection_control(
     server_type: ServerType,
     server_addr: SocketAddr,
-    server_name: String,
-    endpoint: Endpoint,
+    server_name: &str,
+    endpoint: &Endpoint,
     version: &str,
+    request_recv: &Receiver<RequestedPolicy>,
 ) -> Result<()> {
     loop {
-        match connect(server_type, &endpoint, server_addr, &server_name, version).await {
+        match connect(
+            server_type,
+            endpoint,
+            server_addr,
+            server_name,
+            version,
+            request_recv,
+        )
+        .await
+        {
             Ok(_) => return Ok(()),
             Err(e) => {
                 if let Some(e) = e.downcast_ref::<ConnectionError>() {
@@ -219,6 +253,7 @@ async fn connect(
     server_address: SocketAddr,
     server_name: &str,
     version: &str,
+    request_recv: &Receiver<RequestedPolicy>,
 ) -> Result<()> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -231,90 +266,34 @@ async fn connect(
     info!("Connection established to server {}", server_address);
     match server_type {
         ServerType::Publish => {
-            // TODO: Read the recently saved time of period and send it to giganto (issue #13)
-            let tmp_start = Utc.ymd(2022, 11, 10).and_hms(0, 0, 0).timestamp_nanos();
+            loop {
+                let req_pol = request_recv.recv().await?;
+                let conn = conn.clone();
+                let start: i64 = 0;
 
-            // TODO: `models` should be transferred from `review` and `series` should be initialized accordingly (issue #14)
-            let (model, mut series) = super::model::test_conn_model();
+                // TODO: Read the recently saved time of period and send it to giganto (issue #13)
+                // let saved_start = Utc.ymd(2022, 11, 10).and_hms(0, 0, 0).timestamp_nanos();
 
-            // TODO: Establish the channel by model (issue #15)
-            request_network_stream(
-                &mut send,
-                model.kind.into(),
-                tmp_start,
-                &model.id,
-                model.src_ip,
-                model.dst_ip,
-                model.node.clone(),
-            )
-            .await?;
-            tokio::spawn(async move {
-                if let Ok(mut recv) = conn.accept_uni().await {
-                    loop {
-                        match recv_network_stream(&mut recv).await {
-                            Ok((timestamp, raw_event)) => match model.kind {
-                                MessageCode::Conn => {
-                                    let (time, Ok(event)) = (
-                                            Utc.timestamp_nanos(timestamp),
-                                            bincode::deserialize::<Conn>(&raw_event),
-                                        ) else {
-                                            continue;
-                                        };
-                                    if let Err(e) =
-                                        time_series(&model, &mut series, time, &Event::Conn(event))
-                                    {
-                                        error_in_ts(&e);
-                                    }
-                                }
-                                MessageCode::Dns => {
-                                    let (time, Ok(event)) = (
-                                            Utc.timestamp_nanos(timestamp),
-                                            bincode::deserialize::<DnsConn>(&raw_event),
-                                        ) else {
-                                            continue;
-                                        };
-                                    if let Err(e) =
-                                        time_series(&model, &mut series, time, &Event::Dns(event))
-                                    {
-                                        error_in_ts(&e);
-                                    }
-                                }
-                                MessageCode::Rdp => {
-                                    let (time, Ok(event)) = (
-                                            Utc.timestamp_nanos(timestamp),
-                                            bincode::deserialize::<RdpConn>(&raw_event),
-                                        ) else {
-                                            continue;
-                                        };
-                                    if let Err(e) =
-                                        time_series(&model, &mut series, time, &Event::Rdp(event))
-                                    {
-                                        error_in_ts(&e);
-                                    }
-                                }
-                                MessageCode::Http => {
-                                    let (time, Ok(event)) = (
-                                            Utc.timestamp_nanos(timestamp),
-                                            bincode::deserialize::<HttpConn>(&raw_event),
-                                        ) else {
-                                            continue;
-                                        };
-                                    if let Err(e) =
-                                        time_series(&model, &mut series, time, &Event::Http(event))
-                                    {
-                                        error_in_ts(&e);
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                error!("recv stream error: {:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-            .await?;
+                // if saved_start > start {
+                //     start = saved_start;
+                // }
+
+                let (policy, series) = convert_policy(start, req_pol);
+
+                // TODO: Establish the channel by model (issue #15)
+                request_network_stream(
+                    &mut send,
+                    policy.kind.into(),
+                    start,
+                    &policy.id,
+                    policy.src_ip,
+                    policy.dst_ip,
+                    policy.node.clone(),
+                )
+                .await?;
+
+                task::spawn(async move { receiver(conn, policy, series).await });
+            }
         }
         ServerType::Ingestion => {}
     }
@@ -398,4 +377,68 @@ async fn recv_network_stream(recv: &mut RecvStream) -> Result<(i64, Vec<u8>)> {
     recv.read_exact(body_buf.as_mut_slice()).await?;
 
     Ok((timestamp, body_buf))
+}
+
+async fn receiver(conn: Connection, policy: Policy, mut series: TimeSeries) -> Result<()> {
+    if let Ok(mut recv) = conn.accept_uni().await {
+        loop {
+            match recv_network_stream(&mut recv).await {
+                Ok((timestamp, raw_event)) => match policy.kind {
+                    Kind::Conn => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Conn>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) = time_series(&policy, &mut series, time, &Event::Conn(event))
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    Kind::Dns => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<DnsConn>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) = time_series(&policy, &mut series, time, &Event::Dns(event))
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    Kind::Rdp => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<RdpConn>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) = time_series(&policy, &mut series, time, &Event::Rdp(event))
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    Kind::Http => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<HttpConn>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) = time_series(&policy, &mut series, time, &Event::Http(event))
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("recv stream error: {:?}", e);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }

@@ -1,5 +1,8 @@
-use super::{Client, Conn};
-use crate::{to_cert_chain, to_private_key};
+use super::{Client, Conn, Kind};
+use crate::{
+    model::{Interval, Period, Policy, TimeSeries},
+    to_cert_chain, to_private_key,
+};
 
 use chrono::{Duration, TimeZone, Utc};
 use lazy_static::lazy_static;
@@ -97,6 +100,7 @@ fn config_server() -> ServerConfig {
 
 fn client() -> Client {
     let (cert, key, ca_certs) = cert_key();
+    let (_, rx) = async_channel::unbounded();
 
     Client::new(
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_INGESTION_PORT),
@@ -105,6 +109,7 @@ fn client() -> Client {
         cert,
         key,
         ca_certs,
+        rx,
     )
 }
 
@@ -148,6 +153,27 @@ async fn connection_handshake(conn: &Connection) {
         .expect("Incompatible version");
 }
 
+fn test_conn_model() -> (Policy, TimeSeries) {
+    (
+        Policy {
+            id: "0".to_string(),
+            kind: Kind::Conn,
+            interval: Interval::FifteenMinutes,
+            period: Period::OneDay,
+            offset: 32_400,
+            src_ip: None,
+            dst_ip: None,
+            node: Some("einsis".to_string()),
+            column: None,
+        },
+        TimeSeries {
+            model_id: "0".to_string(),
+            start: Utc.ymd(2022, 11, 17).and_hms(0, 0, 0),
+            series: vec![0_f64; 96],
+        },
+    )
+}
+
 fn gen_conn() -> Conn {
     let tmp_dur = Duration::nanoseconds(12345);
     let conn = Conn {
@@ -185,7 +211,7 @@ async fn connect() {
 // period: 1day
 #[tokio::test]
 async fn timeseries_with_conn() {
-    use crate::model::{test_conn_model, time_series};
+    use crate::model::time_series;
     const THREE_MIN: i64 = 3;
 
     let (model, mut timeseries) = test_conn_model();

@@ -54,6 +54,8 @@ async fn main() -> Result<()> {
         files.push(file);
     }
 
+    let (request_send, request_recv) = async_channel::unbounded();
+
     let request_client = request::Client::new(
         settings.review_address,
         settings.review_name,
@@ -61,6 +63,7 @@ async fn main() -> Result<()> {
         cert.clone(),
         key.clone(),
         files.clone(),
+        request_send,
     );
     task::spawn(request_client.run());
 
@@ -71,6 +74,7 @@ async fn main() -> Result<()> {
         cert,
         key,
         files,
+        request_recv,
     );
     subscribe_client.run().await;
 
