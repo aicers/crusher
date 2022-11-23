@@ -7,14 +7,17 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+async-channel = "1.7"
+async-trait = "0.1"
 bincode = "1"
 chrono = { version = "0.4", features = ["serde"] }
 config = { version = "0.13", features = ["toml"], default-features = false }
 directories = "4.0"
 num_enum = "0.5"
 num-traits = "0.2"
-oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.5.0" }
+oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.6.0" }
 quinn = "0.9"
+roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.1.0" }
 rustls = "0.20"
 rustls-pemfile = "1.0"
 serde = { version = "1", features = ["derive"] }

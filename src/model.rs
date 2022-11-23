@@ -1,12 +1,15 @@
-use super::subscribe::{Event, MessageCode};
+use crate::request::{RequestedInterval, RequestedPeriod, RequestedPolicy};
+
+use super::subscribe::{Event, Kind};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
 use num_enum::IntoPrimitive;
 use num_traits::ToPrimitive;
+use serde::Deserialize;
 use std::net::IpAddr;
 
 // Interval should be able to devide any of the Period values.
-#[derive(Clone, Copy, IntoPrimitive)]
+#[derive(Clone, Copy, IntoPrimitive, Deserialize, Debug)]
 #[repr(u32)]
 pub enum Interval {
     FiveMinutes = 300,
@@ -16,8 +19,20 @@ pub enum Interval {
     OneHour = 3_600,
 }
 
+impl From<RequestedInterval> for Interval {
+    fn from(i: RequestedInterval) -> Self {
+        match i {
+            RequestedInterval::FiveMinutes => Self::FiveMinutes,
+            RequestedInterval::TenMinutes => Self::TenMinutes,
+            RequestedInterval::FifteenMinutes => Self::FifteenMinutes,
+            RequestedInterval::ThirtyMinutes => Self::ThirtyMinutes,
+            RequestedInterval::OneHour => Self::OneHour,
+        }
+    }
+}
+
 // Period should be able to devide one day.
-#[derive(Clone, Copy, IntoPrimitive)]
+#[derive(Clone, Copy, IntoPrimitive, Deserialize, Debug)]
 #[repr(u32)]
 pub enum Period {
     SixHours = 21_600,
@@ -25,24 +40,51 @@ pub enum Period {
     OneDay = 86_400,
 }
 
+impl From<RequestedPeriod> for Period {
+    fn from(p: RequestedPeriod) -> Self {
+        match p {
+            RequestedPeriod::SixHours => Self::SixHours,
+            RequestedPeriod::TwelveHours => Self::TwelveHours,
+            RequestedPeriod::OneDay => Self::OneDay,
+        }
+    }
+}
+
 #[allow(dead_code)] // TODO: Since this is in temporary use, remove it later.
-pub(crate) struct Model {
+#[derive(Deserialize, Debug)]
+pub(crate) struct Policy {
     pub id: String,
-    pub kind: MessageCode,
-    interval: Interval,
-    period: Period,
-    offset: i32,
+    pub kind: Kind,
+    pub(crate) interval: Interval,
+    pub(crate) period: Period,
+    pub(crate) offset: i32,
     pub src_ip: Option<IpAddr>,
     pub dst_ip: Option<IpAddr>,
     pub node: Option<String>,
-    sum_column: Option<usize>,
+    pub(crate) column: Option<usize>,
+}
+
+impl From<RequestedPolicy> for Policy {
+    fn from(p: RequestedPolicy) -> Self {
+        Self {
+            id: p.id.to_string(),
+            kind: Kind::from(p.kind),
+            interval: Interval::from(p.interval),
+            period: Period::from(p.period),
+            offset: p.offset,
+            src_ip: p.src_ip,
+            dst_ip: p.dst_ip,
+            node: p.node,
+            column: p.column.map(|c| c as usize),
+        }
+    }
 }
 
 // This is sent to giganto
 #[allow(dead_code)] // TODO: Since this is in temporary use, remove it later.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub(crate) struct TimeSeries {
-    model_id: String,
+    pub(crate) model_id: String,
     pub(crate) start: DateTime<Utc>,
     pub(crate) series: Vec<f64>,
 }
@@ -57,31 +99,23 @@ impl TimeSeries {
     }
 }
 
-// TODO: This is temporary. Remove this when fulfilling issues
-pub(crate) fn test_conn_model() -> (Model, TimeSeries) {
+pub(crate) fn convert_policy(start: i64, req_pol: RequestedPolicy) -> (Policy, TimeSeries) {
+    let policy = Policy::from(req_pol);
+    let model_id = policy.id.clone();
+    let len = (u32::from(policy.period) / u32::from(policy.interval)) as usize;
     (
-        Model {
-            id: "0".to_string(),
-            kind: MessageCode::Conn,
-            interval: Interval::FifteenMinutes,
-            period: Period::OneDay,
-            offset: 32_400,
-            src_ip: None,
-            dst_ip: None,
-            node: Some("einsis".to_string()),
-            sum_column: None,
-        },
-        TimeSeries::new("0".to_string(), Utc.ymd(2022, 11, 17).and_hms(0, 0, 0), 96),
+        policy,
+        TimeSeries::new(model_id, Utc.timestamp_nanos(start), len),
     )
 }
 
 pub(crate) fn time_series(
-    model: &Model,
+    policy: &Policy,
     series: &mut TimeSeries,
     time: DateTime<Utc>,
     event: &Event,
 ) -> Result<()> {
-    let Some(period) = u32::from(model.period).to_i64() else {
+    let Some(period) = u32::from(policy.period).to_i64() else {
             return Err(anyhow!("failed to convert period"))
         };
 
@@ -89,22 +123,22 @@ pub(crate) fn time_series(
         // new period
         // TODO: Send this `series_to_send` to giganto (issue #12)
         let _series_to_send = series.clone();
-        series.start = start_time(model, time)?;
+        series.start = start_time(policy, time)?;
         series.series.fill(0_f64);
     }
 
-    let time_slot = time_slot(model, time)?;
+    let time_slot = time_slot(policy, time)?;
     let Some(value) = series.series.get_mut(time_slot) else {
                 return Err(anyhow!("cannot access the time slot"));
             };
-    *value += event_value(model.sum_column, event);
+    *value += event_value(policy.column, event);
 
     Ok(())
 }
 
-fn time_slot(model: &Model, time: DateTime<Utc>) -> Result<usize> {
+fn time_slot(policy: &Policy, time: DateTime<Utc>) -> Result<usize> {
     let offset_time = time.timestamp()
-        + model
+        + policy
             .offset
             .to_i64()
             .ok_or_else(|| anyhow!("failed to convert offset"))?;
@@ -114,7 +148,7 @@ fn time_slot(model: &Model, time: DateTime<Utc>) -> Result<usize> {
 
     let seconds_of_day =
         offset_time.hour() * 3600 + offset_time.minute() * 60 + offset_time.second();
-    let (interval, period) = (u32::from(model.interval), u32::from(model.period));
+    let (interval, period) = (u32::from(policy.interval), u32::from(policy.period));
     let time_slot = (seconds_of_day - seconds_of_day / period * period) / interval;
 
     time_slot
@@ -129,8 +163,8 @@ fn event_value(sum_column: Option<usize>, event: &Event) -> f64 {
     event.column_value(column)
 }
 
-fn start_time(model: &Model, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
-    let offset = model
+fn start_time(policy: &Policy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let offset = policy
         .offset
         .to_i64()
         .ok_or_else(|| anyhow!("failed to convert offset"))?;
@@ -146,7 +180,7 @@ fn start_time(model: &Model, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
             .to_i64()
             .ok_or_else(|| anyhow!("failed to convert seconds of the day"))?;
 
-    let period = u32::from(model.period);
+    let period = u32::from(policy.period);
     let start_of_period = seconds_of_day / period * period;
     let start_offset_time = timestamp_of_midnight
         + start_of_period
