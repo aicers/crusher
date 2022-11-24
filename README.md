@@ -28,6 +28,8 @@ The following is key values in the TOML configuration file.
 * `review_address`: IP address and port number of `review`.
 * `agent_id`: a unique identifier for the agent on the host where the agent is
   running.
+* `last_timestamp_data`: File that stores the timestamp of the last time series
+  per `sampling policy`.
 
 Example
 
@@ -41,6 +43,7 @@ giganto_publish_address = "127.0.0.1:38371"
 review_name = "localhost"
 review_address ="127.0.0.1:38390"
 agent_id ="crusher"
+last_timestamp_data = "tests/time_data.json"
 ```
 
 By default, giganto reads the config file from the following directories:

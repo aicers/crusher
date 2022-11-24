@@ -1,11 +1,12 @@
 use crate::request::{RequestedInterval, RequestedPeriod, RequestedPolicy};
 
-use super::subscribe::{Event, Kind};
+use super::subscribe::{Event, Kind, INGESTION_CHANNEL};
 use anyhow::{anyhow, Result};
+use async_channel::Sender;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
 use num_enum::IntoPrimitive;
 use num_traits::ToPrimitive;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 // Interval should be able to devide any of the Period values.
@@ -80,19 +81,18 @@ impl From<RequestedPolicy> for Policy {
     }
 }
 
-// This is sent to giganto
-#[allow(dead_code)] // TODO: Since this is in temporary use, remove it later.
-#[derive(Default, Clone, Debug)]
-pub(crate) struct TimeSeries {
-    pub(crate) model_id: String,
+#[derive(Default, Clone, Debug, Serialize)]
+pub struct TimeSeries {
+    pub(crate) sampling_policy_id: String,
+    #[serde(skip)]
     pub(crate) start: DateTime<Utc>,
     pub(crate) series: Vec<f64>,
 }
 
 impl TimeSeries {
-    fn new(model_id: String, start: DateTime<Utc>, len: usize) -> Self {
+    fn new(sampling_policy_id: String, start: DateTime<Utc>, len: usize) -> Self {
         Self {
-            model_id,
+            sampling_policy_id,
             start,
             series: vec![0_f64; len],
         }
@@ -109,20 +109,27 @@ pub(crate) fn convert_policy(start: i64, req_pol: RequestedPolicy) -> (Policy, T
     )
 }
 
-pub(crate) fn time_series(
+pub(crate) async fn time_series(
     policy: &Policy,
     series: &mut TimeSeries,
     time: DateTime<Utc>,
     event: &Event,
+    send_channel: &Sender<TimeSeries>,
 ) -> Result<()> {
     let Some(period) = u32::from(policy.period).to_i64() else {
             return Err(anyhow!("failed to convert period"))
         };
 
     if time.timestamp() - series.start.timestamp() > period {
-        // new period
-        // TODO: Send this `series_to_send` to giganto (issue #12)
-        let _series_to_send = series.clone();
+        if let Some(sender) = INGESTION_CHANNEL
+            .read()
+            .await
+            .get(&series.sampling_policy_id)
+        {
+            sender.send(series.clone()).await?;
+        } else {
+            send_channel.send(series.clone()).await?;
+        }
         series.start = start_time(policy, time)?;
         series.series.fill(0_f64);
     }
@@ -187,8 +194,9 @@ fn start_time(policy: &Policy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
             .to_i64()
             .ok_or_else(|| anyhow!("failed to convert start of the period"))?;
 
-    Ok(DateTime::<Utc>::from_utc(
-        NaiveDateTime::from_timestamp(start_offset_time - offset, 0),
-        Utc,
-    ))
+    let Some(datetime) = NaiveDateTime::from_timestamp_opt(start_offset_time - offset, 0) else {
+        return Err(anyhow!("failed to create NaiveDateTime from timestamp"));
+    };
+
+    Ok(DateTime::<Utc>::from_utc(datetime, Utc))
 }
