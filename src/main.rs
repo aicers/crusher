@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
         settings.giganto_ingestion_address,
         settings.giganto_publish_address,
         settings.giganto_name,
+        settings.last_timestamp_data,
         cert,
         key,
         files,

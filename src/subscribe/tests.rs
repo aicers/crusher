@@ -4,13 +4,14 @@ use crate::{
     to_cert_chain, to_private_key,
 };
 
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use lazy_static::lazy_static;
 use quinn::{Connection, Endpoint, ServerConfig};
 use rustls::{Certificate, PrivateKey};
 use std::{
     fs,
     net::{IpAddr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
     sync::Arc,
 };
 use tokio::sync::Mutex;
@@ -26,6 +27,7 @@ const HOST: &str = "localhost";
 const TEST_INGESTION_PORT: u16 = 60190;
 const TEST_PUBLISH_PORT: u16 = 60191;
 const PROTOCOL_VERSION: &str = "0.4.0";
+const LAST_TIME_SERIES_PATH: &str = "tests/time_data.json";
 
 struct TestServer {
     server_config: ServerConfig,
@@ -106,6 +108,7 @@ fn client() -> Client {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_INGESTION_PORT),
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_PUBLISH_PORT),
         String::from(HOST),
+        PathBuf::from(LAST_TIME_SERIES_PATH),
         cert,
         key,
         ca_certs,
@@ -167,8 +170,14 @@ fn test_conn_model() -> (Policy, TimeSeries) {
             column: None,
         },
         TimeSeries {
-            model_id: "0".to_string(),
-            start: Utc.ymd(2022, 11, 17).and_hms(0, 0, 0),
+            sampling_policy_id: "0".to_string(),
+            start: DateTime::<Utc>::from_utc(
+                NaiveDate::from_ymd_opt(2022, 11, 17)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                Utc,
+            ),
             series: vec![0_f64; 96],
         },
     )
@@ -212,26 +221,36 @@ async fn connect() {
 #[tokio::test]
 async fn timeseries_with_conn() {
     use crate::model::time_series;
+    use crate::subscribe::TimeSeries;
     const THREE_MIN: i64 = 3;
 
     let (model, mut timeseries) = test_conn_model();
     let mut min: i64 = 3;
+    let (sender, _receiver) = async_channel::bounded::<TimeSeries>(1);
 
     while min < 10 {
         // 3times
         let conn_event = gen_conn();
         let dur = Duration::minutes(min);
-        let time = Utc
-            .ymd(2022, 11, 17)
-            .and_hms(0, 0, 0)
-            .checked_add_signed(dur)
-            .unwrap();
+
+        let time = DateTime::<Utc>::from_utc(
+            NaiveDate::from_ymd_opt(2022, 11, 17)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .checked_add_signed(dur)
+                .unwrap(),
+            Utc,
+        );
+
         time_series(
             &model,
             &mut timeseries,
             time,
             &crate::subscribe::Event::Conn(conn_event),
+            &sender,
         )
+        .await
         .unwrap();
 
         min += THREE_MIN;

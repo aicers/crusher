@@ -25,6 +25,7 @@ pub struct Settings {
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub review_address: SocketAddr, // IP address & port to review
     pub agent_id: String,     //unique identifier
+    pub last_timestamp_data: PathBuf, // Path to the last series timestamp data file
 }
 
 impl Settings {
@@ -64,6 +65,7 @@ fn default_config_builder() -> ConfigBuilder<DefaultState> {
     let config_dir = dirs.config_dir();
     let cert_path = config_dir.join("cert.pem");
     let key_path = config_dir.join("key.pem");
+    let last_timestamp_path = config_dir.join("time_data.json");
 
     Config::builder()
         .set_default("cert", cert_path.to_str().expect("path to string"))
@@ -85,6 +87,11 @@ fn default_config_builder() -> ConfigBuilder<DefaultState> {
         .expect("valid address")
         .set_default("agent_id", DEFAULT_AGENT_ID)
         .expect("valid id")
+        .set_default(
+            "last_timestamp_data",
+            last_timestamp_path.to_str().expect("path to string"),
+        )
+        .expect("valid time_data")
 }
 
 /// Deserializes a socket address.

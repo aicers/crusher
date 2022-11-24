@@ -1,26 +1,33 @@
 #[cfg(test)]
 mod tests;
 
-use super::model::time_series;
 use crate::{
     client::{config_client, SERVER_RETRY_INTERVAL},
-    model::{convert_policy, Policy, TimeSeries},
+    model::{convert_policy, time_series, Policy, TimeSeries},
     request::{RequestedKind, RequestedPolicy},
 };
-use anyhow::{bail, Error, Result};
-use async_channel::Receiver;
+use anyhow::{bail, Context, Error, Result};
+use async_channel::{Receiver, Sender};
 use chrono::{TimeZone, Utc};
+use lazy_static::lazy_static;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream};
 use rustls::{Certificate, PrivateKey};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    io::BufReader,
     mem,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     process::exit,
+    sync::Arc,
 };
 use tokio::{
+    sync::RwLock,
     task,
     time::{sleep, Duration},
 };
@@ -29,11 +36,16 @@ use tracing::{error, info};
 const INGESTION_PROTOCOL_VERSION: &str = "0.5.0";
 const PUBLISH_PROTOCOL_VERSION: &str = "0.4.0";
 const CRUSHER_CODE: u8 = 0x01;
+const TIME_SERIES_CHANNEL_SIZE: usize = 1;
+const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
+const INGESTION_TIME_SERIES_TYPE: u32 = 5;
 
-#[derive(Debug, Clone, Copy)]
-enum ServerType {
-    Ingestion,
-    Publish,
+lazy_static! {
+    // A hashmap for data transfer to an already created asynchronous task
+    pub static ref INGESTION_CHANNEL: RwLock<HashMap<String, Sender<TimeSeries>>> =
+        RwLock::new(HashMap::new());
+    // A hashmap for last series timestamp
+    pub static ref LAST_TRANSFER_TIME: RwLock<HashMap<String,i64>> = RwLock::new(HashMap::new());
 }
 
 #[derive(Debug, PartialEq, Eq, TryFromPrimitive, IntoPrimitive, Clone, Copy, Deserialize)]
@@ -152,13 +164,16 @@ pub struct Client {
     server_name: String,
     endpoint: Endpoint,
     request_recv: Receiver<RequestedPolicy>,
+    last_series_time_path: PathBuf,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl Client {
     pub fn new(
         ingestion_addr: SocketAddr,
         publish_addr: SocketAddr,
         server_name: String,
+        last_series_time_path: PathBuf,
         certs: Vec<Certificate>,
         key: PrivateKey,
         files: Vec<Vec<u8>>,
@@ -172,21 +187,23 @@ impl Client {
             server_name,
             endpoint,
             request_recv,
+            last_series_time_path,
         }
     }
 
     pub async fn run(self) {
+        let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
         if let Err(e) = tokio::try_join!(
-            connection_control(
-                ServerType::Ingestion,
+            ingestion_connection_control(
+                receiver,
                 self.ingestion_addr,
-                &self.server_name,
-                &self.endpoint,
+                self.server_name.clone(),
+                self.endpoint.clone(),
+                self.last_series_time_path,
                 INGESTION_PROTOCOL_VERSION,
-                &self.request_recv,
             ),
-            connection_control(
-                ServerType::Publish,
+            publish_connection_control(
+                sender,
                 self.publish_addr,
                 &self.server_name,
                 &self.endpoint,
@@ -199,8 +216,55 @@ impl Client {
     }
 }
 
-async fn connection_control(
-    server_type: ServerType,
+async fn ingestion_connection_control(
+    series_recv: Receiver<TimeSeries>,
+    server_addr: SocketAddr,
+    server_name: String,
+    endpoint: Endpoint,
+    last_series_time_path: PathBuf,
+    version: &str,
+) -> Result<()> {
+    loop {
+        match ingestion_connect(
+            series_recv.clone(),
+            &endpoint,
+            server_addr,
+            &server_name,
+            last_series_time_path.clone(),
+            version,
+        )
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if let Some(e) = e.downcast_ref::<ConnectionError>() {
+                    match e {
+                        ConnectionError::ConnectionClosed(_)
+                        | ConnectionError::ApplicationClosed(_)
+                        | ConnectionError::Reset
+                        | ConnectionError::TimedOut => {
+                            error!(
+                                "Retry connection to {} after {} seconds.",
+                                server_addr, SERVER_RETRY_INTERVAL,
+                            );
+                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                            continue;
+                        }
+                        ConnectionError::TransportError(_) => {
+                            error!("Invalid peer certificate contents");
+                            exit(0)
+                        }
+                        _ => {}
+                    }
+                }
+                bail!("Fail to connect to {}: {:?}", server_addr, e);
+            }
+        }
+    }
+}
+
+async fn publish_connection_control(
+    series_send: Sender<TimeSeries>,
     server_addr: SocketAddr,
     server_name: &str,
     endpoint: &Endpoint,
@@ -208,8 +272,8 @@ async fn connection_control(
     request_recv: &Receiver<RequestedPolicy>,
 ) -> Result<()> {
     loop {
-        match connect(
-            server_type,
+        match publish_connect(
+            series_send.clone(),
             endpoint,
             server_addr,
             server_name,
@@ -247,8 +311,40 @@ async fn connection_control(
 }
 
 #[allow(clippy::too_many_lines)] // TODO: Remove this if not necessary when completing codes
-async fn connect(
-    server_type: ServerType,
+async fn ingestion_connect(
+    series_recv: Receiver<TimeSeries>,
+    endpoint: &Endpoint,
+    server_address: SocketAddr,
+    server_name: &str,
+    last_series_time_path: PathBuf,
+    version: &str,
+) -> Result<()> {
+    let conn = endpoint.connect(server_address, server_name)?.await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    if let Err(e) = client_handshake(version, &mut send, &mut recv).await {
+        error!("Giganto handshake failed: {:#}", e);
+        bail!("{}", e);
+    }
+    info!("Connection established to server {}", server_address);
+
+    let arc_conn = Arc::new(conn);
+
+    // Write last time_series timestamp
+    let (time_sender, time_receiver) =
+        async_channel::bounded::<(String, i64)>(LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE);
+    tokio::spawn(write_last_timestamp(last_series_time_path, time_receiver));
+
+    // First time_series data receive
+    while let Ok(series) = series_recv.recv().await {
+        let connection = arc_conn.clone();
+        tokio::spawn(send_time_series(connection, series, time_sender.clone()));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // TODO: Remove this if not necessary when completing codes
+async fn publish_connect(
+    series_send: Sender<TimeSeries>,
     endpoint: &Endpoint,
     server_address: SocketAddr,
     server_name: &str,
@@ -264,41 +360,36 @@ async fn connect(
     }
 
     info!("Connection established to server {}", server_address);
-    match server_type {
-        ServerType::Publish => {
-            loop {
-                let req_pol = request_recv.recv().await?;
-                let conn = conn.clone();
-                let start: i64 = 0;
 
-                // TODO: Read the recently saved time of period and send it to giganto (issue #13)
-                // let saved_start = Utc.ymd(2022, 11, 10).and_hms(0, 0, 0).timestamp_nanos();
+    loop {
+        let req_pol = request_recv.recv().await?;
+        let conn = conn.clone();
+        let sender = series_send.clone();
+        let start: i64 = 0;
 
-                // if saved_start > start {
-                //     start = saved_start;
-                // }
+        // TODO: Read the recently saved time of period and send it to giganto (issue #13)
+        // let saved_start = Utc.ymd(2022, 11, 10).and_hms(0, 0, 0).timestamp_nanos();
 
-                let (policy, series) = convert_policy(start, req_pol);
+        // if saved_start > start {
+        //     start = saved_start;
+        // }
 
-                // TODO: Establish the channel by model (issue #15)
-                request_network_stream(
-                    &mut send,
-                    policy.kind.into(),
-                    start,
-                    &policy.id,
-                    policy.src_ip,
-                    policy.dst_ip,
-                    policy.node.clone(),
-                )
-                .await?;
+        let (policy, series) = convert_policy(start, req_pol);
 
-                task::spawn(async move { receiver(conn, policy, series).await });
-            }
-        }
-        ServerType::Ingestion => {}
+        // TODO: Establish the channel by model (issue #15)
+        request_network_stream(
+            &mut send,
+            policy.kind.into(),
+            start,
+            &policy.id,
+            policy.src_ip,
+            policy.dst_ip,
+            policy.node.clone(),
+        )
+        .await?;
+
+        task::spawn(async move { receiver(conn, policy, series, sender).await });
     }
-
-    Ok(())
 }
 
 #[inline]
@@ -379,7 +470,12 @@ async fn recv_network_stream(recv: &mut RecvStream) -> Result<(i64, Vec<u8>)> {
     Ok((timestamp, body_buf))
 }
 
-async fn receiver(conn: Connection, policy: Policy, mut series: TimeSeries) -> Result<()> {
+async fn receiver(
+    conn: Connection,
+    policy: Policy,
+    mut series: TimeSeries,
+    sender: Sender<TimeSeries>,
+) -> Result<()> {
     if let Ok(mut recv) = conn.accept_uni().await {
         loop {
             match recv_network_stream(&mut recv).await {
@@ -391,7 +487,9 @@ async fn receiver(conn: Connection, policy: Policy, mut series: TimeSeries) -> R
                         ) else {
                             continue;
                         };
-                        if let Err(e) = time_series(&policy, &mut series, time, &Event::Conn(event))
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Conn(event), &sender)
+                                .await
                         {
                             error_in_ts(&e);
                         }
@@ -403,7 +501,9 @@ async fn receiver(conn: Connection, policy: Policy, mut series: TimeSeries) -> R
                         ) else {
                             continue;
                         };
-                        if let Err(e) = time_series(&policy, &mut series, time, &Event::Dns(event))
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Dns(event), &sender)
+                                .await
                         {
                             error_in_ts(&e);
                         }
@@ -415,7 +515,9 @@ async fn receiver(conn: Connection, policy: Policy, mut series: TimeSeries) -> R
                         ) else {
                             continue;
                         };
-                        if let Err(e) = time_series(&policy, &mut series, time, &Event::Rdp(event))
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Rdp(event), &sender)
+                                .await
                         {
                             error_in_ts(&e);
                         }
@@ -427,7 +529,9 @@ async fn receiver(conn: Connection, policy: Policy, mut series: TimeSeries) -> R
                         ) else {
                             continue;
                         };
-                        if let Err(e) = time_series(&policy, &mut series, time, &Event::Http(event))
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Http(event), &sender)
+                                .await
                         {
                             error_in_ts(&e);
                         }
@@ -439,6 +543,129 @@ async fn receiver(conn: Connection, policy: Policy, mut series: TimeSeries) -> R
                 }
             }
         }
+    }
+    Ok(())
+}
+
+async fn send_time_series(
+    connection: Arc<Connection>,
+    series: TimeSeries,
+    time_sender: Sender<(String, i64)>,
+) -> Result<()> {
+    // Store sender channel (Channel for receiving the next time_series after the first transmission)
+    let sampling_policy_id = series.sampling_policy_id.clone();
+    let (send_channel, recv_channel) =
+        async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
+    INGESTION_CHANNEL
+        .write()
+        .await
+        .insert(sampling_policy_id.clone(), send_channel);
+
+    let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else{
+        bail!("Failed to open bi-direction QUIC channel");
+    };
+
+    // First data transmission (record type + series data)
+    first_series_data(&mut series_sender, series).await?;
+
+    // Receive start time of giganto last saved time series.
+    tokio::spawn(receive_time_series_timestamp(
+        series_receiver,
+        sampling_policy_id,
+        time_sender,
+    ));
+
+    // Data transmission after the first time (only series data)
+    while let Ok(series) = recv_channel.recv().await {
+        series_data(&mut series_sender, series).await?;
+    }
+
+    Ok(())
+}
+
+async fn receive_time_series_timestamp(
+    mut receiver: RecvStream,
+    sampling_policy_id: String,
+    time_sender: Sender<(String, i64)>,
+) -> Result<()> {
+    let mut timestamp_buf = [0; std::mem::size_of::<u64>()];
+    loop {
+        match receiver.read_exact(&mut timestamp_buf).await {
+            Ok(()) => {
+                let recv_timestamp = i64::from_be_bytes(timestamp_buf);
+                time_sender
+                    .send((sampling_policy_id.clone(), recv_timestamp))
+                    .await?;
+            }
+            Err(quinn::ReadExactError::FinishedEarly) => {
+                break;
+            }
+            Err(e) => {
+                bail!("last series times error: {}", e);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn first_series_data(sender: &mut SendStream, series: TimeSeries) -> Result<()> {
+    sender
+        .write_all(&INGESTION_TIME_SERIES_TYPE.to_le_bytes())
+        .await
+        .context("Failed to send record type data")?;
+    series_data(sender, series).await?;
+    Ok(())
+}
+
+async fn series_data(sender: &mut SendStream, series: TimeSeries) -> Result<()> {
+    let start_time = series.start.timestamp_nanos().to_le_bytes();
+    let series_data = bincode::serialize(&series)?;
+    let series_data_len = u32::try_from(series_data.len())?.to_le_bytes();
+    let mut data: Vec<u8> =
+        Vec::with_capacity(start_time.len() + series_data_len.len() + series_data.len());
+    data.extend_from_slice(&start_time);
+    data.extend_from_slice(&series_data_len);
+    data.extend_from_slice(&series_data);
+    sender
+        .write_all(&data)
+        .await
+        .context("Failed to send body data")?;
+    Ok(())
+}
+
+async fn write_last_timestamp(
+    last_series_time_path: PathBuf,
+    time_receiver: Receiver<(String, i64)>,
+) -> Result<()> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(last_series_time_path)
+        .context("Failed to open last time series timestamp file")?;
+    while let Ok((id, timestamp)) = time_receiver.recv().await {
+        LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
+        serde_json::to_writer(&file, &(*LAST_TRANSFER_TIME.read().await))
+            .context("Failed to write last time series timestamp file")?;
+    }
+    Ok(())
+}
+
+async fn _read_last_timestamp(last_series_time_path: PathBuf) -> Result<()> {
+    let file = File::open(last_series_time_path)
+        .context("Failed to open last time series timestamp file")?;
+    let json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
+    let Value::Object(map_data) = json else {
+        bail!("Failed to parse json data, invaild json format")
+    };
+    for (key, val) in map_data {
+        let Value::Number(value) = val else {
+            bail!("Failed to parse timestamp data, invaild json format");
+        };
+        let Some(timestamp) = value.as_i64() else {
+            bail!("Failed to convert timestamp data, invaild time data");
+        };
+        LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
     }
     Ok(())
 }
