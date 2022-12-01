@@ -3,10 +3,10 @@ mod tests;
 
 use crate::{
     client::{config_client, SERVER_RETRY_INTERVAL},
-    model::{convert_policy, time_series, Policy, TimeSeries},
+    model::{convert_policy, time_series, Period, Policy, TimeSeries},
     request::{RequestedKind, RequestedPolicy},
 };
-use anyhow::{bail, Context, Error, Result};
+use anyhow::{anyhow, bail, Context, Error, Result};
 use async_channel::{Receiver, Sender};
 use chrono::{TimeZone, Utc};
 use lazy_static::lazy_static;
@@ -22,7 +22,7 @@ use std::{
     io::BufReader,
     mem,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::exit,
     sync::Arc,
 };
@@ -360,23 +360,26 @@ async fn publish_connect(
     }
 
     info!("Connection established to server {}", server_address);
-
     loop {
         let req_pol = request_recv.recv().await?;
         let conn = conn.clone();
         let sender = series_send.clone();
-        let start: i64 = 0;
+        let mut start: i64 = 0;
 
-        // TODO: Read the recently saved time of period and send it to giganto (issue #13)
-        // let saved_start = Utc.ymd(2022, 11, 10).and_hms(0, 0, 0).timestamp_nanos();
-
-        // if saved_start > start {
-        //     start = saved_start;
-        // }
+        if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&req_pol.id.to_string()) {
+            let Some(period) = u32::from(Period::try_from(req_pol.period.clone())?).to_i64() else {
+                return Err(anyhow!("failed to convert period"))
+            };
+            let duration = chrono::Duration::seconds(period);
+            if let Some(last_timestamp) =
+                Utc.timestamp_nanos(*last_time).checked_add_signed(duration)
+            {
+                start = last_timestamp.timestamp_nanos();
+            }
+        }
 
         let (policy, series) = convert_policy(start, req_pol);
 
-        // TODO: Establish the channel by model (issue #15)
         request_network_stream(
             &mut send,
             policy.kind.into(),
@@ -637,35 +640,37 @@ async fn write_last_timestamp(
     last_series_time_path: PathBuf,
     time_receiver: Receiver<(String, i64)>,
 ) -> Result<()> {
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(last_series_time_path)
-        .context("Failed to open last time series timestamp file")?;
     while let Ok((id, timestamp)) = time_receiver.recv().await {
         LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&last_series_time_path)
+            .context("Failed to open last time series timestamp file")?;
         serde_json::to_writer(&file, &(*LAST_TRANSFER_TIME.read().await))
             .context("Failed to write last time series timestamp file")?;
     }
     Ok(())
 }
 
-async fn _read_last_timestamp(last_series_time_path: PathBuf) -> Result<()> {
-    let file = File::open(last_series_time_path)
-        .context("Failed to open last time series timestamp file")?;
-    let json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
-    let Value::Object(map_data) = json else {
-        bail!("Failed to parse json data, invaild json format")
-    };
-    for (key, val) in map_data {
-        let Value::Number(value) = val else {
+pub async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
+    if last_series_time_path.exists() {
+        let file = File::open(last_series_time_path)
+            .context("Failed to open last time series timestamp file")?;
+        let json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
+        let Value::Object(map_data) = json else {
+            bail!("Failed to parse json data, invaild json format")
+        };
+        for (key, val) in map_data {
+            let Value::Number(value) = val else {
             bail!("Failed to parse timestamp data, invaild json format");
         };
-        let Some(timestamp) = value.as_i64() else {
+            let Some(timestamp) = value.as_i64() else {
             bail!("Failed to convert timestamp data, invaild time data");
         };
-        LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
+            LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
+        }
     }
     Ok(())
 }
