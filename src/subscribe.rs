@@ -564,7 +564,7 @@ async fn send_time_series(
         .await
         .insert(sampling_policy_id.clone(), send_channel);
 
-    let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else{
+    let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else {
         bail!("Failed to open bi-direction QUIC channel");
     };
 
@@ -666,7 +666,8 @@ pub async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
             let Value::Number(value) = val else {
             bail!("Failed to parse timestamp data, invaild json format");
         };
-            let Some(timestamp) = value.as_i64() else {
+            #[rustfmt::skip] // rust-lang/rustfmt#4914
+        let Some(timestamp) = value.as_i64() else {
             bail!("Failed to convert timestamp data, invaild time data");
         };
             LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
