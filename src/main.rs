@@ -4,12 +4,14 @@ mod request;
 mod settings;
 mod subscribe;
 
+use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 use anyhow::{anyhow, Context, Result};
 use rustls::{Certificate, PrivateKey};
 use settings::Settings;
 use std::{env, fs, process::exit};
 use tokio::task;
 
+const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 const USAGE: &str = "\
 USAGE:
     crusher [CONFIG]
@@ -54,7 +56,10 @@ async fn main() -> Result<()> {
         files.push(file);
     }
 
-    let (request_send, request_recv) = async_channel::unbounded();
+    read_last_timestamp(&settings.last_timestamp_data).await?;
+
+    let (request_send, request_recv) =
+        async_channel::bounded::<RequestedPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
 
     let request_client = request::Client::new(
         settings.review_address,

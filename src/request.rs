@@ -1,22 +1,31 @@
 use crate::client::{config_client, SERVER_RETRY_INTERVAL};
-use anyhow::{anyhow, bail, Error, Result};
+use anyhow::{bail, Error, Result};
 use async_channel::Sender;
 use async_trait::async_trait;
 use bincode::Options;
+use lazy_static::lazy_static;
 use num_enum::TryFromPrimitive;
-use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use rustls::{Certificate, PrivateKey};
 use serde::Deserialize;
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     process::exit,
 };
-use tokio::time::{sleep, Duration};
+use tokio::{
+    sync::RwLock,
+    time::{sleep, Duration},
+};
 use tracing::{error, info, warn};
 
 const REVIEW_PROTOCOL_VERSION: &str = "0.13.0-alpha.37";
+lazy_static! {
+    // current sampling_policy value
+    pub static ref RUNTIME_POLICY_LIST: RwLock<HashSet<u32>> = RwLock::new(HashSet::new());
+}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RequestedPolicy {
     pub id: u32,
     pub kind: RequestedKind,
@@ -29,7 +38,7 @@ pub struct RequestedPolicy {
     pub column: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, TryFromPrimitive)]
+#[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
 #[repr(u32)]
 pub enum RequestedKind {
     Conn = 0,
@@ -44,7 +53,7 @@ impl Default for RequestedKind {
     }
 }
 
-#[derive(Debug, Deserialize, TryFromPrimitive)]
+#[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
 #[repr(u32)]
 pub enum RequestedInterval {
     FiveMinutes = 0,
@@ -60,7 +69,7 @@ impl Default for RequestedInterval {
     }
 }
 
-#[derive(Debug, Deserialize, TryFromPrimitive)]
+#[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
 #[repr(u32)]
 pub enum RequestedPeriod {
     SixHours,
@@ -110,25 +119,11 @@ impl Client {
                 self.server_address,
                 &self.server_name,
                 &self.agent_id,
+                &self.request_send,
             )
             .await
             {
-                Ok(conn) => {
-                    let request_handler = RequestHandler {
-                        request_send: self.request_send,
-                    };
-
-                    tokio::select! {
-                        res = handle_incoming(request_handler, &conn) => {
-                            if let Err(e) = res {
-                                warn!("control channel failed: {}", e);
-                            } else {
-                                return Ok(());
-                            }
-                        },
-                    }
-                    return Ok(());
-                }
+                Ok(_) => return Ok(()),
                 Err(e) => {
                     if let Some(e) = e.downcast_ref::<ConnectionError>() {
                         match e {
@@ -162,7 +157,8 @@ async fn connect(
     server_address: SocketAddr,
     server_name: &str,
     agent_id: &str,
-) -> Result<Connection> {
+    request_send: &Sender<RequestedPolicy>,
+) -> Result<()> {
     let connection = endpoint.connect(server_address, server_name)?.await?;
 
     handshake(&connection, agent_id, REVIEW_PROTOCOL_VERSION)
@@ -174,7 +170,19 @@ async fn connect(
 
     info!("Connection established to server {}", server_address);
 
-    Ok(connection)
+    let request_handler = RequestHandler {
+        request_send: request_send.clone(),
+    };
+
+    tokio::select! {
+        res = handle_incoming(request_handler, &connection) => {
+            if let Err(e) = res {
+                warn!("control channel failed: {}", e);
+                return Err(e);
+            }
+            Ok(())
+        },
+    }
 }
 
 async fn handshake(
@@ -203,7 +211,8 @@ async fn handle_incoming(handler: RequestHandler, conn: &Connection) -> Result<(
                 );
             }
             Err(e) => {
-                return Err(anyhow!("connection closed: {}", e));
+                conn.close(VarInt::from_u32(0), b"Lost server connection");
+                return Err(Error::new(e));
             }
         }
     }
@@ -238,11 +247,16 @@ impl oinq::request::Handler for RequestHandler {
             .deserialize::<Vec<RequestedPolicy>>(policies)
             .map_err(|e| format!("Failed to deserialize policy: {}", e))?;
         for policy in policies {
+            if RUNTIME_POLICY_LIST.read().await.get(&policy.id).is_some() {
+                continue;
+            }
+            RUNTIME_POLICY_LIST.write().await.insert(policy.id);
             self.request_send
                 .send(policy)
                 .await
                 .map_err(|e| format!("send fail: {}", e))?;
         }
+
         Ok(())
     }
 }
