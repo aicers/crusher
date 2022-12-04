@@ -4,7 +4,7 @@ mod tests;
 use crate::{
     client::{config_client, SERVER_RETRY_INTERVAL},
     model::{convert_policy, time_series, Period, Policy, TimeSeries},
-    request::{RequestedKind, RequestedPolicy},
+    request::{RequestedKind, RequestedPolicy, RUNTIME_POLICY_LIST},
 };
 use anyhow::{anyhow, bail, Context, Error, Result};
 use async_channel::{Receiver, Sender};
@@ -12,7 +12,7 @@ use chrono::{TimeZone, Utc};
 use lazy_static::lazy_static;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use num_traits::ToPrimitive;
-use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, WriteError};
 use rustls::{Certificate, PrivateKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,14 +27,14 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    sync::RwLock,
+    sync::{Mutex, Notify, RwLock},
     task,
     time::{sleep, Duration},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-const INGESTION_PROTOCOL_VERSION: &str = "0.5.0";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.4.0";
+const INGESTION_PROTOCOL_VERSION: &str = "0.6.0";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.7.0-alpha.1";
 const CRUSHER_CODE: u8 = 0x01;
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
@@ -224,18 +224,40 @@ async fn ingestion_connection_control(
     last_series_time_path: PathBuf,
     version: &str,
 ) -> Result<()> {
-    loop {
-        match ingestion_connect(
-            series_recv.clone(),
-            &endpoint,
-            server_addr,
-            &server_name,
-            last_series_time_path.clone(),
-            version,
-        )
-        .await
-        {
-            Ok(_) => return Ok(()),
+    'connection: loop {
+        let connection_notify = Arc::new(Notify::new());
+        match ingestion_connect(&endpoint, server_addr, &server_name, version).await {
+            Ok(conn) => {
+                let arc_conn = Arc::new(conn);
+
+                // Write last time_series timestamp
+                let (time_sender, time_receiver) = async_channel::bounded::<(String, i64)>(
+                    LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE,
+                );
+                tokio::spawn(write_last_timestamp(
+                    last_series_time_path.clone(),
+                    time_receiver,
+                ));
+
+                loop {
+                    tokio::select! {
+                        _ = connection_notify.notified() =>{
+                            drop(connection_notify);
+                            INGESTION_CHANNEL.write().await.clear();
+                            error!(
+                                "Stream Channel Closed. Retry connection to {}",
+                                server_addr,
+                            );
+                            continue 'connection;
+                        }
+                        Ok(series) = series_recv.recv() => {
+                           // First time_series data receive
+                           let connection = arc_conn.clone();
+                           tokio::spawn(send_time_series(connection, series, time_sender.clone(),connection_notify.clone()));
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 if let Some(e) = e.downcast_ref::<ConnectionError>() {
                     match e {
@@ -263,6 +285,7 @@ async fn ingestion_connection_control(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn publish_connection_control(
     series_send: Sender<TimeSeries>,
     server_addr: SocketAddr,
@@ -271,18 +294,88 @@ async fn publish_connection_control(
     version: &str,
     request_recv: &Receiver<RequestedPolicy>,
 ) -> Result<()> {
-    loop {
-        match publish_connect(
-            series_send.clone(),
-            endpoint,
-            server_addr,
-            server_name,
-            version,
-            request_recv,
-        )
-        .await
-        {
-            Ok(_) => return Ok(()),
+    'connection: loop {
+        let connection_notify = Arc::new(Notify::new());
+        match publish_connect(endpoint, server_addr, server_name, version).await {
+            Ok((conn, send)) => loop {
+                let req_send = Arc::new(Mutex::new(send));
+                for req_pol in RUNTIME_POLICY_LIST.read().await.values() {
+                    if let Err(e) = process_network_stream(
+                        conn.clone(),
+                        series_send.clone(),
+                        req_pol.clone(),
+                        req_send.clone(),
+                        connection_notify.clone(),
+                    )
+                    .await
+                    {
+                        for cause in e.chain() {
+                            if let Some(e) = cause.downcast_ref::<WriteError>() {
+                                match e {
+                                    WriteError::ConnectionLost(_) => {
+                                        continue 'connection;
+                                    }
+                                    WriteError::Stopped(_) => {
+                                        return Ok(());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if let Some(e) = cause.downcast_ref::<ConnectionError>() {
+                                match e {
+                                    ConnectionError::TimedOut | ConnectionError::LocallyClosed => {
+                                        continue 'connection;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        return Err(anyhow!("Cannot recover from open stream error: {}", e));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                loop {
+                    tokio::select! {
+                        _ = connection_notify.notified() =>{
+                            drop(connection_notify);
+                            error!(
+                                "Stream Channel Closed. Retry connection to {} after {} seconds.",
+                                server_addr, SERVER_RETRY_INTERVAL,
+                            );
+                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                            continue 'connection;
+                        }
+                        Ok(req_pol) = request_recv.recv() => {
+                            if let Err(e) = process_network_stream(conn.clone(), series_send.clone(), req_pol,req_send.clone(),connection_notify.clone())
+                            .await
+                            {
+                                for cause in e.chain() {
+                                    if let Some(e) = cause.downcast_ref::<WriteError>() {
+                                        match e {
+                                            WriteError::ConnectionLost(_) => {
+                                                continue 'connection;
+                                            }
+                                            WriteError::Stopped(_) => {
+                                                return Ok(());
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    if let Some(e) = cause.downcast_ref::<ConnectionError>() {
+                                        match e {
+                                            ConnectionError::TimedOut | ConnectionError::LocallyClosed => {
+                                                continue 'connection;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                return Err(anyhow!("Cannot recover from open stream error: {}", e));
+                            }
+                        }
+                    }
+                }
+            },
             Err(e) => {
                 if let Some(e) = e.downcast_ref::<ConnectionError>() {
                     match e {
@@ -311,13 +404,11 @@ async fn publish_connection_control(
 }
 
 async fn ingestion_connect(
-    series_recv: Receiver<TimeSeries>,
     endpoint: &Endpoint,
     server_address: SocketAddr,
     server_name: &str,
-    last_series_time_path: PathBuf,
     version: &str,
-) -> Result<()> {
+) -> Result<Connection> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     if let Err(e) = client_handshake(version, &mut send, &mut recv).await {
@@ -326,29 +417,15 @@ async fn ingestion_connect(
     }
     info!("Connection established to server {}", server_address);
 
-    let arc_conn = Arc::new(conn);
-
-    // Write last time_series timestamp
-    let (time_sender, time_receiver) =
-        async_channel::bounded::<(String, i64)>(LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE);
-    tokio::spawn(write_last_timestamp(last_series_time_path, time_receiver));
-
-    // First time_series data receive
-    while let Ok(series) = series_recv.recv().await {
-        let connection = arc_conn.clone();
-        tokio::spawn(send_time_series(connection, series, time_sender.clone()));
-    }
-    Ok(())
+    Ok(conn)
 }
 
 async fn publish_connect(
-    series_send: Sender<TimeSeries>,
     endpoint: &Endpoint,
     server_address: SocketAddr,
     server_name: &str,
     version: &str,
-    request_recv: &Receiver<RequestedPolicy>,
-) -> Result<()> {
+) -> Result<(Connection, SendStream)> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -358,39 +435,42 @@ async fn publish_connect(
     }
 
     info!("Connection established to server {}", server_address);
-    loop {
-        let req_pol = request_recv.recv().await?;
-        let conn = conn.clone();
-        let sender = series_send.clone();
-        let mut start: i64 = 0;
+    Ok((conn, send))
+}
 
-        if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&req_pol.id.to_string()) {
-            let Some(period) = u32::from(Period::try_from(req_pol.period.clone())?).to_i64() else {
-                return Err(anyhow!("failed to convert period"))
-            };
-            let duration = chrono::Duration::seconds(period);
-            if let Some(last_timestamp) =
-                Utc.timestamp_nanos(*last_time).checked_add_signed(duration)
-            {
-                start = last_timestamp.timestamp_nanos();
-            }
+async fn process_network_stream(
+    conn: Connection,
+    sender: Sender<TimeSeries>,
+    req_pol: RequestedPolicy,
+    send: Arc<Mutex<SendStream>>,
+    connection_notify: Arc<Notify>,
+) -> Result<()> {
+    let mut start: i64 = 0;
+    if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&req_pol.id.to_string()) {
+        let Some(period) = u32::from(Period::try_from(req_pol.period.clone())?).to_i64() else {
+            return Err(anyhow!("failed to convert period"))
+        };
+        let duration = chrono::Duration::seconds(period);
+        if let Some(last_timestamp) = Utc.timestamp_nanos(*last_time).checked_add_signed(duration) {
+            start = last_timestamp.timestamp_nanos();
         }
-
-        let (policy, series) = convert_policy(start, req_pol);
-
-        request_network_stream(
-            &mut send,
-            policy.kind.into(),
-            start,
-            &policy.id,
-            policy.src_ip,
-            policy.dst_ip,
-            policy.node.clone(),
-        )
-        .await?;
-
-        task::spawn(async move { receiver(conn, policy, series, sender).await });
     }
+
+    let (policy, series) = convert_policy(start, req_pol);
+
+    request_network_stream(
+        send,
+        policy.kind.into(),
+        start,
+        &policy.id,
+        policy.src_ip,
+        policy.dst_ip,
+        policy.node.clone(),
+    )
+    .await?;
+
+    task::spawn(async move { receiver(conn, policy, series, sender, connection_notify).await });
+    Ok(())
 }
 
 #[inline]
@@ -431,7 +511,7 @@ async fn client_handshake(
 }
 
 async fn request_network_stream(
-    send: &mut SendStream,
+    send: Arc<Mutex<SendStream>>,
     protocol: u32,
     start: i64,
     model_id: &str,
@@ -449,7 +529,8 @@ async fn request_network_stream(
     req_data.extend(frame_len.to_le_bytes());
     req_data.append(&mut request_msg);
 
-    send.write_all(&req_data).await?;
+    let mut data_send = send.lock().await;
+    data_send.write_all(&req_data).await?;
 
     Ok(())
 }
@@ -476,11 +557,18 @@ async fn receiver(
     policy: Policy,
     mut series: TimeSeries,
     sender: Sender<TimeSeries>,
+    connection_notify: Arc<Notify>,
 ) -> Result<()> {
     if let Ok(mut recv) = conn.accept_uni().await {
+        let mut type_buf = [0_u8; mem::size_of::<u32>()];
+        recv.read_exact(&mut type_buf).await.map_err(|e| {
+            connection_notify.notify_one();
+            warn!("failed to receive stream ack type value: {}", e);
+            anyhow!("failed to receive stream ack type value: {}", e)
+        })?;
         loop {
-            match recv_network_stream(&mut recv).await {
-                Ok((timestamp, raw_event)) => match policy.kind {
+            if let Ok((timestamp, raw_event)) = recv_network_stream(&mut recv).await {
+                match policy.kind {
                     Kind::Conn => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
@@ -537,11 +625,10 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
-                },
-                Err(e) => {
-                    error!("recv stream error: {:?}", e);
-                    break;
                 }
+            } else {
+                connection_notify.notify_one();
+                break;
             }
         }
     }
@@ -552,6 +639,7 @@ async fn send_time_series(
     connection: Arc<Connection>,
     series: TimeSeries,
     time_sender: Sender<(String, i64)>,
+    connection_notify: Arc<Notify>,
 ) -> Result<()> {
     // Store sender channel (Channel for receiving the next time_series after the first transmission)
     let sampling_policy_id = series.sampling_policy_id.clone();
@@ -574,13 +662,13 @@ async fn send_time_series(
         series_receiver,
         sampling_policy_id,
         time_sender,
+        connection_notify,
     ));
 
     // Data transmission after the first time (only series data)
     while let Ok(series) = recv_channel.recv().await {
         series_data(&mut series_sender, series).await?;
     }
-
     Ok(())
 }
 
@@ -588,12 +676,18 @@ async fn receive_time_series_timestamp(
     mut receiver: RecvStream,
     sampling_policy_id: String,
     time_sender: Sender<(String, i64)>,
+    connection_notify: Arc<Notify>,
 ) -> Result<()> {
     let mut timestamp_buf = [0; std::mem::size_of::<u64>()];
     loop {
         match receiver.read_exact(&mut timestamp_buf).await {
             Ok(()) => {
                 let recv_timestamp = i64::from_be_bytes(timestamp_buf);
+                info!(
+                    "The time of the timeseries last sent by {}. : {}",
+                    sampling_policy_id,
+                    Utc.timestamp_nanos(recv_timestamp)
+                );
                 time_sender
                     .send((sampling_policy_id.clone(), recv_timestamp))
                     .await?;
@@ -602,6 +696,7 @@ async fn receive_time_series_timestamp(
                 break;
             }
             Err(e) => {
+                connection_notify.notify_one();
                 bail!("last series times error: {}", e);
             }
         }
@@ -631,6 +726,10 @@ async fn series_data(sender: &mut SendStream, series: TimeSeries) -> Result<()> 
         .write_all(&data)
         .await
         .context("Failed to send body data")?;
+    info!(
+        "Time series transmission complete : {} {}",
+        series.sampling_policy_id, series.start
+    );
     Ok(())
 }
 
