@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::time::Duration;
 
 pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(5_000);
-pub const SERVER_RETRY_INTERVAL: u64 = 5;
+pub const SERVER_RETRY_INTERVAL: u64 = 3;
 
 #[allow(clippy::module_name_repetitions)]
 pub fn config_client(

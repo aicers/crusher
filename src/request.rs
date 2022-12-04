@@ -9,7 +9,7 @@ use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarIn
 use rustls::{Certificate, PrivateKey};
 use serde::Deserialize;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     process::exit,
 };
@@ -17,12 +17,12 @@ use tokio::{
     sync::RwLock,
     time::{sleep, Duration},
 };
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 const REVIEW_PROTOCOL_VERSION: &str = "0.13.0-alpha.37";
 lazy_static! {
     // current sampling_policy value
-    pub static ref RUNTIME_POLICY_LIST: RwLock<HashSet<u32>> = RwLock::new(HashSet::new());
+    pub static ref RUNTIME_POLICY_LIST: RwLock<HashMap<u32,RequestedPolicy>> = RwLock::new(HashMap::new());
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -248,13 +248,19 @@ impl oinq::request::Handler for RequestHandler {
             .map_err(|e| format!("Failed to deserialize policy: {}", e))?;
         for policy in policies {
             if RUNTIME_POLICY_LIST.read().await.get(&policy.id).is_some() {
+                trace!("duplicated policy: {:?}", policy);
                 continue;
             }
-            RUNTIME_POLICY_LIST.write().await.insert(policy.id);
+            RUNTIME_POLICY_LIST
+                .write()
+                .await
+                .insert(policy.id, policy.clone());
+            trace!("Receive REview's policy: {:?}", policy);
             self.request_send
                 .send(policy)
                 .await
                 .map_err(|e| format!("send fail: {}", e))?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
         Ok(())
