@@ -310,7 +310,6 @@ async fn publish_connection_control(
     }
 }
 
-#[allow(clippy::too_many_lines)] // TODO: Remove this if not necessary when completing codes
 async fn ingestion_connect(
     series_recv: Receiver<TimeSeries>,
     endpoint: &Endpoint,
@@ -342,7 +341,6 @@ async fn ingestion_connect(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // TODO: Remove this if not necessary when completing codes
 async fn publish_connect(
     series_send: Sender<TimeSeries>,
     endpoint: &Endpoint,
