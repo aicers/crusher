@@ -260,7 +260,6 @@ impl oinq::request::Handler for RequestHandler {
                 .send(policy)
                 .await
                 .map_err(|e| format!("send fail: {}", e))?;
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
         Ok(())

@@ -3,7 +3,7 @@ mod tests;
 
 use crate::{
     client::{self, SERVER_RETRY_INTERVAL},
-    model::{convert_policy, time_series, Period, Policy, TimeSeries},
+    model::{convert_policy, time_series, Period, TimeSeries},
     request::{RequestedKind, RequestedPolicy, RUNTIME_POLICY_LIST},
 };
 use anyhow::{anyhow, bail, Context, Error, Result};
@@ -31,14 +31,15 @@ use tokio::{
     task,
     time::{sleep, Duration},
 };
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 const INGESTION_PROTOCOL_VERSION: &str = "0.6.0";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.7.0-alpha.1";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.7.0-alpha.2";
 const CRUSHER_CODE: u8 = 0x01;
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const INGESTION_TIME_SERIES_TYPE: u32 = 5;
+const SECOND_TO_NANO: i64 = 1_000_000_000;
 
 lazy_static! {
     // A hashmap for data transfer to an already created asynchronous task
@@ -332,7 +333,6 @@ async fn publish_connection_control(
                         }
                         return Err(anyhow!("Cannot recover from open stream error: {}", e));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 loop {
                     tokio::select! {
@@ -438,6 +438,22 @@ async fn publish_connect(
     Ok((conn, send))
 }
 
+async fn calculate_series_start_time(req_pol: &RequestedPolicy) -> Result<i64> {
+    let mut start: i64 = 0;
+    if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&req_pol.id.to_string()) {
+        let Some(period) = u32::from(Period::try_from(req_pol.period.clone())?).to_i64() else {
+            return Err(anyhow!("Failed to convert period"))
+        };
+        let Some(period_nano) = period.checked_mul(SECOND_TO_NANO) else {
+            return Err(anyhow!("Failed to convert period to nanoseconds"))
+        };
+        if let Some(last_timestamp) = last_time.checked_add(period_nano) {
+            start = last_timestamp;
+        }
+    }
+    Ok(start)
+}
+
 async fn process_network_stream(
     conn: Connection,
     sender: Sender<TimeSeries>,
@@ -445,31 +461,20 @@ async fn process_network_stream(
     send: Arc<Mutex<SendStream>>,
     connection_notify: Arc<Notify>,
 ) -> Result<()> {
-    let mut start: i64 = 0;
-    if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&req_pol.id.to_string()) {
-        let Some(period) = u32::from(Period::try_from(req_pol.period.clone())?).to_i64() else {
-            return Err(anyhow!("failed to convert period"))
-        };
-        let duration = chrono::Duration::seconds(period);
-        if let Some(last_timestamp) = Utc.timestamp_nanos(*last_time).checked_add_signed(duration) {
-            start = last_timestamp.timestamp_nanos();
-        }
-    }
-
-    let (policy, series) = convert_policy(start, req_pol);
+    let start = calculate_series_start_time(&req_pol).await?;
 
     request_network_stream(
         send,
-        policy.kind.into(),
+        Kind::from(req_pol.kind).into(),
         start,
-        &policy.id,
-        policy.src_ip,
-        policy.dst_ip,
-        policy.node.clone(),
+        &req_pol.id.to_string(),
+        req_pol.src_ip,
+        req_pol.dst_ip,
+        req_pol.node.clone(),
     )
     .await?;
 
-    task::spawn(async move { receiver(conn, policy, series, sender, connection_notify).await });
+    task::spawn(async move { receiver(conn, sender, connection_notify).await });
     Ok(())
 }
 
@@ -552,20 +557,39 @@ async fn recv_network_stream(recv: &mut RecvStream) -> Result<(i64, Vec<u8>)> {
     Ok((timestamp, body_buf))
 }
 
+async fn recv_stream_id(recv: &mut RecvStream) -> Result<u32> {
+    let mut id_len_buf = [0_u8; mem::size_of::<u32>()];
+    recv.read_exact(&mut id_len_buf).await?;
+    let len = usize::try_from(u32::from_le_bytes(id_len_buf))?;
+    let mut id_buf = vec![0; len];
+    recv.read_exact(&mut id_buf).await?;
+    let id = String::from_utf8(id_buf)?;
+    let result = id.parse::<u32>()?;
+    Ok(result)
+}
+
 async fn receiver(
     conn: Connection,
-    policy: Policy,
-    mut series: TimeSeries,
     sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
 ) -> Result<()> {
     if let Ok(mut recv) = conn.accept_uni().await {
-        let mut type_buf = [0_u8; mem::size_of::<u32>()];
-        recv.read_exact(&mut type_buf).await.map_err(|e| {
+        let Ok(id) = recv_stream_id(&mut recv).await else {
             connection_notify.notify_one();
-            warn!("failed to receive stream ack type value: {}", e);
-            anyhow!("failed to receive stream ack type value: {}", e)
-        })?;
+            warn!("Failed to receive stream id value");
+            bail!("Failed to receive stream id value");
+        };
+
+        let req_pol = if let Some(req_pol) = RUNTIME_POLICY_LIST.read().await.get(&id) {
+            req_pol.clone()
+        } else {
+            bail!("Failed to get runtime policy data");
+        };
+
+        let start = calculate_series_start_time(&req_pol).await?;
+        let (policy, mut series) = convert_policy(start, req_pol);
+
+        info!("Stream's Policy : {:?}", policy);
         loop {
             if let Ok((timestamp, raw_event)) = recv_network_stream(&mut recv).await {
                 match policy.kind {
@@ -683,7 +707,7 @@ async fn receive_time_series_timestamp(
         match receiver.read_exact(&mut timestamp_buf).await {
             Ok(()) => {
                 let recv_timestamp = i64::from_be_bytes(timestamp_buf);
-                info!(
+                trace!(
                     "The time of the timeseries last sent by {}. : {}",
                     sampling_policy_id,
                     Utc.timestamp_nanos(recv_timestamp)
@@ -726,9 +750,10 @@ async fn series_data(sender: &mut SendStream, series: TimeSeries) -> Result<()> 
         .write_all(&data)
         .await
         .context("Failed to send body data")?;
-    info!(
+    trace!(
         "Time series transmission complete : {} {}",
-        series.sampling_policy_id, series.start
+        series.sampling_policy_id,
+        series.start
     );
     Ok(())
 }
