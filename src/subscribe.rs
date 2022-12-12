@@ -2,7 +2,7 @@
 mod tests;
 
 use crate::{
-    client::{config_client, SERVER_RETRY_INTERVAL},
+    client::{self, SERVER_RETRY_INTERVAL},
     model::{convert_policy, time_series, Period, Policy, TimeSeries},
     request::{RequestedKind, RequestedPolicy, RUNTIME_POLICY_LIST},
 };
@@ -179,7 +179,7 @@ impl Client {
         files: Vec<Vec<u8>>,
         request_recv: Receiver<RequestedPolicy>,
     ) -> Self {
-        let endpoint = config_client(certs, key, files)
+        let endpoint = client::config(certs, key, files)
             .expect("server configuration error with cert, key or root");
         Client {
             ingestion_addr,

@@ -1,4 +1,4 @@
-use crate::client::{config_client, SERVER_RETRY_INTERVAL};
+use crate::client::{self, SERVER_RETRY_INTERVAL};
 use anyhow::{bail, Error, Result};
 use async_channel::Sender;
 use async_trait::async_trait;
@@ -101,7 +101,7 @@ impl Client {
         files: Vec<Vec<u8>>,
         request_send: Sender<RequestedPolicy>,
     ) -> Self {
-        let endpoint = config_client(certs, key, files)
+        let endpoint = client::config(certs, key, files)
             .expect("server configuration error with cert, key or root");
         Client {
             server_address,
