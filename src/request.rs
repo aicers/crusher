@@ -47,12 +47,6 @@ pub enum RequestedKind {
     Rdp = 3,
 }
 
-impl Default for RequestedKind {
-    fn default() -> Self {
-        Self::Conn
-    }
-}
-
 #[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
 #[repr(u32)]
 pub enum RequestedInterval {
@@ -63,24 +57,12 @@ pub enum RequestedInterval {
     OneHour = 4,
 }
 
-impl Default for RequestedInterval {
-    fn default() -> Self {
-        Self::FifteenMinutes
-    }
-}
-
 #[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
 #[repr(u32)]
 pub enum RequestedPeriod {
     SixHours,
     TwelveHours,
     OneDay,
-}
-
-impl Default for RequestedPeriod {
-    fn default() -> Self {
-        Self::OneDay
-    }
 }
 
 pub struct Client {
