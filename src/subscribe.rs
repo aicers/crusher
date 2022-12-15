@@ -56,6 +56,11 @@ pub(crate) enum Kind {
     Dns = 1,
     Rdp = 2,
     Http = 3,
+    Smtp = 5,
+    Ntlm = 6,
+    Kerberos = 7,
+    Ssh = 8,
+    DceRpc = 9,
 }
 
 impl From<RequestedKind> for Kind {
@@ -65,15 +70,25 @@ impl From<RequestedKind> for Kind {
             RequestedKind::Dns => Self::Dns,
             RequestedKind::Http => Self::Http,
             RequestedKind::Rdp => Self::Rdp,
+            RequestedKind::Smtp => Self::Smtp,
+            RequestedKind::Ntlm => Self::Ntlm,
+            RequestedKind::Kerberos => Self::Kerberos,
+            RequestedKind::Ssh => Self::Ssh,
+            RequestedKind::DceRpc => Self::DceRpc,
         }
     }
 }
 
 pub(crate) enum Event {
     Conn(Conn),
-    Dns(DnsConn),
-    Http(HttpConn),
-    Rdp(RdpConn),
+    Dns(Dns),
+    Http(Http),
+    Rdp(Rdp),
+    Smtp(Smtp),
+    Ntlml(Ntlm),
+    Kerberos(Kerberos),
+    Ssh(Ssh),
+    DceRpc(DceRpc),
 }
 
 impl Event {
@@ -83,6 +98,11 @@ impl Event {
             Self::Dns(evt) => evt.column_value(column),
             Self::Http(evt) => evt.column_value(column),
             Self::Rdp(evt) => evt.column_value(column),
+            Self::Smtp(evt) => evt.column_value(column),
+            Self::Ntlml(evt) => evt.column_value(column),
+            Self::Kerberos(evt) => evt.column_value(column),
+            Self::Ssh(evt) => evt.column_value(column),
+            Self::DceRpc(evt) => evt.column_value(column),
         }
     }
 }
@@ -121,7 +141,7 @@ impl ColumnValue for Conn {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct DnsConn {
+pub(crate) struct Dns {
     orig_addr: IpAddr,
     resp_addr: IpAddr,
     orig_port: u16,
@@ -130,10 +150,10 @@ pub(crate) struct DnsConn {
     query: String,
 }
 
-impl ColumnValue for DnsConn {}
+impl ColumnValue for Dns {}
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct RdpConn {
+pub(crate) struct Rdp {
     orig_addr: IpAddr,
     resp_addr: IpAddr,
     orig_port: u16,
@@ -141,10 +161,10 @@ pub(crate) struct RdpConn {
     cookie: String,
 }
 
-impl ColumnValue for RdpConn {}
+impl ColumnValue for Rdp {}
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct HttpConn {
+pub(crate) struct Http {
     orig_addr: IpAddr,
     resp_addr: IpAddr,
     orig_port: u16,
@@ -157,7 +177,98 @@ pub(crate) struct HttpConn {
     status_code: u16,
 }
 
-impl ColumnValue for HttpConn {}
+impl ColumnValue for Http {}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Smtp {
+    pub orig_addr: IpAddr,
+    pub resp_addr: IpAddr,
+    pub orig_port: u16,
+    pub resp_port: u16,
+    pub mailfrom: String,
+    pub date: String,
+    pub from: String,
+    pub to: String,
+    pub subject: String,
+    pub agent: String,
+}
+
+impl ColumnValue for Smtp {}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Ntlm {
+    pub orig_addr: IpAddr,
+    pub resp_addr: IpAddr,
+    pub orig_port: u16,
+    pub resp_port: u16,
+    pub username: String,
+    pub hostname: String,
+    pub domainname: String,
+    pub server_nb_computer_name: String,
+    pub server_dns_computer_name: String,
+    pub server_tree_name: String,
+    pub success: String,
+}
+
+impl ColumnValue for Ntlm {}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Kerberos {
+    pub orig_addr: IpAddr,
+    pub resp_addr: IpAddr,
+    pub orig_port: u16,
+    pub resp_port: u16,
+    pub request_type: String,
+    pub client: String,
+    pub service: String,
+    pub success: String,
+    pub error_msg: String,
+    pub from: i64,
+    pub till: i64,
+    pub cipher: String,
+    pub forwardable: String,
+    pub renewable: String,
+    pub client_cert_subject: String,
+    pub server_cert_subject: String,
+}
+
+impl ColumnValue for Kerberos {}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Ssh {
+    pub orig_addr: IpAddr,
+    pub resp_addr: IpAddr,
+    pub orig_port: u16,
+    pub resp_port: u16,
+    pub version: i64,
+    pub auth_success: String,
+    pub auth_attempts: i64,
+    pub direction: String,
+    pub client: String,
+    pub server: String,
+    pub cipher_alg: String,
+    pub mac_alg: String,
+    pub compression_alg: String,
+    pub kex_alg: String,
+    pub host_key_alg: String,
+    pub host_key: String,
+}
+
+impl ColumnValue for Ssh {}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DceRpc {
+    pub orig_addr: IpAddr,
+    pub resp_addr: IpAddr,
+    pub orig_port: u16,
+    pub resp_port: u16,
+    pub rtt: i64,
+    pub named_pipe: String,
+    pub endpoint: String,
+    pub operation: String,
+}
+
+impl ColumnValue for DceRpc {}
 
 pub struct Client {
     ingestion_addr: SocketAddr,
@@ -568,6 +679,7 @@ async fn recv_stream_id(recv: &mut RecvStream) -> Result<u32> {
     Ok(result)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn receiver(
     conn: Connection,
     sender: Sender<TimeSeries>,
@@ -610,7 +722,7 @@ async fn receiver(
                     Kind::Dns => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
-                            bincode::deserialize::<DnsConn>(&raw_event),
+                            bincode::deserialize::<Dns>(&raw_event),
                         ) else {
                             continue;
                         };
@@ -624,7 +736,7 @@ async fn receiver(
                     Kind::Rdp => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
-                            bincode::deserialize::<RdpConn>(&raw_event),
+                            bincode::deserialize::<Rdp>(&raw_event),
                         ) else {
                             continue;
                         };
@@ -638,12 +750,87 @@ async fn receiver(
                     Kind::Http => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
-                            bincode::deserialize::<HttpConn>(&raw_event),
+                            bincode::deserialize::<Http>(&raw_event),
                         ) else {
                             continue;
                         };
                         if let Err(e) =
                             time_series(&policy, &mut series, time, &Event::Http(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    Kind::Smtp => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Smtp>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Smtp(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    Kind::Ntlm => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Ntlm>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Ntlml(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    Kind::Kerberos => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Kerberos>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) = time_series(
+                            &policy,
+                            &mut series,
+                            time,
+                            &Event::Kerberos(event),
+                            &sender,
+                        )
+                        .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    Kind::Ssh => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Ssh>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Ssh(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    Kind::DceRpc => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<DceRpc>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::DceRpc(event), &sender)
                                 .await
                         {
                             error_in_ts(&e);

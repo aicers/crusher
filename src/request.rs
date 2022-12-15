@@ -45,6 +45,11 @@ pub enum RequestedKind {
     Dns = 1,
     Http = 2,
     Rdp = 3,
+    Smtp = 4,
+    Ntlm = 5,
+    Kerberos = 6,
+    Ssh = 7,
+    DceRpc = 8,
 }
 
 #[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
