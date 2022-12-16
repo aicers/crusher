@@ -100,7 +100,7 @@ fn parse() -> Option<String> {
     if arg == "--help" || arg == "-h" {
         println!("{}", version());
         println!();
-        print!("{}", USAGE);
+        print!("{USAGE}");
         exit(0);
     }
     if arg == "--version" || arg == "-V" {
@@ -108,8 +108,8 @@ fn parse() -> Option<String> {
         exit(0);
     }
     if arg.starts_with('-') {
-        eprintln!("Error: unknown option: {}", arg);
-        eprintln!("\n{}", USAGE);
+        eprintln!("Error: unknown option: {arg}");
+        eprintln!("\n{USAGE}");
         exit(1);
     }
 

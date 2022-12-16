@@ -185,7 +185,8 @@ fn test_conn_model() -> (Policy, TimeSeries) {
 
 fn gen_conn() -> Conn {
     let tmp_dur = Duration::nanoseconds(12345);
-    let conn = Conn {
+
+    Conn {
         orig_addr: "192.168.4.76".parse::<IpAddr>().unwrap(),
         resp_addr: "192.168.4.76".parse::<IpAddr>().unwrap(),
         orig_port: 46378,
@@ -196,9 +197,7 @@ fn gen_conn() -> Conn {
         resp_bytes: 295,
         orig_pkts: 397,
         resp_pkts: 511,
-    };
-
-    conn
+    }
 }
 
 // test만들다가 현재 test할 기능이 없어 쓰지 않지만
@@ -256,5 +255,5 @@ async fn timeseries_with_conn() {
         min += THREE_MIN;
     }
 
-    assert_eq!(timeseries.series[36], 3.0)
+    assert_eq!(timeseries.series[36], 3.0);
 }

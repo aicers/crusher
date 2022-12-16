@@ -213,7 +213,7 @@ struct RequestHandler {
 #[async_trait]
 impl oinq::request::Handler for RequestHandler {
     async fn reboot(&mut self) -> Result<(), String> {
-        roxy::reboot().map_err(|e| format!("cannot restart the system: {}", e))?;
+        roxy::reboot().map_err(|e| format!("cannot restart the system: {e}"))?;
         Ok(())
     }
 
@@ -232,7 +232,7 @@ impl oinq::request::Handler for RequestHandler {
     async fn sampling_policy_list(&mut self, policies: &[u8]) -> Result<(), String> {
         let policies = bincode::DefaultOptions::new()
             .deserialize::<Vec<RequestedPolicy>>(policies)
-            .map_err(|e| format!("Failed to deserialize policy: {}", e))?;
+            .map_err(|e| format!("Failed to deserialize policy: {e}"))?;
         for policy in policies {
             if RUNTIME_POLICY_LIST.read().await.get(&policy.id).is_some() {
                 trace!("duplicated policy: {:?}", policy);
@@ -246,7 +246,7 @@ impl oinq::request::Handler for RequestHandler {
             self.request_send
                 .send(policy)
                 .await
-                .map_err(|e| format!("send fail: {}", e))?;
+                .map_err(|e| format!("send fail: {e}"))?;
         }
 
         Ok(())

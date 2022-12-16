@@ -105,5 +105,5 @@ where
 {
     let addr = String::deserialize(deserializer)?;
     addr.parse()
-        .map_err(|e| D::Error::custom(format!("invalid address \"{}\": {}", addr, e)))
+        .map_err(|e| D::Error::custom(format!("invalid address \"{addr}\": {e}")))
 }
