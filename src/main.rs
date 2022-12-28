@@ -5,7 +5,7 @@ mod settings;
 mod subscribe;
 
 use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rustls::{Certificate, PrivateKey};
 use settings::Settings;
 use std::{env, fs, process::exit};
@@ -123,7 +123,7 @@ fn version() -> String {
 fn to_cert_chain(pem: &[u8]) -> Result<Vec<Certificate>> {
     let certs = rustls_pemfile::certs(&mut &*pem).context("cannot parse certificate chain")?;
     if certs.is_empty() {
-        return Err(anyhow!("no certificate found"));
+        bail!("no certificate found");
     }
     Ok(certs.into_iter().map(Certificate).collect())
 }

@@ -1,7 +1,7 @@
 use crate::request::{RequestedInterval, RequestedPeriod, RequestedPolicy};
 
 use super::subscribe::{Event, Kind, INGESTION_CHANNEL};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use async_channel::Sender;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
 use num_enum::IntoPrimitive;
@@ -117,8 +117,8 @@ pub(crate) async fn time_series(
     send_channel: &Sender<TimeSeries>,
 ) -> Result<()> {
     let Some(period) = u32::from(policy.period).to_i64() else {
-            return Err(anyhow!("failed to convert period"))
-        };
+        bail!("failed to convert period")
+    };
 
     if time.timestamp() - series.start.timestamp() > period {
         if let Some(sender) = INGESTION_CHANNEL
@@ -136,7 +136,7 @@ pub(crate) async fn time_series(
 
     let time_slot = time_slot(policy, time)?;
     let Some(value) = series.series.get_mut(time_slot) else {
-                return Err(anyhow!("cannot access the time slot"));
+                bail!("cannot access the time slot");
             };
     *value += event_value(policy.column, event);
 
@@ -150,7 +150,7 @@ fn time_slot(policy: &Policy, time: DateTime<Utc>) -> Result<usize> {
             .to_i64()
             .ok_or_else(|| anyhow!("failed to convert offset"))?;
     let Some(offset_time) = NaiveDateTime::from_timestamp_opt(offset_time, 0) else {
-        return Err(anyhow!("failed to create NaiveDateTime from timestamp"));
+        bail!("failed to create NaiveDateTime from timestamp");
     };
 
     let seconds_of_day =
@@ -177,7 +177,7 @@ fn start_time(policy: &Policy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
         .ok_or_else(|| anyhow!("failed to convert offset"))?;
     let offset_time = time.timestamp() + offset;
     let Some(offset_time) = NaiveDateTime::from_timestamp_opt(offset_time, 0) else {
-        return Err(anyhow!("failed to create NaiveDateTime from timestamp"));
+        bail!("failed to create NaiveDateTime from timestamp");
     };
 
     let seconds_of_day =
@@ -195,7 +195,7 @@ fn start_time(policy: &Policy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
             .ok_or_else(|| anyhow!("failed to convert start of the period"))?;
 
     let Some(datetime) = NaiveDateTime::from_timestamp_opt(start_offset_time - offset, 0) else {
-        return Err(anyhow!("failed to create NaiveDateTime from timestamp"));
+        bail!("failed to create NaiveDateTime from timestamp");
     };
 
     Ok(DateTime::<Utc>::from_utc(datetime, Utc))
