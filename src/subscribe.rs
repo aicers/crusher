@@ -6,7 +6,7 @@ use crate::{
     model::{convert_policy, time_series, Period, TimeSeries},
     request::{RequestedKind, RequestedPolicy, RUNTIME_POLICY_LIST},
 };
-use anyhow::{anyhow, bail, Context, Error, Result};
+use anyhow::{bail, Context, Error, Result};
 use async_channel::{Receiver, Sender};
 use chrono::{TimeZone, Utc};
 use lazy_static::lazy_static;
@@ -442,7 +442,7 @@ async fn publish_connection_control(
                                 }
                             }
                         }
-                        return Err(anyhow!("Cannot recover from open stream error: {}", e));
+                        bail!("Cannot recover from open stream error: {}", e);
                     }
                 }
                 loop {
@@ -481,7 +481,7 @@ async fn publish_connection_control(
                                         }
                                     }
                                 }
-                                return Err(anyhow!("Cannot recover from open stream error: {}", e));
+                                bail!("Cannot recover from open stream error: {}", e);
                             }
                         }
                     }
@@ -553,10 +553,10 @@ async fn calculate_series_start_time(req_pol: &RequestedPolicy) -> Result<i64> {
     let mut start: i64 = 0;
     if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&req_pol.id.to_string()) {
         let Some(period) = u32::from(Period::try_from(req_pol.period.clone())?).to_i64() else {
-            return Err(anyhow!("Failed to convert period"))
+            bail!("Failed to convert period");
         };
         let Some(period_nano) = period.checked_mul(SECOND_TO_NANO) else {
-            return Err(anyhow!("Failed to convert period to nanoseconds"))
+            bail!("Failed to convert period to nanoseconds");
         };
         if let Some(last_timestamp) = last_time.checked_add(period_nano) {
             start = last_timestamp;
