@@ -9,7 +9,7 @@ use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
-// Interval should be able to devide any of the Period values.
+// Interval should be able to divide any of the Period values.
 #[derive(Clone, Copy, IntoPrimitive, Deserialize, Debug)]
 #[repr(u32)]
 pub enum Interval {
@@ -32,7 +32,7 @@ impl From<RequestedInterval> for Interval {
     }
 }
 
-// Period should be able to devide one day.
+// Period should be able to divide one day.
 #[derive(Clone, Copy, IntoPrimitive, Deserialize, Debug)]
 #[repr(u32)]
 pub enum Period {
