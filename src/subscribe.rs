@@ -33,8 +33,8 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const INGESTION_PROTOCOL_VERSION: &str = "0.6.0";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.7.0-alpha.2";
+const INGESTION_PROTOCOL_VERSION: &str = "0.8.0-alpha.1";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.7.0";
 const CRUSHER_CODE: u8 = 0x01;
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
@@ -85,7 +85,7 @@ pub(crate) enum Event {
     Http(Http),
     Rdp(Rdp),
     Smtp(Smtp),
-    Ntlml(Ntlm),
+    Ntlm(Ntlm),
     Kerberos(Kerberos),
     Ssh(Ssh),
     DceRpc(DceRpc),
@@ -99,7 +99,7 @@ impl Event {
             Self::Http(evt) => evt.column_value(column),
             Self::Rdp(evt) => evt.column_value(column),
             Self::Smtp(evt) => evt.column_value(column),
-            Self::Ntlml(evt) => evt.column_value(column),
+            Self::Ntlm(evt) => evt.column_value(column),
             Self::Kerberos(evt) => evt.column_value(column),
             Self::Ssh(evt) => evt.column_value(column),
             Self::DceRpc(evt) => evt.column_value(column),
@@ -120,26 +120,28 @@ pub(crate) struct Conn {
     orig_port: u16,
     resp_port: u16,
     proto: u8,
-    duration: i64,   // 5
-    orig_bytes: u64, // 6
-    resp_bytes: u64, // 7
-    orig_pkts: u64,  // 8
-    resp_pkts: u64,  // 9
+    service: String,
+    duration: i64,   // 6
+    orig_bytes: u64, // 7
+    resp_bytes: u64, // 8
+    orig_pkts: u64,  // 9
+    resp_pkts: u64,  // 10
 }
 
 impl ColumnValue for Conn {
     fn column_value(&self, column: usize) -> f64 {
         match column {
-            5 => self.duration.to_f64().unwrap_or_default(),
-            6 => self.orig_bytes.to_f64().unwrap_or_default(),
-            7 => self.resp_bytes.to_f64().unwrap_or_default(),
-            8 => self.orig_pkts.to_f64().unwrap_or_default(),
-            9 => self.resp_pkts.to_f64().unwrap_or_default(),
+            6 => self.duration.to_f64().unwrap_or_default(),
+            7 => self.orig_bytes.to_f64().unwrap_or_default(),
+            8 => self.resp_bytes.to_f64().unwrap_or_default(),
+            9 => self.orig_pkts.to_f64().unwrap_or_default(),
+            10 => self.resp_pkts.to_f64().unwrap_or_default(),
             _ => 1_f64,
         }
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Dns {
     orig_addr: IpAddr,
@@ -148,6 +150,17 @@ pub(crate) struct Dns {
     resp_port: u16,
     proto: u8,
     query: String,
+    answer: Vec<String>,
+    trans_id: u16,
+    rtt: i64,
+    qclass: u16,
+    qtype: u16,
+    rcode: u16,
+    aa_flag: bool,
+    tc_flag: bool,
+    rd_flag: bool,
+    ra_flag: bool,
+    ttl: Vec<i32>,
 }
 
 impl ColumnValue for Dns {}
@@ -173,8 +186,18 @@ pub(crate) struct Http {
     host: String,
     uri: String,
     referrer: String,
+    version: String,
     user_agent: String,
+    request_len: usize,
+    response_len: usize,
     status_code: u16,
+    status_msg: String,
+    username: String,
+    password: String,
+    cookie: String,
+    content_encoding: String,
+    content_type: String,
+    cache_control: String,
 }
 
 impl ColumnValue for Http {}
@@ -783,7 +806,7 @@ async fn receiver(
                             continue;
                         };
                         if let Err(e) =
-                            time_series(&policy, &mut series, time, &Event::Ntlml(event), &sender)
+                            time_series(&policy, &mut series, time, &Event::Ntlm(event), &sender)
                                 .await
                         {
                             error_in_ts(&e);
