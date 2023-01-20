@@ -116,12 +116,12 @@ trait ColumnValue {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Conn {
     orig_addr: IpAddr, // 0
-    resp_addr: IpAddr,
     orig_port: u16,
+    resp_addr: IpAddr,
     resp_port: u16,
     proto: u8,
+    duration: i64, // 5
     service: String,
-    duration: i64,   // 6
     orig_bytes: u64, // 7
     resp_bytes: u64, // 8
     orig_pkts: u64,  // 9
@@ -131,7 +131,7 @@ pub(crate) struct Conn {
 impl ColumnValue for Conn {
     fn column_value(&self, column: usize) -> f64 {
         match column {
-            6 => self.duration.to_f64().unwrap_or_default(),
+            5 => self.duration.to_f64().unwrap_or_default(),
             7 => self.orig_bytes.to_f64().unwrap_or_default(),
             8 => self.resp_bytes.to_f64().unwrap_or_default(),
             9 => self.orig_pkts.to_f64().unwrap_or_default(),
@@ -145,10 +145,11 @@ impl ColumnValue for Conn {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Dns {
     orig_addr: IpAddr,
-    resp_addr: IpAddr,
     orig_port: u16,
+    resp_addr: IpAddr,
     resp_port: u16,
     proto: u8,
+    duration: i64,
     query: String,
     answer: Vec<String>,
     trans_id: u16,
@@ -168,9 +169,11 @@ impl ColumnValue for Dns {}
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Rdp {
     orig_addr: IpAddr,
-    resp_addr: IpAddr,
     orig_port: u16,
+    resp_addr: IpAddr,
     resp_port: u16,
+    proto: u8,
+    duration: i64,
     cookie: String,
 }
 
@@ -179,9 +182,11 @@ impl ColumnValue for Rdp {}
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Http {
     orig_addr: IpAddr,
-    resp_addr: IpAddr,
     orig_port: u16,
+    resp_addr: IpAddr,
     resp_port: u16,
+    proto: u8,
+    duration: i64,
     method: String,
     host: String,
     uri: String,
@@ -203,92 +208,102 @@ pub(crate) struct Http {
 impl ColumnValue for Http {}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Smtp {
-    pub orig_addr: IpAddr,
-    pub resp_addr: IpAddr,
-    pub orig_port: u16,
-    pub resp_port: u16,
-    pub mailfrom: String,
-    pub date: String,
-    pub from: String,
-    pub to: String,
-    pub subject: String,
-    pub agent: String,
+pub(crate) struct Smtp {
+    orig_addr: IpAddr,
+    orig_port: u16,
+    resp_addr: IpAddr,
+    resp_port: u16,
+    proto: u8,
+    duration: i64,
+    mailfrom: String,
+    date: String,
+    from: String,
+    to: String,
+    subject: String,
+    agent: String,
 }
 
 impl ColumnValue for Smtp {}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Ntlm {
-    pub orig_addr: IpAddr,
-    pub resp_addr: IpAddr,
-    pub orig_port: u16,
-    pub resp_port: u16,
-    pub username: String,
-    pub hostname: String,
-    pub domainname: String,
-    pub server_nb_computer_name: String,
-    pub server_dns_computer_name: String,
-    pub server_tree_name: String,
-    pub success: String,
+pub(crate) struct Ntlm {
+    orig_addr: IpAddr,
+    orig_port: u16,
+    resp_addr: IpAddr,
+    resp_port: u16,
+    proto: u8,
+    duration: i64,
+    username: String,
+    hostname: String,
+    domainname: String,
+    server_nb_computer_name: String,
+    server_dns_computer_name: String,
+    server_tree_name: String,
+    success: String,
 }
 
 impl ColumnValue for Ntlm {}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Kerberos {
-    pub orig_addr: IpAddr,
-    pub resp_addr: IpAddr,
-    pub orig_port: u16,
-    pub resp_port: u16,
-    pub request_type: String,
-    pub client: String,
-    pub service: String,
-    pub success: String,
-    pub error_msg: String,
-    pub from: i64,
-    pub till: i64,
-    pub cipher: String,
-    pub forwardable: String,
-    pub renewable: String,
-    pub client_cert_subject: String,
-    pub server_cert_subject: String,
+pub(crate) struct Kerberos {
+    orig_addr: IpAddr,
+    orig_port: u16,
+    resp_addr: IpAddr,
+    resp_port: u16,
+    proto: u8,
+    duration: i64,
+    request_type: String,
+    client: String,
+    service: String,
+    success: String,
+    error_msg: String,
+    from: i64,
+    till: i64,
+    cipher: String,
+    forwardable: String,
+    renewable: String,
+    client_cert_subject: String,
+    server_cert_subject: String,
 }
 
 impl ColumnValue for Kerberos {}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Ssh {
-    pub orig_addr: IpAddr,
-    pub resp_addr: IpAddr,
-    pub orig_port: u16,
-    pub resp_port: u16,
-    pub version: i64,
-    pub auth_success: String,
-    pub auth_attempts: i64,
-    pub direction: String,
-    pub client: String,
-    pub server: String,
-    pub cipher_alg: String,
-    pub mac_alg: String,
-    pub compression_alg: String,
-    pub kex_alg: String,
-    pub host_key_alg: String,
-    pub host_key: String,
+pub(crate) struct Ssh {
+    orig_addr: IpAddr,
+    orig_port: u16,
+    resp_addr: IpAddr,
+    resp_port: u16,
+    proto: u8,
+    duration: i64,
+    version: i64,
+    auth_success: String,
+    auth_attempts: i64,
+    direction: String,
+    client: String,
+    server: String,
+    cipher_alg: String,
+    mac_alg: String,
+    compression_alg: String,
+    kex_alg: String,
+    host_key_alg: String,
+    host_key: String,
 }
 
 impl ColumnValue for Ssh {}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct DceRpc {
-    pub orig_addr: IpAddr,
-    pub resp_addr: IpAddr,
-    pub orig_port: u16,
-    pub resp_port: u16,
-    pub rtt: i64,
-    pub named_pipe: String,
-    pub endpoint: String,
-    pub operation: String,
+pub(crate) struct DceRpc {
+    orig_addr: IpAddr,
+    orig_port: u16,
+    resp_addr: IpAddr,
+    resp_port: u16,
+    proto: u8,
+    duration: i64,
+    rtt: i64,
+    named_pipe: String,
+    endpoint: String,
+    operation: String,
 }
 
 impl ColumnValue for DceRpc {}
