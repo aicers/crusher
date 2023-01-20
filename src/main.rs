@@ -8,8 +8,8 @@ use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 use anyhow::{anyhow, bail, Context, Result};
 use rustls::{Certificate, PrivateKey};
 use settings::Settings;
-use std::{env, fs, process::exit};
-use tokio::task;
+use std::{collections::HashMap, env, fs, process::exit, sync::Arc};
+use tokio::{sync::RwLock, task};
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 const USAGE: &str = "\
@@ -70,7 +70,8 @@ async fn main() -> Result<()> {
         files.clone(),
         request_send,
     );
-    task::spawn(request_client.run());
+    let runtime_policy_list = Arc::new(RwLock::new(HashMap::new())); // current sampling_policy value
+    task::spawn(request_client.run(Arc::clone(&runtime_policy_list)));
 
     let subscribe_client = subscribe::Client::new(
         settings.giganto_ingestion_address,
@@ -82,7 +83,7 @@ async fn main() -> Result<()> {
         files,
         request_recv,
     );
-    subscribe_client.run().await;
+    subscribe_client.run(runtime_policy_list).await;
 
     Ok(())
 }
