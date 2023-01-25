@@ -4,7 +4,7 @@ mod tests;
 use crate::{
     client::{self, SERVER_RETRY_INTERVAL},
     model::{convert_policy, time_series, Period, TimeSeries},
-    request::{RequestedKind, RequestedPolicy, RUNTIME_POLICY_LIST},
+    request::{RequestedKind, RequestedPolicy},
 };
 use anyhow::{bail, Context, Error, Result};
 use async_channel::{Receiver, Sender};
@@ -341,7 +341,7 @@ impl Client {
         }
     }
 
-    pub async fn run(self) {
+    pub async fn run(self, runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>) {
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
         if let Err(e) = tokio::try_join!(
             ingestion_connection_control(
@@ -359,6 +359,7 @@ impl Client {
                 &self.endpoint,
                 PUBLISH_PROTOCOL_VERSION,
                 &self.request_recv,
+                runtime_policy_list,
             )
         ) {
             error!("giganto connection error occur : {}", e);
@@ -443,19 +444,21 @@ async fn publish_connection_control(
     endpoint: &Endpoint,
     version: &str,
     request_recv: &Receiver<RequestedPolicy>,
+    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = Arc::new(Notify::new());
         match publish_connect(endpoint, server_addr, server_name, version).await {
             Ok((conn, send)) => loop {
                 let req_send = Arc::new(Mutex::new(send));
-                for req_pol in RUNTIME_POLICY_LIST.read().await.values() {
+                for req_pol in runtime_policy_list.read().await.values() {
                     if let Err(e) = process_network_stream(
                         conn.clone(),
                         series_send.clone(),
                         req_pol.clone(),
                         req_send.clone(),
                         connection_notify.clone(),
+                        runtime_policy_list.clone(),
                     )
                     .await
                     {
@@ -495,7 +498,7 @@ async fn publish_connection_control(
                             continue 'connection;
                         }
                         Ok(req_pol) = request_recv.recv() => {
-                            if let Err(e) = process_network_stream(conn.clone(), series_send.clone(), req_pol,req_send.clone(),connection_notify.clone())
+                            if let Err(e) = process_network_stream(conn.clone(), series_send.clone(), req_pol,req_send.clone(),connection_notify.clone(), runtime_policy_list.clone())
                             .await
                             {
                                 for cause in e.chain() {
@@ -609,6 +612,7 @@ async fn process_network_stream(
     req_pol: RequestedPolicy,
     send: Arc<Mutex<SendStream>>,
     connection_notify: Arc<Notify>,
+    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
 ) -> Result<()> {
     let start = calculate_series_start_time(&req_pol).await?;
 
@@ -623,7 +627,9 @@ async fn process_network_stream(
     )
     .await?;
 
-    task::spawn(async move { receiver(conn, sender, connection_notify).await });
+    task::spawn(
+        async move { receiver(conn, sender, connection_notify, runtime_policy_list).await },
+    );
     Ok(())
 }
 
@@ -722,6 +728,7 @@ async fn receiver(
     conn: Connection,
     sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
+    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
 ) -> Result<()> {
     if let Ok(mut recv) = conn.accept_uni().await {
         let Ok(id) = recv_stream_id(&mut recv).await else {
@@ -730,7 +737,7 @@ async fn receiver(
             bail!("Failed to receive stream id value");
         };
 
-        let req_pol = if let Some(req_pol) = RUNTIME_POLICY_LIST.read().await.get(&id) {
+        let req_pol = if let Some(req_pol) = runtime_policy_list.read().await.get(&id) {
             req_pol.clone()
         } else {
             bail!("Failed to get runtime policy data");

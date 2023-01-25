@@ -9,12 +9,13 @@ use lazy_static::lazy_static;
 use quinn::{Connection, Endpoint, ServerConfig};
 use rustls::{Certificate, PrivateKey};
 use std::{
+    collections::HashMap,
     fs,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 lazy_static! {
     pub(crate) static ref TOKEN: Mutex<u32> = Mutex::new(0);
@@ -192,7 +193,7 @@ fn gen_conn() -> Conn {
         orig_port: 46378,
         resp_port: 80,
         proto: 6,
-        service: "".to_string(),
+        service: String::new(),
         duration: tmp_dur.num_nanoseconds().unwrap(),
         orig_bytes: 77,
         resp_bytes: 295,
@@ -211,7 +212,7 @@ async fn connect() {
     let publish_server = TestServer::new(TEST_PUBLISH_PORT);
     tokio::spawn(ingestion_server.run());
     tokio::spawn(publish_server.run());
-    client().run().await;
+    client().run(Arc::new(RwLock::new(HashMap::new()))).await;
 }
 
 // start time: 2022/11/17 00:00:00

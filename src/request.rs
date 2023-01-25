@@ -3,7 +3,6 @@ use anyhow::{bail, Error, Result};
 use async_channel::Sender;
 use async_trait::async_trait;
 use bincode::Options;
-use lazy_static::lazy_static;
 use num_enum::TryFromPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use rustls::{Certificate, PrivateKey};
@@ -12,6 +11,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     process::exit,
+    sync::Arc,
 };
 use tokio::{
     sync::RwLock,
@@ -20,10 +20,6 @@ use tokio::{
 use tracing::{error, info, trace, warn};
 
 const REVIEW_PROTOCOL_VERSION: &str = "0.13.0-alpha.37";
-lazy_static! {
-    // current sampling_policy value
-    pub static ref RUNTIME_POLICY_LIST: RwLock<HashMap<u32,RequestedPolicy>> = RwLock::new(HashMap::new());
-}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RequestedPolicy {
@@ -99,7 +95,10 @@ impl Client {
         }
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(
+        self,
+        runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    ) -> Result<()> {
         loop {
             match connect(
                 &self.endpoint,
@@ -107,6 +106,7 @@ impl Client {
                 &self.server_name,
                 &self.agent_id,
                 &self.request_send,
+                runtime_policy_list.clone(),
             )
             .await
             {
@@ -145,6 +145,7 @@ async fn connect(
     server_name: &str,
     agent_id: &str,
     request_send: &Sender<RequestedPolicy>,
+    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
 ) -> Result<()> {
     let connection = endpoint.connect(server_address, server_name)?.await?;
 
@@ -159,6 +160,7 @@ async fn connect(
 
     let request_handler = RequestHandler {
         request_send: request_send.clone(),
+        runtime_policy_list,
     };
 
     tokio::select! {
@@ -208,6 +210,7 @@ async fn handle_incoming(handler: RequestHandler, conn: &Connection) -> Result<(
 #[derive(Clone)]
 struct RequestHandler {
     request_send: Sender<RequestedPolicy>,
+    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
 }
 
 #[async_trait]
@@ -234,11 +237,17 @@ impl oinq::request::Handler for RequestHandler {
             .deserialize::<Vec<RequestedPolicy>>(policies)
             .map_err(|e| format!("Failed to deserialize policy: {e}"))?;
         for policy in policies {
-            if RUNTIME_POLICY_LIST.read().await.get(&policy.id).is_some() {
+            if self
+                .runtime_policy_list
+                .read()
+                .await
+                .get(&policy.id)
+                .is_some()
+            {
                 trace!("duplicated policy: {:?}", policy);
                 continue;
             }
-            RUNTIME_POLICY_LIST
+            self.runtime_policy_list
                 .write()
                 .await
                 .insert(policy.id, policy.clone());
