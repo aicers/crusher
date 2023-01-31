@@ -1,9 +1,10 @@
 use crate::request::{RequestedInterval, RequestedPeriod, RequestedPolicy};
 
-use super::subscribe::{Event, Kind, INGESTION_CHANNEL};
+use super::subscribe::{Event, INGESTION_CHANNEL};
 use anyhow::{anyhow, bail, Result};
 use async_channel::Sender;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
+use giganto_client::publish::stream::RequestStreamRecord;
 use num_enum::IntoPrimitive;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -55,7 +56,7 @@ impl From<RequestedPeriod> for Period {
 #[derive(Deserialize, Debug)]
 pub(crate) struct Policy {
     pub id: String,
-    pub kind: Kind,
+    pub kind: RequestStreamRecord,
     pub(crate) interval: Interval,
     pub(crate) period: Period,
     pub(crate) offset: i32,
@@ -69,7 +70,7 @@ impl From<RequestedPolicy> for Policy {
     fn from(p: RequestedPolicy) -> Self {
         Self {
             id: p.id.to_string(),
-            kind: Kind::from(p.kind),
+            kind: RequestStreamRecord::from(p.kind),
             interval: Interval::from(p.interval),
             period: Period::from(p.period),
             offset: p.offset,

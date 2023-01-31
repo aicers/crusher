@@ -272,6 +272,7 @@ dependencies = [
  "chrono",
  "config",
  "directories",
+ "giganto-client",
  "lazy_static",
  "num-traits",
  "num_enum",
@@ -581,6 +582,23 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi 0.11.0+wasi-snapshot-preview1",
+]
+
+[[package]]
+name = "giganto-client"
+version = "0.1.0"
+source = "git+https://github.com/aicers/giganto.git?rev=c1d610c#c1d610c9cab254e83bf5e59f03b9e9575a970cdc"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "chrono",
+ "num_enum",
+ "oinq",
+ "quinn",
+ "semver",
+ "serde",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

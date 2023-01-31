@@ -1,10 +1,11 @@
-use super::{Client, Conn, Kind};
+use super::{Client, Conn};
 use crate::{
     model::{Interval, Period, Policy, TimeSeries},
     to_cert_chain, to_private_key,
 };
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
+use giganto_client::publish::stream::RequestStreamRecord;
 use lazy_static::lazy_static;
 use quinn::{Connection, Endpoint, ServerConfig};
 use rustls::{Certificate, PrivateKey};
@@ -161,7 +162,7 @@ fn test_conn_model() -> (Policy, TimeSeries) {
     (
         Policy {
             id: "0".to_string(),
-            kind: Kind::Conn,
+            kind: RequestStreamRecord::Conn,
             interval: Interval::FifteenMinutes,
             period: Period::OneDay,
             offset: 32_400,
