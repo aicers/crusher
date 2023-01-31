@@ -9,19 +9,28 @@ use crate::{
 use anyhow::{bail, Context, Error, Result};
 use async_channel::{Receiver, Sender};
 use chrono::{TimeZone, Utc};
+use giganto_client::{
+    connection::client_handshake,
+    frame::RecvError,
+    ingest::{
+        network::{Conn, DceRpc, Dns, Http, Kerberos, Ntlm, Rdp, Smtp, Ssh},
+        receive_ack_timestamp, send_event, send_record_header, RecordType,
+    },
+    publish::{
+        receive_crusher_data, receive_crusher_stream_start_message, send_stream_request,
+        stream::{NodeType, RequestCrusherStream, RequestStreamRecord},
+    },
+};
 use lazy_static::lazy_static;
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, WriteError};
 use rustls::{Certificate, PrivateKey};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::BufReader,
-    mem,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::exit,
     sync::Arc,
@@ -35,10 +44,8 @@ use tracing::{error, info, trace, warn};
 
 const INGESTION_PROTOCOL_VERSION: &str = "0.8.0-alpha.1";
 const PUBLISH_PROTOCOL_VERSION: &str = "0.7.0";
-const CRUSHER_CODE: u8 = 0x01;
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
-const INGESTION_TIME_SERIES_TYPE: u32 = 5;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
 
 lazy_static! {
@@ -49,21 +56,7 @@ lazy_static! {
     pub static ref LAST_TRANSFER_TIME: RwLock<HashMap<String,i64>> = RwLock::new(HashMap::new());
 }
 
-#[derive(Debug, PartialEq, Eq, TryFromPrimitive, IntoPrimitive, Clone, Copy, Deserialize)]
-#[repr(u32)]
-pub(crate) enum Kind {
-    Conn = 0,
-    Dns = 1,
-    Rdp = 2,
-    Http = 3,
-    Smtp = 5,
-    Ntlm = 6,
-    Kerberos = 7,
-    Ssh = 8,
-    DceRpc = 9,
-}
-
-impl From<RequestedKind> for Kind {
+impl From<RequestedKind> for RequestStreamRecord {
     fn from(k: RequestedKind) -> Self {
         match k {
             RequestedKind::Conn => Self::Conn,
@@ -113,21 +106,6 @@ trait ColumnValue {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Conn {
-    orig_addr: IpAddr, // 0
-    orig_port: u16,
-    resp_addr: IpAddr,
-    resp_port: u16,
-    proto: u8,
-    duration: i64, // 5
-    service: String,
-    orig_bytes: u64, // 7
-    resp_bytes: u64, // 8
-    orig_pkts: u64,  // 9
-    resp_pkts: u64,  // 10
-}
-
 impl ColumnValue for Conn {
     fn column_value(&self, column: usize) -> f64 {
         match column {
@@ -141,170 +119,19 @@ impl ColumnValue for Conn {
     }
 }
 
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Dns {
-    orig_addr: IpAddr,
-    orig_port: u16,
-    resp_addr: IpAddr,
-    resp_port: u16,
-    proto: u8,
-    duration: i64,
-    query: String,
-    answer: Vec<String>,
-    trans_id: u16,
-    rtt: i64,
-    qclass: u16,
-    qtype: u16,
-    rcode: u16,
-    aa_flag: bool,
-    tc_flag: bool,
-    rd_flag: bool,
-    ra_flag: bool,
-    ttl: Vec<i32>,
-}
-
 impl ColumnValue for Dns {}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Rdp {
-    orig_addr: IpAddr,
-    orig_port: u16,
-    resp_addr: IpAddr,
-    resp_port: u16,
-    proto: u8,
-    duration: i64,
-    cookie: String,
-}
 
 impl ColumnValue for Rdp {}
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Http {
-    orig_addr: IpAddr,
-    orig_port: u16,
-    resp_addr: IpAddr,
-    resp_port: u16,
-    proto: u8,
-    duration: i64,
-    method: String,
-    host: String,
-    uri: String,
-    referrer: String,
-    version: String,
-    user_agent: String,
-    request_len: usize,
-    response_len: usize,
-    status_code: u16,
-    status_msg: String,
-    username: String,
-    password: String,
-    cookie: String,
-    content_encoding: String,
-    content_type: String,
-    cache_control: String,
-}
-
 impl ColumnValue for Http {}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct Smtp {
-    orig_addr: IpAddr,
-    orig_port: u16,
-    resp_addr: IpAddr,
-    resp_port: u16,
-    proto: u8,
-    duration: i64,
-    mailfrom: String,
-    date: String,
-    from: String,
-    to: String,
-    subject: String,
-    agent: String,
-}
 
 impl ColumnValue for Smtp {}
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct Ntlm {
-    orig_addr: IpAddr,
-    orig_port: u16,
-    resp_addr: IpAddr,
-    resp_port: u16,
-    proto: u8,
-    duration: i64,
-    username: String,
-    hostname: String,
-    domainname: String,
-    server_nb_computer_name: String,
-    server_dns_computer_name: String,
-    server_tree_name: String,
-    success: String,
-}
-
 impl ColumnValue for Ntlm {}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct Kerberos {
-    orig_addr: IpAddr,
-    orig_port: u16,
-    resp_addr: IpAddr,
-    resp_port: u16,
-    proto: u8,
-    duration: i64,
-    request_type: String,
-    client: String,
-    service: String,
-    success: String,
-    error_msg: String,
-    from: i64,
-    till: i64,
-    cipher: String,
-    forwardable: String,
-    renewable: String,
-    client_cert_subject: String,
-    server_cert_subject: String,
-}
 
 impl ColumnValue for Kerberos {}
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct Ssh {
-    orig_addr: IpAddr,
-    orig_port: u16,
-    resp_addr: IpAddr,
-    resp_port: u16,
-    proto: u8,
-    duration: i64,
-    version: i64,
-    auth_success: String,
-    auth_attempts: i64,
-    direction: String,
-    client: String,
-    server: String,
-    cipher_alg: String,
-    mac_alg: String,
-    compression_alg: String,
-    kex_alg: String,
-    host_key_alg: String,
-    host_key: String,
-}
-
 impl ColumnValue for Ssh {}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct DceRpc {
-    orig_addr: IpAddr,
-    orig_port: u16,
-    resp_addr: IpAddr,
-    resp_port: u16,
-    proto: u8,
-    duration: i64,
-    rtt: i64,
-    named_pipe: String,
-    endpoint: String,
-    operation: String,
-}
 
 impl ColumnValue for DceRpc {}
 
@@ -562,13 +389,8 @@ async fn ingestion_connect(
     version: &str,
 ) -> Result<Connection> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    if let Err(e) = client_handshake(version, &mut send, &mut recv).await {
-        error!("Giganto handshake failed: {:#}", e);
-        bail!("{}", e);
-    }
+    client_handshake(&conn, version).await?;
     info!("Connection established to server {}", server_address);
-
     Ok(conn)
 }
 
@@ -579,13 +401,7 @@ async fn publish_connect(
     version: &str,
 ) -> Result<(Connection, SendStream)> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-
-    if let Err(e) = client_handshake(version, &mut send, &mut recv).await {
-        error!("Giganto handshake failed: {:#}", e);
-        bail!("{}", e);
-    }
-
+    let (send, _) = client_handshake(&conn, version).await?;
     info!("Connection established to server {}", server_address);
     Ok((conn, send))
 }
@@ -615,18 +431,20 @@ async fn process_network_stream(
     runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
 ) -> Result<()> {
     let start = calculate_series_start_time(&req_pol).await?;
-
-    request_network_stream(
-        send,
-        Kind::from(req_pol.kind).into(),
+    let req_msg = RequestCrusherStream {
         start,
-        &req_pol.id.to_string(),
-        req_pol.src_ip,
-        req_pol.dst_ip,
-        req_pol.node.clone(),
+        id: req_pol.id.to_string(),
+        src_ip: req_pol.src_ip,
+        des_ip: req_pol.dst_ip,
+        source: req_pol.node.clone(),
+    };
+    send_stream_request(
+        &mut (*send.lock().await),
+        RequestStreamRecord::from(req_pol.kind),
+        NodeType::Crusher,
+        req_msg,
     )
     .await?;
-
     task::spawn(
         async move { receiver(conn, sender, connection_notify, runtime_policy_list).await },
     );
@@ -638,91 +456,6 @@ fn error_in_ts(e: &Error) {
     error!("Failure in generating time series: {}", e);
 }
 
-async fn client_handshake(
-    version: &str,
-    send: &mut SendStream,
-    recv: &mut RecvStream,
-) -> Result<()> {
-    let version_len = u64::try_from(version.len())
-        .expect("less than u64::MAX")
-        .to_le_bytes();
-
-    let mut handshake_buf = Vec::with_capacity(version_len.len() + version.len());
-    handshake_buf.extend(version_len);
-    handshake_buf.extend(version.as_bytes());
-    send.write_all(&handshake_buf).await?;
-
-    let mut resp_len_buf = [0; std::mem::size_of::<u64>()];
-    recv.read_exact(&mut resp_len_buf).await?;
-    let len = u64::from_le_bytes(resp_len_buf);
-
-    let mut resp_buf = Vec::new();
-    resp_buf.resize(len.try_into()?, 0);
-    recv.read_exact(resp_buf.as_mut_slice()).await?;
-
-    if bincode::deserialize::<Option<&str>>(&resp_buf)
-        .unwrap()
-        .is_none()
-    {
-        bail!("Incompatible version");
-    }
-
-    Ok(())
-}
-
-async fn request_network_stream(
-    send: Arc<Mutex<SendStream>>,
-    protocol: u32,
-    start: i64,
-    model_id: &str,
-    src_ip: Option<IpAddr>,
-    dst_ip: Option<IpAddr>,
-    node_id: Option<String>,
-) -> Result<()> {
-    let mut req_data: Vec<u8> = Vec::new();
-    req_data.extend(CRUSHER_CODE.to_le_bytes());
-    req_data.extend(protocol.to_le_bytes());
-
-    let mut request_msg =
-        bincode::serialize(&(start, model_id.to_string(), src_ip, dst_ip, node_id))?;
-    let frame_len: u32 = request_msg.len().try_into()?;
-    req_data.extend(frame_len.to_le_bytes());
-    req_data.append(&mut request_msg);
-
-    let mut data_send = send.lock().await;
-    data_send.write_all(&req_data).await?;
-
-    Ok(())
-}
-
-async fn recv_network_stream(recv: &mut RecvStream) -> Result<(i64, Vec<u8>)> {
-    let mut ts_buf = [0; mem::size_of::<u64>()];
-    let mut len_buf = [0; mem::size_of::<u32>()];
-    let mut body_buf: Vec<u8> = Vec::new();
-
-    recv.read_exact(&mut ts_buf).await?;
-    let timestamp = i64::from_le_bytes(ts_buf);
-
-    recv.read_exact(&mut len_buf).await?;
-
-    let len: usize = u32::from_le_bytes(len_buf).try_into()?;
-    body_buf.resize(len, 0);
-    recv.read_exact(body_buf.as_mut_slice()).await?;
-
-    Ok((timestamp, body_buf))
-}
-
-async fn recv_stream_id(recv: &mut RecvStream) -> Result<u32> {
-    let mut id_len_buf = [0_u8; mem::size_of::<u32>()];
-    recv.read_exact(&mut id_len_buf).await?;
-    let len = usize::try_from(u32::from_le_bytes(id_len_buf))?;
-    let mut id_buf = vec![0; len];
-    recv.read_exact(&mut id_buf).await?;
-    let id = String::from_utf8(id_buf)?;
-    let result = id.parse::<u32>()?;
-    Ok(result)
-}
-
 #[allow(clippy::too_many_lines)]
 async fn receiver(
     conn: Connection,
@@ -731,7 +464,7 @@ async fn receiver(
     runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
 ) -> Result<()> {
     if let Ok(mut recv) = conn.accept_uni().await {
-        let Ok(id) = recv_stream_id(&mut recv).await else {
+        let Ok(id) = receive_crusher_stream_start_message(&mut recv).await else {
             connection_notify.notify_one();
             warn!("Failed to receive stream id value");
             bail!("Failed to receive stream id value");
@@ -748,9 +481,9 @@ async fn receiver(
 
         info!("Stream's Policy : {:?}", policy);
         loop {
-            if let Ok((timestamp, raw_event)) = recv_network_stream(&mut recv).await {
+            if let Ok((raw_event, timestamp)) = receive_crusher_data(&mut recv).await {
                 match policy.kind {
-                    Kind::Conn => {
+                    RequestStreamRecord::Conn => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
                             bincode::deserialize::<Conn>(&raw_event),
@@ -764,7 +497,7 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
-                    Kind::Dns => {
+                    RequestStreamRecord::Dns => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
                             bincode::deserialize::<Dns>(&raw_event),
@@ -778,7 +511,7 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
-                    Kind::Rdp => {
+                    RequestStreamRecord::Rdp => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
                             bincode::deserialize::<Rdp>(&raw_event),
@@ -792,7 +525,7 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
-                    Kind::Http => {
+                    RequestStreamRecord::Http => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
                             bincode::deserialize::<Http>(&raw_event),
@@ -806,7 +539,7 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
-                    Kind::Smtp => {
+                    RequestStreamRecord::Smtp => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
                             bincode::deserialize::<Smtp>(&raw_event),
@@ -820,7 +553,7 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
-                    Kind::Ntlm => {
+                    RequestStreamRecord::Ntlm => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
                             bincode::deserialize::<Ntlm>(&raw_event),
@@ -834,7 +567,7 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
-                    Kind::Kerberos => {
+                    RequestStreamRecord::Kerberos => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
                             bincode::deserialize::<Kerberos>(&raw_event),
@@ -853,7 +586,7 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
-                    Kind::Ssh => {
+                    RequestStreamRecord::Ssh => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
                             bincode::deserialize::<Ssh>(&raw_event),
@@ -867,7 +600,7 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
-                    Kind::DceRpc => {
+                    RequestStreamRecord::DceRpc => {
                         let (time, Ok(event)) = (
                             Utc.timestamp_nanos(timestamp),
                             bincode::deserialize::<DceRpc>(&raw_event),
@@ -881,6 +614,8 @@ async fn receiver(
                             error_in_ts(&e);
                         }
                     }
+                    // pcap is not used in crusher
+                    _ => {}
                 }
             } else {
                 connection_notify.notify_one();
@@ -911,7 +646,8 @@ async fn send_time_series(
     };
 
     // First data transmission (record type + series data)
-    first_series_data(&mut series_sender, series).await?;
+    send_record_header(&mut series_sender, RecordType::PeriodicTimeSeries).await?;
+    send_event(&mut series_sender, series.start.timestamp_nanos(), series).await?;
 
     // Receive start time of giganto last saved time series.
     tokio::spawn(receive_time_series_timestamp(
@@ -923,7 +659,7 @@ async fn send_time_series(
 
     // Data transmission after the first time (only series data)
     while let Ok(series) = recv_channel.recv().await {
-        series_data(&mut series_sender, series).await?;
+        send_event(&mut series_sender, series.start.timestamp_nanos(), series).await?;
     }
     Ok(())
 }
@@ -934,21 +670,19 @@ async fn receive_time_series_timestamp(
     time_sender: Sender<(String, i64)>,
     connection_notify: Arc<Notify>,
 ) -> Result<()> {
-    let mut timestamp_buf = [0; std::mem::size_of::<u64>()];
     loop {
-        match receiver.read_exact(&mut timestamp_buf).await {
-            Ok(()) => {
-                let recv_timestamp = i64::from_be_bytes(timestamp_buf);
+        match receive_ack_timestamp(&mut receiver).await {
+            Ok(timestamp) => {
                 trace!(
                     "The time of the timeseries last sent by {}. : {}",
                     sampling_policy_id,
-                    Utc.timestamp_nanos(recv_timestamp)
+                    Utc.timestamp_nanos(timestamp)
                 );
                 time_sender
-                    .send((sampling_policy_id.clone(), recv_timestamp))
+                    .send((sampling_policy_id.clone(), timestamp))
                     .await?;
             }
-            Err(quinn::ReadExactError::FinishedEarly) => {
+            Err(RecvError::ReadError(quinn::ReadExactError::FinishedEarly)) => {
                 break;
             }
             Err(e) => {
@@ -957,36 +691,6 @@ async fn receive_time_series_timestamp(
             }
         }
     }
-    Ok(())
-}
-
-async fn first_series_data(sender: &mut SendStream, series: TimeSeries) -> Result<()> {
-    sender
-        .write_all(&INGESTION_TIME_SERIES_TYPE.to_le_bytes())
-        .await
-        .context("Failed to send record type data")?;
-    series_data(sender, series).await?;
-    Ok(())
-}
-
-async fn series_data(sender: &mut SendStream, series: TimeSeries) -> Result<()> {
-    let start_time = series.start.timestamp_nanos().to_le_bytes();
-    let series_data = bincode::serialize(&series)?;
-    let series_data_len = u32::try_from(series_data.len())?.to_le_bytes();
-    let mut data: Vec<u8> =
-        Vec::with_capacity(start_time.len() + series_data_len.len() + series_data.len());
-    data.extend_from_slice(&start_time);
-    data.extend_from_slice(&series_data_len);
-    data.extend_from_slice(&series_data);
-    sender
-        .write_all(&data)
-        .await
-        .context("Failed to send body data")?;
-    trace!(
-        "Time series transmission complete : {} {}",
-        series.sampling_policy_id,
-        series.start
-    );
     Ok(())
 }
 
