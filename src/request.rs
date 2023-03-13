@@ -19,7 +19,7 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const REVIEW_PROTOCOL_VERSION: &str = "0.13.0-alpha.37";
+const REVIEW_PROTOCOL_VERSION: &str = "0.17.0-alpha.1";
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RequestedPolicy {
