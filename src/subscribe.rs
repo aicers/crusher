@@ -42,8 +42,8 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const INGESTION_PROTOCOL_VERSION: &str = "0.8.0-alpha.1";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.7.0";
+const INGESTION_PROTOCOL_VERSION: &str = "0.8.0";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.8.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
@@ -435,7 +435,7 @@ async fn process_network_stream(
         start,
         id: req_pol.id.to_string(),
         src_ip: req_pol.src_ip,
-        des_ip: req_pol.dst_ip,
+        dst_ip: req_pol.dst_ip,
         source: req_pol.node.clone(),
     };
     send_stream_request(
