@@ -2,6 +2,10 @@
 
 Crusher generates statistics from raw events.
 
+## Requirements
+
+* Giganto 0.8.0 or higher
+
 ## Usage
 
 You can run Crusher by invoking the following command:
@@ -53,4 +57,4 @@ By default, giganto reads the config file from the following directories:
 
 ## Copyright
 
-* Copyright 2022 EINSIS, Inc.
+* Copyright 2023 EINSIS, Inc.
