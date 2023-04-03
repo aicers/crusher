@@ -9,7 +9,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use rustls::{Certificate, PrivateKey};
 use settings::Settings;
 use std::{collections::HashMap, env, fs, process::exit, sync::Arc};
-use tokio::{sync::RwLock, task};
+use tokio::{
+    sync::{Notify, RwLock},
+    task,
+};
+use tracing::{error, warn};
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 const USAGE: &str = "\
@@ -26,71 +30,96 @@ ARG:
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let settings = if let Some(config_filename) = parse() {
+    let config_filename = parse();
+    let mut settings = if let Some(config_filename) = config_filename.clone() {
         Settings::from_file(&config_filename)?
     } else {
         Settings::new()?
     };
 
-    let cert_pem = fs::read(&settings.cert).with_context(|| {
-        format!(
-            "failed to read certificate file: {}",
-            settings.cert.display()
-        )
-    })?;
-    let cert = to_cert_chain(&cert_pem).context("cannot read certificate chain")?;
-    assert!(!cert.is_empty());
-    let key_pem = fs::read(&settings.key).with_context(|| {
-        format!(
-            "failed to read private key file: {}",
-            settings.key.display()
-        )
-    })?;
-    let key = to_private_key(&key_pem).context("cannot read private key")?;
-
     tracing_subscriber::fmt::init();
+    loop {
+        let config_reload = Arc::new(Notify::new());
+        let notify_shutdown = Arc::new(Notify::new());
 
-    let mut files: Vec<Vec<u8>> = Vec::new();
-    for root in &settings.roots {
-        let file = fs::read(root).expect("Failed to read file");
-        files.push(file);
+        let cert_pem = fs::read(&settings.cert).with_context(|| {
+            format!(
+                "failed to read certificate file: {}",
+                settings.cert.display()
+            )
+        })?;
+        let cert = to_cert_chain(&cert_pem).context("cannot read certificate chain")?;
+        assert!(!cert.is_empty());
+        let key_pem = fs::read(&settings.key).with_context(|| {
+            format!(
+                "failed to read private key file: {}",
+                settings.key.display()
+            )
+        })?;
+        let key = to_private_key(&key_pem).context("cannot read private key")?;
+
+        let mut files: Vec<Vec<u8>> = Vec::new();
+        for root in &settings.roots {
+            let file = fs::read(root).expect("Failed to read file");
+            files.push(file);
+        }
+
+        read_last_timestamp(&settings.last_timestamp_data).await?;
+
+        let (request_send, request_recv) =
+            async_channel::bounded::<RequestedPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
+
+        let request_client = request::Client::new(
+            settings.review_address,
+            settings.review_name,
+            cert.clone(),
+            key.clone(),
+            files.clone(),
+            request_send,
+        );
+        let runtime_policy_list = Arc::new(RwLock::new(HashMap::new())); // current sampling_policy value
+        let delete_policy_ids = Arc::new(RwLock::new(Vec::new()));
+        task::spawn(request_client.run(
+            Arc::clone(&runtime_policy_list),
+            Arc::clone(&delete_policy_ids),
+            config_reload.clone(),
+            notify_shutdown.clone(),
+        ));
+
+        let subscribe_client = subscribe::Client::new(
+            settings.giganto_ingest_address,
+            settings.giganto_publish_address,
+            settings.giganto_name,
+            settings.last_timestamp_data,
+            cert,
+            key,
+            files,
+            request_recv,
+        );
+        task::spawn(subscribe_client.run(
+            runtime_policy_list,
+            delete_policy_ids,
+            notify_shutdown.clone(),
+        ));
+        loop {
+            config_reload.notified().await;
+            if let Some(config_filename) = config_filename.clone() {
+                match Settings::from_file(&config_filename) {
+                    Ok(new_settings) => {
+                        settings = new_settings;
+                        notify_shutdown.notify_waiters();
+                        notify_shutdown.notified().await;
+                        break;
+                    }
+                    Err(e) => {
+                        error!("Failed to load the new configuration: {:?}", e);
+                        warn!("Run Crusher with the previous config");
+                        continue;
+                    }
+                }
+            }
+        }
     }
-
-    read_last_timestamp(&settings.last_timestamp_data).await?;
-
-    let (request_send, request_recv) =
-        async_channel::bounded::<RequestedPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
-
-    let request_client = request::Client::new(
-        settings.review_address,
-        settings.review_name,
-        cert.clone(),
-        key.clone(),
-        files.clone(),
-        request_send,
-    );
-    let active_policy_list = Arc::new(RwLock::new(HashMap::new())); // current sampling_policy value
-    let delete_policy_ids = Arc::new(RwLock::new(Vec::new()));
-    task::spawn(request_client.run(
-        Arc::clone(&active_policy_list),
-        Arc::clone(&delete_policy_ids),
-    ));
-
-    let subscribe_client = subscribe::Client::new(
-        settings.giganto_ingestion_address,
-        settings.giganto_publish_address,
-        settings.giganto_name,
-        settings.last_timestamp_data,
-        cert,
-        key,
-        files,
-        request_recv,
-    );
-    subscribe_client
-        .run(active_policy_list, delete_policy_ids)
-        .await;
-
-    Ok(())
 }
 
 /// Parses the command line arguments and returns the first argument.

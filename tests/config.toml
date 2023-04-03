@@ -2,7 +2,7 @@
  cert = "tests/cert.pem"
  roots = ["tests/root.pem"]
  giganto_name = "localhost"
- giganto_ingestion_address = "127.0.0.1:38370"
+ giganto_ingest_address = "127.0.0.1:38370"
  giganto_publish_address = "127.0.0.1:38371"
  review_name = "localhost"
  review_address ="127.0.0.1:38390"

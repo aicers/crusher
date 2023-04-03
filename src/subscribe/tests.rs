@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 lazy_static! {
     pub(crate) static ref TOKEN: Mutex<u32> = Mutex::new(0);
@@ -26,7 +26,7 @@ const CERT_PATH: &str = "tests/cert.pem";
 const KEY_PATH: &str = "tests/key.pem";
 const CA_CERT_PATH: &str = "tests/root.pem";
 const HOST: &str = "localhost";
-const TEST_INGESTION_PORT: u16 = 60190;
+const TEST_INGEST_PORT: u16 = 60190;
 const TEST_PUBLISH_PORT: u16 = 60191;
 const PROTOCOL_VERSION: &str = "0.4.0";
 const LAST_TIME_SERIES_PATH: &str = "tests/time_data.json";
@@ -107,7 +107,7 @@ fn client() -> Client {
     let (_, rx) = async_channel::unbounded();
 
     Client::new(
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_INGESTION_PORT),
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_INGEST_PORT),
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_PUBLISH_PORT),
         String::from(HOST),
         PathBuf::from(LAST_TIME_SERIES_PATH),
@@ -132,7 +132,7 @@ async fn connection_handshake(conn: &Connection) {
     let (mut send, mut recv) = conn
         .open_bi()
         .await
-        .expect("Failed to open bidirection channel");
+        .expect("Failed to open bidirectional channel");
     let version_len = u64::try_from(PROTOCOL_VERSION.len())
         .expect("less than u64::MAX")
         .to_le_bytes();
@@ -173,7 +173,7 @@ fn test_conn_model() -> (Policy, TimeSeries) {
         },
         TimeSeries {
             sampling_policy_id: "0".to_string(),
-            start: DateTime::<Utc>::from_utc(
+            start: DateTime::<Utc>::from_naive_utc_and_offset(
                 NaiveDate::from_ymd_opt(2022, 11, 17)
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
@@ -209,14 +209,15 @@ fn gen_conn() -> Conn {
 #[allow(unused)]
 async fn connect() {
     let _lock = TOKEN.lock().await;
-    let ingestion_server = TestServer::new(TEST_INGESTION_PORT);
+    let ingest_server = TestServer::new(TEST_INGEST_PORT);
     let publish_server = TestServer::new(TEST_PUBLISH_PORT);
-    tokio::spawn(ingestion_server.run());
+    tokio::spawn(ingest_server.run());
     tokio::spawn(publish_server.run());
     client()
         .run(
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(RwLock::new(Vec::new())),
+            Arc::new(Notify::new()),
         )
         .await;
 }
@@ -240,7 +241,7 @@ async fn timeseries_with_conn() {
         let conn_event = gen_conn();
         let dur = Duration::minutes(min);
 
-        let time = DateTime::<Utc>::from_utc(
+        let time = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2022, 11, 17)
                 .unwrap()
                 .and_hms_opt(0, 0, 0)

@@ -1,6 +1,6 @@
 use crate::request::{RequestedInterval, RequestedPeriod, RequestedPolicy};
 
-use super::subscribe::{Event, INGESTION_CHANNEL};
+use super::subscribe::{Event, INGEST_CHANNEL};
 use anyhow::{anyhow, bail, Result};
 use async_channel::Sender;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
@@ -122,11 +122,7 @@ pub(crate) async fn time_series(
     };
 
     if time.timestamp() - series.start.timestamp() > period {
-        if let Some(sender) = INGESTION_CHANNEL
-            .read()
-            .await
-            .get(&series.sampling_policy_id)
-        {
+        if let Some(sender) = INGEST_CHANNEL.read().await.get(&series.sampling_policy_id) {
             sender.send(series.clone()).await?;
         } else {
             send_channel.send(series.clone()).await?;
@@ -199,5 +195,5 @@ fn start_time(policy: &Policy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
         bail!("failed to create NaiveDateTime from timestamp");
     };
 
-    Ok(DateTime::<Utc>::from_utc(datetime, Utc))
+    Ok(DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc))
 }

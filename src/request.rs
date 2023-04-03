@@ -4,6 +4,7 @@ use async_channel::Sender;
 use async_trait::async_trait;
 use bincode::Options;
 use num_enum::TryFromPrimitive;
+use oinq::{request, Configuration};
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use rustls::{Certificate, PrivateKey};
 use serde::Deserialize;
@@ -14,7 +15,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    sync::RwLock,
+    sync::{Notify, RwLock},
     time::{sleep, Duration},
 };
 use tracing::{error, info, trace, warn};
@@ -102,6 +103,8 @@ impl Client {
         self,
         active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+        config_reload: Arc<Notify>,
+        wait_shutdown: Arc<Notify>,
     ) -> Result<()> {
         loop {
             match connect(
@@ -111,6 +114,8 @@ impl Client {
                 &self.request_send,
                 active_policy_list.clone(),
                 delete_policy_ids.clone(),
+                config_reload.clone(),
+                wait_shutdown.clone(),
             )
             .await
             {
@@ -143,6 +148,7 @@ impl Client {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect(
     endpoint: &Endpoint,
     server_address: SocketAddr,
@@ -150,6 +156,8 @@ async fn connect(
     request_send: &Sender<RequestedPolicy>,
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    config_reload: Arc<Notify>,
+    wait_shutdown: Arc<Notify>,
 ) -> Result<()> {
     let connection = endpoint.connect(server_address, server_name)?.await?;
 
@@ -166,6 +174,7 @@ async fn connect(
         request_send: request_send.clone(),
         active_policy_list,
         delete_policy_ids,
+        config_reload: config_reload.clone(),
     };
 
     tokio::select! {
@@ -176,6 +185,11 @@ async fn connect(
             }
             Ok(())
         },
+        _ = wait_shutdown.notified() => {
+            info!("Shutting down request channel");
+            endpoint.close(0_u32.into(), &[]);
+            Ok(())
+        }
     }
 }
 
@@ -215,6 +229,7 @@ struct RequestHandler {
     request_send: Sender<RequestedPolicy>,
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    config_reload: Arc<Notify>,
 }
 
 #[async_trait]
@@ -277,5 +292,34 @@ impl oinq::request::Handler for RequestHandler {
         }
 
         Ok(())
+    }
+
+    async fn get_config(&mut self) -> Result<Configuration, String> {
+        let conf =
+            crate::settings::get_config().map_err(|e| format!("failed to get config: {e}"))?;
+        Ok(conf)
+    }
+
+    async fn set_config(&mut self, conf: Configuration) -> Result<(), String> {
+        info!("start set configuration");
+        crate::settings::set_config(conf).map_err(|e| format!("failed to set config: {e}"))?;
+        self.config_reload.notify_one();
+        Ok(())
+    }
+
+    async fn process_list(&mut self) -> Result<Vec<request::Process>, String> {
+        let list = roxy::process_list().await;
+        let list = list
+            .into_iter()
+            .map(|p| request::Process {
+                user: p.user,
+                cpu_usage: p.cpu_usage,
+                mem_usage: p.mem_usage,
+                start_time: p.start_time,
+                command: p.command,
+            })
+            .collect();
+
+        Ok(list)
     }
 }

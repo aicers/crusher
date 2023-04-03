@@ -26,7 +26,7 @@ The following is key values in the TOML configuration file.
 * `roots`: RootCA file. (for Giganto, Review)
 * `giganto_name`: the name of the Giganto. This must match with the DNS name in
   the certificate.
-* `giganto_ingestion_address`: IP address and port number of `Giganto ingestion`.
+* `giganto_ingest_address`: IP address and port number of `Giganto ingest`.
 * `giganto_publish_address`: IP address and port number of `Giganto publish`.
 * `review_name`: the name of the review. This must match with the DNS name in
   the certificate.
@@ -41,7 +41,7 @@ key = "key.pem"
 cert = "cert.pem"
 roots = ["ca1.pem", "ca2.pem", "ca3.pem"]
 giganto_name = "localhost"
-giganto_ingestion_address = "127.0.0.1:38370"
+giganto_ingest_address = "127.0.0.1:38370"
 giganto_publish_address = "127.0.0.1:38371"
 review_name = "localhost"
 review_address ="127.0.0.1:38390"
