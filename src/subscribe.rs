@@ -42,8 +42,8 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const INGESTION_PROTOCOL_VERSION: &str = "0.8.0";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.8.0";
+const INGESTION_PROTOCOL_VERSION: &str = "0.9.0";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.9.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
