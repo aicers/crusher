@@ -17,7 +17,7 @@ giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "
 lazy_static = "1"
 num_enum = "0.6"
 num-traits = "0.2"
-oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.6.0" }
+oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.6.1" }
 quinn = "0.9"
 roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.1.0" }
 rustls = "0.20"

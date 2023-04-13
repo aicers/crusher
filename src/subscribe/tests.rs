@@ -213,7 +213,12 @@ async fn connect() {
     let publish_server = TestServer::new(TEST_PUBLISH_PORT);
     tokio::spawn(ingestion_server.run());
     tokio::spawn(publish_server.run());
-    client().run(Arc::new(RwLock::new(HashMap::new()))).await;
+    client()
+        .run(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(Vec::new())),
+        )
+        .await;
 }
 
 // start time: 2022/11/17 00:00:00

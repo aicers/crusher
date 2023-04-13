@@ -98,7 +98,8 @@ impl Client {
 
     pub async fn run(
         self,
-        runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+        active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+        delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     ) -> Result<()> {
         loop {
             match connect(
@@ -107,7 +108,8 @@ impl Client {
                 &self.server_name,
                 &self.agent_id,
                 &self.request_send,
-                runtime_policy_list.clone(),
+                active_policy_list.clone(),
+                delete_policy_ids.clone(),
             )
             .await
             {
@@ -146,7 +148,8 @@ async fn connect(
     server_name: &str,
     agent_id: &str,
     request_send: &Sender<RequestedPolicy>,
-    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
 ) -> Result<()> {
     let connection = endpoint.connect(server_address, server_name)?.await?;
 
@@ -161,7 +164,8 @@ async fn connect(
 
     let request_handler = RequestHandler {
         request_send: request_send.clone(),
-        runtime_policy_list,
+        active_policy_list,
+        delete_policy_ids,
     };
 
     tokio::select! {
@@ -211,7 +215,8 @@ async fn handle_incoming(handler: RequestHandler, conn: &Connection) -> Result<(
 #[derive(Clone)]
 struct RequestHandler {
     request_send: Sender<RequestedPolicy>,
-    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
 }
 
 #[async_trait]
@@ -239,7 +244,7 @@ impl oinq::request::Handler for RequestHandler {
             .map_err(|e| format!("Failed to deserialize policy: {e}"))?;
         for policy in policies {
             if self
-                .runtime_policy_list
+                .active_policy_list
                 .read()
                 .await
                 .get(&policy.id)
@@ -248,7 +253,7 @@ impl oinq::request::Handler for RequestHandler {
                 trace!("duplicated policy: {:?}", policy);
                 continue;
             }
-            self.runtime_policy_list
+            self.active_policy_list
                 .write()
                 .await
                 .insert(policy.id, policy.clone());
@@ -257,6 +262,20 @@ impl oinq::request::Handler for RequestHandler {
                 .send(policy)
                 .await
                 .map_err(|e| format!("send fail: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    async fn delete_sampling_policy(&mut self, policy_ids: &[u8]) -> Result<(), String> {
+        let policy_ids = bincode::DefaultOptions::new()
+            .deserialize::<Vec<u32>>(policy_ids)
+            .map_err(|e| format!("Failed to deserialize policy id: {e}"))?;
+        for id in policy_ids {
+            if let Some(deleted_policy) = self.active_policy_list.write().await.remove(&id) {
+                trace!("{} Deleted from runtime policy list.", deleted_policy.id);
+                self.delete_policy_ids.write().await.push(id);
+            }
         }
 
         Ok(())
