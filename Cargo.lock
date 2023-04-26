@@ -281,7 +281,7 @@ dependencies = [
  "giganto-client",
  "lazy_static",
  "num-traits",
- "num_enum",
+ "num_enum 0.6.1",
  "oinq",
  "quinn",
  "roxy",
@@ -592,13 +592,13 @@ dependencies = [
 
 [[package]]
 name = "giganto-client"
-version = "0.3.0"
-source = "git+https://github.com/aicers/giganto-client.git?tag=0.3.0#72bbda3d99b49d59778c095558e4ae8ab7657f44"
+version = "0.5.0"
+source = "git+https://github.com/aicers/giganto-client.git?tag=0.5.0#68ed71ee4fb350806dbee76a4c4c8be89243b9a8"
 dependencies = [
  "anyhow",
  "bincode",
  "chrono",
- "num_enum",
+ "num_enum 0.6.1",
  "oinq",
  "quinn",
  "semver",
@@ -958,7 +958,16 @@ version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f646caf906c20226733ed5b1374287eb97e3c2a5c227ce668c1f2ce20ae57c9"
 dependencies = [
- "num_enum_derive",
+ "num_enum_derive 0.5.11",
+]
+
+[[package]]
+name = "num_enum"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a015b430d3c108a207fd776d2e2196aaf8b1cf8cf93253e3a097ff3085076a1"
+dependencies = [
+ "num_enum_derive 0.6.1",
 ]
 
 [[package]]
@@ -971,6 +980,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96667db765a921f7b295ffee8b60472b686a51d4f21c2ee4ffdb94c7013b65a6"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.10",
 ]
 
 [[package]]
@@ -992,7 +1013,7 @@ dependencies = [
  "futures",
  "gethostname",
  "ipnet",
- "num_enum",
+ "num_enum 0.5.11",
  "quinn",
  "semver",
  "serde",
@@ -1410,7 +1431,7 @@ dependencies = [
  "ipnet",
  "log",
  "nix",
- "num_enum",
+ "num_enum 0.5.11",
  "openssl",
  "pnet",
  "regex",

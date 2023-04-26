@@ -46,6 +46,7 @@ pub enum RequestedKind {
     Kerberos = 6,
     Ssh = 7,
     DceRpc = 8,
+    Ftp = 9,
 }
 
 #[derive(Debug, Deserialize, TryFromPrimitive, Clone)]

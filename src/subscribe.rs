@@ -13,7 +13,7 @@ use giganto_client::{
     connection::client_handshake,
     frame::RecvError,
     ingest::{
-        network::{Conn, DceRpc, Dns, Http, Kerberos, Ntlm, Rdp, Smtp, Ssh},
+        network::{Conn, DceRpc, Dns, Ftp, Http, Kerberos, Ntlm, Rdp, Smtp, Ssh},
         receive_ack_timestamp, send_event, send_record_header, RecordType,
     },
     publish::{
@@ -42,8 +42,8 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const INGESTION_PROTOCOL_VERSION: &str = "0.9.0";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.9.0";
+const INGESTION_PROTOCOL_VERSION: &str = "0.10.0";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.10.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
@@ -68,6 +68,7 @@ impl From<RequestedKind> for RequestStreamRecord {
             RequestedKind::Kerberos => Self::Kerberos,
             RequestedKind::Ssh => Self::Ssh,
             RequestedKind::DceRpc => Self::DceRpc,
+            RequestedKind::Ftp => Self::Ftp,
         }
     }
 }
@@ -82,6 +83,7 @@ pub(crate) enum Event {
     Kerberos(Kerberos),
     Ssh(Ssh),
     DceRpc(DceRpc),
+    Ftp(Ftp),
 }
 
 impl Event {
@@ -96,6 +98,7 @@ impl Event {
             Self::Kerberos(evt) => evt.column_value(column),
             Self::Ssh(evt) => evt.column_value(column),
             Self::DceRpc(evt) => evt.column_value(column),
+            Self::Ftp(evt) => evt.column_value(column),
         }
     }
 }
@@ -134,6 +137,8 @@ impl ColumnValue for Kerberos {}
 impl ColumnValue for Ssh {}
 
 impl ColumnValue for DceRpc {}
+
+impl ColumnValue for Ftp {}
 
 pub struct Client {
     ingestion_addr: SocketAddr,
@@ -609,6 +614,20 @@ async fn receiver(
                         };
                         if let Err(e) =
                             time_series(&policy, &mut series, time, &Event::DceRpc(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    RequestStreamRecord::Ftp => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Ftp>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Ftp(event), &sender)
                                 .await
                         {
                             error_in_ts(&e);
