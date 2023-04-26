@@ -5,6 +5,12 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add more network data type. (`Ftp`)
+
 ## [0.1.0] - 2023-03-30
 
 ### Added
@@ -15,4 +21,5 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Send the generated `time series` to `giganto`'s ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.1.0...main
 [0.1.0]: https://github.com/aicers/crusher/tree/0.1.0
