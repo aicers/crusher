@@ -10,6 +10,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Add more network data type. (`Ftp`)
+- Delete the policies by requested IDs.
 
 ## [0.1.0] - 2023-03-30
 

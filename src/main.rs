@@ -70,8 +70,12 @@ async fn main() -> Result<()> {
         files.clone(),
         request_send,
     );
-    let runtime_policy_list = Arc::new(RwLock::new(HashMap::new())); // current sampling_policy value
-    task::spawn(request_client.run(Arc::clone(&runtime_policy_list)));
+    let active_policy_list = Arc::new(RwLock::new(HashMap::new())); // current sampling_policy value
+    let delete_policy_ids = Arc::new(RwLock::new(Vec::new()));
+    task::spawn(request_client.run(
+        Arc::clone(&active_policy_list),
+        Arc::clone(&delete_policy_ids),
+    ));
 
     let subscribe_client = subscribe::Client::new(
         settings.giganto_ingestion_address,
@@ -83,7 +87,9 @@ async fn main() -> Result<()> {
         files,
         request_recv,
     );
-    subscribe_client.run(runtime_policy_list).await;
+    subscribe_client
+        .run(active_policy_list, delete_policy_ids)
+        .await;
 
     Ok(())
 }

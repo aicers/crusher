@@ -23,13 +23,13 @@ use giganto_client::{
 };
 use lazy_static::lazy_static;
 use num_traits::ToPrimitive;
-use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, WriteError};
+use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
 use rustls::{Certificate, PrivateKey};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    io::BufReader,
+    io::{BufReader, BufWriter},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::exit,
@@ -162,7 +162,7 @@ impl Client {
         request_recv: Receiver<RequestedPolicy>,
     ) -> Self {
         let endpoint = client::config(certs, key, files)
-            .expect("server configuration error with cert, key or root");
+            .expect("Server configuration error with cert, key or root");
         Client {
             ingestion_addr,
             publish_addr,
@@ -173,7 +173,11 @@ impl Client {
         }
     }
 
-    pub async fn run(self, runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>) {
+    pub async fn run(
+        self,
+        active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+        delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    ) {
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
         if let Err(e) = tokio::try_join!(
             ingestion_connection_control(
@@ -181,7 +185,7 @@ impl Client {
                 self.ingestion_addr,
                 self.server_name.clone(),
                 self.endpoint.clone(),
-                self.last_series_time_path,
+                self.last_series_time_path.clone(),
                 INGESTION_PROTOCOL_VERSION,
             ),
             publish_connection_control(
@@ -191,10 +195,12 @@ impl Client {
                 &self.endpoint,
                 PUBLISH_PROTOCOL_VERSION,
                 &self.request_recv,
-                runtime_policy_list,
+                active_policy_list,
+                delete_policy_ids,
+                self.last_series_time_path,
             )
         ) {
-            error!("giganto connection error occur : {}", e);
+            error!("Giganto connection error occur : {}", e);
         }
     }
 }
@@ -228,15 +234,20 @@ async fn ingestion_connection_control(
                             drop(connection_notify);
                             INGESTION_CHANNEL.write().await.clear();
                             error!(
-                                "Stream Channel Closed. Retry connection to {}",
+                                "Stream channel closed. Retry connection to {}",
                                 server_addr,
                             );
                             continue 'connection;
                         }
                         Ok(series) = series_recv.recv() => {
-                           // First time_series data receive
-                           let connection = arc_conn.clone();
-                           tokio::spawn(send_time_series(connection, series, time_sender.clone(),connection_notify.clone()));
+                            // First time_series data receive
+                            let connection = arc_conn.clone();
+                            tokio::spawn(send_time_series(
+                                connection,
+                                series,
+                                time_sender.clone(),
+                                connection_notify.clone(),
+                            ));
                         }
                     }
                 }
@@ -268,7 +279,7 @@ async fn ingestion_connection_control(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn publish_connection_control(
     series_send: Sender<TimeSeries>,
     server_addr: SocketAddr,
@@ -276,21 +287,25 @@ async fn publish_connection_control(
     endpoint: &Endpoint,
     version: &str,
     request_recv: &Receiver<RequestedPolicy>,
-    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    last_series_time_path: PathBuf,
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = Arc::new(Notify::new());
         match publish_connect(endpoint, server_addr, server_name, version).await {
             Ok((conn, send)) => loop {
                 let req_send = Arc::new(Mutex::new(send));
-                for req_pol in runtime_policy_list.read().await.values() {
+                for req_pol in active_policy_list.read().await.values() {
                     if let Err(e) = process_network_stream(
                         conn.clone(),
                         series_send.clone(),
                         req_pol.clone(),
                         req_send.clone(),
                         connection_notify.clone(),
-                        runtime_policy_list.clone(),
+                        active_policy_list.clone(),
+                        delete_policy_ids.clone(),
+                        last_series_time_path.clone(),
                     )
                     .await
                     {
@@ -320,18 +335,26 @@ async fn publish_connection_control(
                 }
                 loop {
                     tokio::select! {
-                        _ = connection_notify.notified() =>{
+                        _ = connection_notify.notified() => {
                             drop(connection_notify);
                             error!(
-                                "Stream Channel Closed. Retry connection to {} after {} seconds.",
+                                "Stream channel closed. Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
                             );
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                             continue 'connection;
                         }
                         Ok(req_pol) = request_recv.recv() => {
-                            if let Err(e) = process_network_stream(conn.clone(), series_send.clone(), req_pol,req_send.clone(),connection_notify.clone(), runtime_policy_list.clone())
-                            .await
+                            if let Err(e) = process_network_stream(
+                                conn.clone(),
+                                series_send.clone(),
+                                req_pol,
+                                req_send.clone(),
+                                connection_notify.clone(),
+                                active_policy_list.clone(),
+                                delete_policy_ids.clone(),
+                                last_series_time_path.clone(),
+                            ).await
                             {
                                 for cause in e.chain() {
                                     if let Some(e) = cause.downcast_ref::<WriteError>() {
@@ -427,13 +450,16 @@ async fn calculate_series_start_time(req_pol: &RequestedPolicy) -> Result<i64> {
     Ok(start)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_network_stream(
     conn: Connection,
     sender: Sender<TimeSeries>,
     req_pol: RequestedPolicy,
     send: Arc<Mutex<SendStream>>,
     connection_notify: Arc<Notify>,
-    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    last_series_time_path: PathBuf,
 ) -> Result<()> {
     let start = calculate_series_start_time(&req_pol).await?;
     let req_msg = RequestCrusherStream {
@@ -450,9 +476,17 @@ async fn process_network_stream(
         req_msg,
     )
     .await?;
-    task::spawn(
-        async move { receiver(conn, sender, connection_notify, runtime_policy_list).await },
-    );
+    task::spawn(async move {
+        receiver(
+            conn,
+            sender,
+            connection_notify,
+            active_policy_list,
+            delete_policy_ids,
+            last_series_time_path,
+        )
+        .await
+    });
     Ok(())
 }
 
@@ -466,7 +500,9 @@ async fn receiver(
     conn: Connection,
     sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
-    runtime_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    last_series_time_path: PathBuf,
 ) -> Result<()> {
     if let Ok(mut recv) = conn.accept_uni().await {
         let Ok(id) = receive_crusher_stream_start_message(&mut recv).await else {
@@ -475,7 +511,7 @@ async fn receiver(
             bail!("Failed to receive stream id value");
         };
 
-        let req_pol = if let Some(req_pol) = runtime_policy_list.read().await.get(&id) {
+        let req_pol = if let Some(req_pol) = active_policy_list.read().await.get(&id) {
             req_pol.clone()
         } else {
             bail!("Failed to get runtime policy data");
@@ -484,8 +520,17 @@ async fn receiver(
         let start = calculate_series_start_time(&req_pol).await?;
         let (policy, mut series) = convert_policy(start, req_pol);
 
-        info!("Stream's Policy : {:?}", policy);
+        info!("Stream's policy : {:?}", policy);
         loop {
+            if delete_policy_ids.read().await.contains(&id) {
+                recv.stop(VarInt::default())?;
+                delete_last_timestamp(&last_series_time_path, id)?;
+                delete_policy_ids
+                    .write()
+                    .await
+                    .retain(|&delete_id| delete_id != id);
+                break;
+            }
             if let Ok((raw_event, timestamp)) = receive_crusher_data(&mut recv).await {
                 match policy.kind {
                     RequestStreamRecord::Conn => {
@@ -706,7 +751,7 @@ async fn receive_time_series_timestamp(
             }
             Err(e) => {
                 connection_notify.notify_one();
-                bail!("last series times error: {}", e);
+                bail!("Last series times error: {}", e);
             }
         }
     }
@@ -750,5 +795,18 @@ pub async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
             LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
         }
     }
+    Ok(())
+}
+
+fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Result<()> {
+    let file = File::open(last_series_time_path)?;
+    let id = format!("{id}");
+    let mut json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
+    if let Value::Object(ref mut map_data) = json {
+        map_data.remove(&id);
+    }
+    let file = File::create(last_series_time_path)?;
+    serde_json::to_writer(BufWriter::new(file), &json)?;
+
     Ok(())
 }
