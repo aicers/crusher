@@ -12,6 +12,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Add more network data type. (`Ftp`)
 - Delete the policies by requested IDs.
 
+### Changed
+
+- Removes the `agent_id` provided in the config file. This value is provided by
+  the CN in the certificate in the form of `agent_id@host_id`.
+- Requires REview 0.22.x
+
 ## [0.1.0] - 2023-03-30
 
 ### Added

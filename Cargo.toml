@@ -13,14 +13,14 @@ bincode = "1"
 chrono = { version = "0.4", features = ["serde"] }
 config = { version = "0.13", features = ["toml"], default-features = false }
 directories = "5.0"
-giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.5.0" }
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.7.0" }
 lazy_static = "1"
 num_enum = "0.6"
 num-traits = "0.2"
-oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.6.1" }
-quinn = "0.9"
+oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.7.0" }
+quinn = "0.10"
 roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.1.0" }
-rustls = "0.20"
+rustls = "0.21"
 rustls-pemfile = "1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

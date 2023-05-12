@@ -19,7 +19,7 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const REVIEW_PROTOCOL_VERSION: &str = "0.18.0";
+const REVIEW_PROTOCOL_VERSION: &str = "0.22.0";
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RequestedPolicy {
@@ -70,7 +70,6 @@ pub enum RequestedPeriod {
 pub struct Client {
     server_address: SocketAddr,
     server_name: String,
-    agent_id: String,
     endpoint: Endpoint,
     request_send: Sender<RequestedPolicy>,
 }
@@ -79,7 +78,6 @@ impl Client {
     pub fn new(
         server_address: SocketAddr,
         server_name: String,
-        agent_id: String,
         certs: Vec<Certificate>,
         key: PrivateKey,
         files: Vec<Vec<u8>>,
@@ -90,7 +88,6 @@ impl Client {
         Client {
             server_address,
             server_name,
-            agent_id,
             endpoint,
             request_send,
         }
@@ -106,7 +103,6 @@ impl Client {
                 &self.endpoint,
                 self.server_address,
                 &self.server_name,
-                &self.agent_id,
                 &self.request_send,
                 active_policy_list.clone(),
                 delete_policy_ids.clone(),
@@ -146,14 +142,13 @@ async fn connect(
     endpoint: &Endpoint,
     server_address: SocketAddr,
     server_name: &str,
-    agent_id: &str,
     request_send: &Sender<RequestedPolicy>,
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
 ) -> Result<()> {
     let connection = endpoint.connect(server_address, server_name)?.await?;
 
-    handshake(&connection, agent_id, REVIEW_PROTOCOL_VERSION)
+    handshake(&connection, REVIEW_PROTOCOL_VERSION)
         .await
         .map_err(|e| {
             error!("Review handshake failed: {:#}", e);
@@ -181,7 +176,6 @@ async fn connect(
 
 async fn handshake(
     conn: &Connection,
-    agent_id: &str,
     protocol: &str,
 ) -> Result<(SendStream, RecvStream), oinq::message::HandshakeError> {
     let (send, recv) = oinq::message::client_handshake(
@@ -189,7 +183,6 @@ async fn handshake(
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
         protocol,
-        agent_id,
     )
     .await?;
     Ok((send, recv))
