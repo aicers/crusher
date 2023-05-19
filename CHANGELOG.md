@@ -5,7 +5,7 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2023-05-19
 
 ### Added
 
@@ -16,7 +16,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Removes the `agent_id` provided in the config file. This value is provided by
   the CN in the certificate in the form of `agent_id@host_id`.
-- Requires REview 0.22.x
+- Requires REview 0.23.x
 
 ## [0.1.0] - 2023-03-30
 
@@ -28,5 +28,5 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Send the generated `time series` to `giganto`'s ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
-[Unreleased]: https://github.com/aicers/crusher/compare/0.1.0...main
+[0.2.0]: https://github.com/aicers/crusher/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/aicers/crusher/tree/0.1.0
