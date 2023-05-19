@@ -8,7 +8,6 @@ const DEFAULT_GIGANTO_INGESTION_ADDRESS: &str = "[::]:38370";
 const DEFAULT_GIGANTO_PUBLISH_ADDRESS: &str = "[::]:38371";
 const DEFAULT_REVIEW_NAME: &str = "localhost";
 const DEFAULT_REVIEW_ADDRESS: &str = "[::]:38390";
-const DEFAULT_AGENT_ID: &str = "cruhser";
 
 /// The application settings.
 #[derive(Clone, Debug, Deserialize)]
@@ -24,7 +23,6 @@ pub struct Settings {
     pub review_name: String,  // host name to review
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub review_address: SocketAddr, // IP address & port to review
-    pub agent_id: String,     //unique identifier
     pub last_timestamp_data: PathBuf, // Path to the last series timestamp data file
 }
 
@@ -85,8 +83,6 @@ fn default_config_builder() -> ConfigBuilder<DefaultState> {
         .expect("valid name")
         .set_default("review_address", DEFAULT_REVIEW_ADDRESS)
         .expect("valid address")
-        .set_default("agent_id", DEFAULT_AGENT_ID)
-        .expect("valid id")
         .set_default(
             "last_timestamp_data",
             last_timestamp_path.to_str().expect("path to string"),

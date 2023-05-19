@@ -86,7 +86,7 @@ fn config_server() -> ServerConfig {
         }
     }
 
-    let client_auth = rustls::server::AllowAnyAuthenticatedClient::new(client_auth_roots);
+    let client_auth = rustls::server::AllowAnyAuthenticatedClient::new(client_auth_roots).boxed();
     let server_crypto = rustls::ServerConfig::builder()
         .with_safe_defaults()
         .with_client_cert_verifier(client_auth)

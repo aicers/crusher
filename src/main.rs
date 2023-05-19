@@ -64,7 +64,6 @@ async fn main() -> Result<()> {
     let request_client = request::Client::new(
         settings.review_address,
         settings.review_name,
-        settings.agent_id,
         cert.clone(),
         key.clone(),
         files.clone(),

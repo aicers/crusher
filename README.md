@@ -4,8 +4,8 @@ Crusher generates statistics from raw events.
 
 ## Requirements
 
-* REview 0.18.0 or higher
-* Giganto 0.10.0 or higher
+* REview 0.22.0 or higher
+* Giganto 0.11.0 or higher
 
 ## Usage
 
@@ -31,8 +31,6 @@ The following is key values in the TOML configuration file.
 * `review_name`: the name of the review. This must match with the DNS name in
   the certificate.
 * `review_address`: IP address and port number of `review`.
-* `agent_id`: a unique identifier for the agent on the host where the agent is
-  running.
 * `last_timestamp_data`: File that stores the timestamp of the last time series
   per `sampling policy`.
 
@@ -47,7 +45,6 @@ giganto_ingestion_address = "127.0.0.1:38370"
 giganto_publish_address = "127.0.0.1:38371"
 review_name = "localhost"
 review_address ="127.0.0.1:38390"
-agent_id ="crusher"
 last_timestamp_data = "tests/time_data.json"
 ```
 
