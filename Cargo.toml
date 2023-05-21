@@ -1,6 +1,6 @@
 [package]
 name = "crusher"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -17,9 +17,9 @@ giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "
 lazy_static = "1"
 num_enum = "0.6"
 num-traits = "0.2"
-oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.7.0" }
+oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.7.1" }
 quinn = "0.10"
-roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.1.0" }
+roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.2.0" }
 rustls = "0.21"
 rustls-pemfile = "1.0"
 serde = { version = "1", features = ["derive"] }
