@@ -13,7 +13,9 @@ use giganto_client::{
     connection::client_handshake,
     frame::RecvError,
     ingest::{
-        network::{Conn, DceRpc, Dns, Ftp, Http, Kerberos, Ntlm, Rdp, Smtp, Ssh},
+        network::{
+            Conn, DceRpc, Dns, Ftp, Http, Kerberos, Ldap, Mqtt, Nfs, Ntlm, Rdp, Smb, Smtp, Ssh, Tls,
+        },
         receive_ack_timestamp, send_event, send_record_header, RecordType,
     },
     publish::{
@@ -42,8 +44,8 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const INGESTION_PROTOCOL_VERSION: &str = "0.11.0";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.11.0";
+const INGESTION_PROTOCOL_VERSION: &str = "0.12.2";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.12.2";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
@@ -69,6 +71,11 @@ impl From<RequestedKind> for RequestStreamRecord {
             RequestedKind::Ssh => Self::Ssh,
             RequestedKind::DceRpc => Self::DceRpc,
             RequestedKind::Ftp => Self::Ftp,
+            RequestedKind::Mqtt => Self::Mqtt,
+            RequestedKind::Ldap => Self::Ldap,
+            RequestedKind::Tls => Self::Tls,
+            RequestedKind::Smb => Self::Smb,
+            RequestedKind::Nfs => Self::Nfs,
         }
     }
 }
@@ -84,6 +91,11 @@ pub(crate) enum Event {
     Ssh(Ssh),
     DceRpc(DceRpc),
     Ftp(Ftp),
+    Mqtt(Mqtt),
+    Ldap(Ldap),
+    Tls(Tls),
+    Smb(Smb),
+    Nfs(Nfs),
 }
 
 impl Event {
@@ -99,6 +111,11 @@ impl Event {
             Self::Ssh(evt) => evt.column_value(column),
             Self::DceRpc(evt) => evt.column_value(column),
             Self::Ftp(evt) => evt.column_value(column),
+            Self::Mqtt(evt) => evt.column_value(column),
+            Self::Ldap(evt) => evt.column_value(column),
+            Self::Tls(evt) => evt.column_value(column),
+            Self::Smb(evt) => evt.column_value(column),
+            Self::Nfs(evt) => evt.column_value(column),
         }
     }
 }
@@ -139,6 +156,16 @@ impl ColumnValue for Ssh {}
 impl ColumnValue for DceRpc {}
 
 impl ColumnValue for Ftp {}
+
+impl ColumnValue for Mqtt {}
+
+impl ColumnValue for Ldap {}
+
+impl ColumnValue for Tls {}
+
+impl ColumnValue for Smb {}
+
+impl ColumnValue for Nfs {}
 
 pub struct Client {
     ingestion_addr: SocketAddr,
@@ -673,6 +700,76 @@ async fn receiver(
                         };
                         if let Err(e) =
                             time_series(&policy, &mut series, time, &Event::Ftp(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    RequestStreamRecord::Mqtt => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Mqtt>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Mqtt(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    RequestStreamRecord::Ldap => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Ldap>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Ldap(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    RequestStreamRecord::Tls => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Tls>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Tls(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    RequestStreamRecord::Smb => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Smb>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Smb(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+                    RequestStreamRecord::Nfs => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Nfs>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Nfs(event), &sender)
                                 .await
                         {
                             error_in_ts(&e);
