@@ -13,7 +13,7 @@ bincode = "1"
 chrono = { version = "0.4", features = ["serde"] }
 config = { version = "0.13", features = ["toml"], default-features = false }
 directories = "5.0"
-giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.7.0" }
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.11.0" }
 lazy_static = "1"
 num_enum = "0.6"
 num-traits = "0.2"

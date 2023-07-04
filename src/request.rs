@@ -47,6 +47,11 @@ pub enum RequestedKind {
     Ssh = 7,
     DceRpc = 8,
     Ftp = 9,
+    Mqtt = 10,
+    Ldap = 11,
+    Tls = 12,
+    Smb = 13,
+    Nfs = 14,
 }
 
 #[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
