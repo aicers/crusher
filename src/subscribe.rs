@@ -879,16 +879,16 @@ pub async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
             .context("Failed to open last time series timestamp file")?;
         let json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
         let Value::Object(map_data) = json else {
-            bail!("Failed to parse json data, invaild json format")
+            bail!("Failed to parse json data, invaild json format");
         };
         for (key, val) in map_data {
             let Value::Number(value) = val else {
-            bail!("Failed to parse timestamp data, invaild json format");
-        };
+                bail!("Failed to parse timestamp data, invaild json format");
+            };
             #[rustfmt::skip] // rust-lang/rustfmt#4914
-        let Some(timestamp) = value.as_i64() else {
-            bail!("Failed to convert timestamp data, invaild time data");
-        };
+            let Some(timestamp) = value.as_i64() else {
+                bail!("Failed to convert timestamp data, invaild time data");
+            };
             LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
         }
     }

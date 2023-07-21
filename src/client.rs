@@ -23,7 +23,7 @@ pub fn config(certs: Vec<Certificate>, key: PrivateKey, files: Vec<Vec<u8>>) -> 
     let tls_config = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(root_store)
-        .with_single_cert(certs, key)?;
+        .with_client_auth_cert(certs, key)?;
 
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));

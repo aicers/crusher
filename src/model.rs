@@ -137,8 +137,8 @@ pub(crate) async fn time_series(
 
     let time_slot = time_slot(policy, time)?;
     let Some(value) = series.series.get_mut(time_slot) else {
-                bail!("cannot access the time slot");
-            };
+        bail!("cannot access the time slot");
+    };
     *value += event_value(policy.column, event);
 
     Ok(())
