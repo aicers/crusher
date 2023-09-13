@@ -44,7 +44,7 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const INGESTION_PROTOCOL_VERSION: &str = "0.12.2";
+const INGEST_PROTOCOL_VERSION: &str = "0.12.2";
 const PUBLISH_PROTOCOL_VERSION: &str = "0.12.2";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
@@ -52,7 +52,7 @@ const SECOND_TO_NANO: i64 = 1_000_000_000;
 
 lazy_static! {
     // A hashmap for data transfer to an already created asynchronous task
-    pub static ref INGESTION_CHANNEL: RwLock<HashMap<String, Sender<TimeSeries>>> =
+    pub static ref INGEST_CHANNEL: RwLock<HashMap<String, Sender<TimeSeries>>> =
         RwLock::new(HashMap::new());
     // A hashmap for last series timestamp
     pub static ref LAST_TRANSFER_TIME: RwLock<HashMap<String,i64>> = RwLock::new(HashMap::new());
@@ -168,7 +168,7 @@ impl ColumnValue for Smb {}
 impl ColumnValue for Nfs {}
 
 pub struct Client {
-    ingestion_addr: SocketAddr,
+    ingest_addr: SocketAddr,
     publish_addr: SocketAddr,
     server_name: String,
     endpoint: Endpoint,
@@ -179,7 +179,7 @@ pub struct Client {
 #[allow(clippy::too_many_arguments)]
 impl Client {
     pub fn new(
-        ingestion_addr: SocketAddr,
+        ingest_addr: SocketAddr,
         publish_addr: SocketAddr,
         server_name: String,
         last_series_time_path: PathBuf,
@@ -191,7 +191,7 @@ impl Client {
         let endpoint = client::config(certs, key, files)
             .expect("Server configuration error with cert, key or root");
         Client {
-            ingestion_addr,
+            ingest_addr,
             publish_addr,
             server_name,
             endpoint,
@@ -204,22 +204,25 @@ impl Client {
         self,
         active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+        wait_shutdown: Arc<Notify>,
     ) {
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
         if let Err(e) = tokio::try_join!(
-            ingestion_connection_control(
+            ingest_connection_control(
                 receiver,
-                self.ingestion_addr,
+                self.ingest_addr,
                 self.server_name.clone(),
                 self.endpoint.clone(),
+                wait_shutdown.clone(),
                 self.last_series_time_path.clone(),
-                INGESTION_PROTOCOL_VERSION,
+                INGEST_PROTOCOL_VERSION,
             ),
             publish_connection_control(
                 sender,
                 self.publish_addr,
                 &self.server_name,
                 &self.endpoint,
+                wait_shutdown.clone(),
                 PUBLISH_PROTOCOL_VERSION,
                 &self.request_recv,
                 active_policy_list,
@@ -232,17 +235,18 @@ impl Client {
     }
 }
 
-async fn ingestion_connection_control(
+async fn ingest_connection_control(
     series_recv: Receiver<TimeSeries>,
     server_addr: SocketAddr,
     server_name: String,
     endpoint: Endpoint,
+    wait_shutdown: Arc<Notify>,
     last_series_time_path: PathBuf,
     version: &str,
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = Arc::new(Notify::new());
-        match ingestion_connect(&endpoint, server_addr, &server_name, version).await {
+        match ingest_connect(&endpoint, server_addr, &server_name, version).await {
             Ok(conn) => {
                 let arc_conn = Arc::new(conn);
 
@@ -257,14 +261,19 @@ async fn ingestion_connection_control(
 
                 loop {
                     tokio::select! {
-                        _ = connection_notify.notified() =>{
+                        _ = connection_notify.notified() => {
                             drop(connection_notify);
-                            INGESTION_CHANNEL.write().await.clear();
+                            INGEST_CHANNEL.write().await.clear();
                             error!(
                                 "Stream channel closed. Retry connection to {}",
                                 server_addr,
                             );
                             continue 'connection;
+                        }
+                        _ = wait_shutdown.notified() => {
+                            info!("Shutting down ingest channel");
+                            endpoint.close(0u32.into(), &[]);
+                            return Ok(());
                         }
                         Ok(series) = series_recv.recv() => {
                             // First time_series data receive
@@ -312,6 +321,7 @@ async fn publish_connection_control(
     server_addr: SocketAddr,
     server_name: &str,
     endpoint: &Endpoint,
+    wait_shutdown: Arc<Notify>,
     version: &str,
     request_recv: &Receiver<RequestedPolicy>,
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
@@ -370,6 +380,12 @@ async fn publish_connection_control(
                             );
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                             continue 'connection;
+                        }
+                        _ = wait_shutdown.notified() => {
+                            info!("Shutting down publish channel");
+                            endpoint.close(0u32.into(), &[]);
+                            wait_shutdown.notify_one();
+                            return Ok(());
                         }
                         Ok(req_pol) = request_recv.recv() => {
                             if let Err(e) = process_network_stream(
@@ -437,7 +453,7 @@ async fn publish_connection_control(
     }
 }
 
-async fn ingestion_connect(
+async fn ingest_connect(
     endpoint: &Endpoint,
     server_address: SocketAddr,
     server_name: &str,
@@ -797,7 +813,7 @@ async fn send_time_series(
     let sampling_policy_id = series.sampling_policy_id.clone();
     let (send_channel, recv_channel) =
         async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
-    INGESTION_CHANNEL
+    INGEST_CHANNEL
         .write()
         .await
         .insert(sampling_policy_id.clone(), send_channel);
@@ -879,15 +895,15 @@ pub async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
             .context("Failed to open last time series timestamp file")?;
         let json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
         let Value::Object(map_data) = json else {
-            bail!("Failed to parse json data, invaild json format");
+            bail!("Failed to parse json data, invalid json format");
         };
         for (key, val) in map_data {
             let Value::Number(value) = val else {
-                bail!("Failed to parse timestamp data, invaild json format");
+                bail!("Failed to parse timestamp data, invalid json format");
             };
             #[rustfmt::skip] // rust-lang/rustfmt#4914
             let Some(timestamp) = value.as_i64() else {
-                bail!("Failed to convert timestamp data, invaild time data");
+                bail!("Failed to convert timestamp data, invalid time data");
             };
             LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
         }

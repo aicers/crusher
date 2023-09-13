@@ -1,13 +1,22 @@
 //! Configurations for the application.
+use anyhow::{Context, Result};
 use config::{builder::DefaultState, Config, ConfigBuilder, ConfigError, File};
+use oinq::Configuration;
 use serde::{de::Error, Deserialize, Deserializer};
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    net::SocketAddr,
+    path::PathBuf,
+};
+use toml_edit::{value, Document};
 
 const DEFAULT_GIGANTO_NAME: &str = "localhost";
-const DEFAULT_GIGANTO_INGESTION_ADDRESS: &str = "[::]:38370";
+const DEFAULT_GIGANTO_INGEST_ADDRESS: &str = "[::]:38370";
 const DEFAULT_GIGANTO_PUBLISH_ADDRESS: &str = "[::]:38371";
 const DEFAULT_REVIEW_NAME: &str = "localhost";
 const DEFAULT_REVIEW_ADDRESS: &str = "[::]:38390";
+const DEFAULT_TOML: &str = "/usr/local/aice/conf/crusher.toml";
 
 /// The application settings.
 #[derive(Clone, Debug, Deserialize)]
@@ -17,7 +26,7 @@ pub struct Settings {
     pub roots: Vec<PathBuf>,  // Path to the rootCA file
     pub giganto_name: String, // host name to giganto
     #[serde(deserialize_with = "deserialize_socket_addr")]
-    pub giganto_ingestion_address: SocketAddr, // IP address & port to giganto
+    pub giganto_ingest_address: SocketAddr, // IP address & port to giganto
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub giganto_publish_address: SocketAddr, // IP address & port to giganto
     pub review_name: String,  // host name to review
@@ -72,10 +81,7 @@ fn default_config_builder() -> ConfigBuilder<DefaultState> {
         .expect("default key dir")
         .set_default("giganto_name", DEFAULT_GIGANTO_NAME)
         .expect("valid name")
-        .set_default(
-            "giganto_ingestion_address",
-            DEFAULT_GIGANTO_INGESTION_ADDRESS,
-        )
+        .set_default("giganto_ingest_address", DEFAULT_GIGANTO_INGEST_ADDRESS)
         .expect("valid address")
         .set_default("giganto_publish_address", DEFAULT_GIGANTO_PUBLISH_ADDRESS)
         .expect("valid address")
@@ -102,4 +108,55 @@ where
     let addr = String::deserialize(deserializer)?;
     addr.parse()
         .map_err(|e| D::Error::custom(format!("invalid address \"{addr}\": {e}")))
+}
+
+pub fn get_config() -> Result<Configuration> {
+    let toml = fs::read_to_string(DEFAULT_TOML).context("toml not found")?;
+    let doc = toml.parse::<Document>()?;
+
+    let giganto_publish_address = doc
+        .get("giganto_publish_address")
+        .context("\"giganto_publish_address\" not found")?
+        .to_string()
+        .trim_matches('\"')
+        .parse::<SocketAddr>()?;
+    let giganto_ingest_address = doc
+        .get("giganto_ingest_address")
+        .context("\"giganto_ingest_address\" not found")?
+        .to_string()
+        .trim_matches('\"')
+        .parse::<SocketAddr>()?;
+
+    Ok(Configuration {
+        hog_sources: None,
+        hog_protocols: None,
+        publish_address: Some(giganto_publish_address),
+        ingest_address: Some(giganto_ingest_address),
+        dump_file: None,
+        dump_size: None,
+        log_options: None,
+        giganto_name: None,
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub fn set_config(conf: Configuration) -> Result<()> {
+    let toml = fs::read_to_string(DEFAULT_TOML).context("toml not found")?;
+    let mut doc = toml.parse::<Document>()?;
+
+    if let Some(giganto_ingest_address) = conf.ingest_address {
+        doc["giganto_ingest_address"] = value(giganto_ingest_address.to_string());
+    }
+    if let Some(giganto_publish_address) = conf.publish_address {
+        doc["giganto_publish_address"] = value(giganto_publish_address.to_string());
+    }
+
+    let output = doc.to_string();
+    let mut toml_file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(DEFAULT_TOML)?;
+    writeln!(toml_file, "{output}")?;
+
+    Ok(())
 }
