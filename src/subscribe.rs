@@ -824,7 +824,15 @@ async fn send_time_series(
 
     // First data transmission (record type + series data)
     send_record_header(&mut series_sender, RecordType::PeriodicTimeSeries).await?;
-    send_event(&mut series_sender, series.start.timestamp_nanos(), series).await?;
+    send_event(
+        &mut series_sender,
+        series
+            .start
+            .timestamp_nanos_opt()
+            .expect("valid timestamp range"),
+        series,
+    )
+    .await?;
 
     // Receive start time of giganto last saved time series.
     tokio::spawn(receive_time_series_timestamp(
@@ -836,7 +844,15 @@ async fn send_time_series(
 
     // Data transmission after the first time (only series data)
     while let Ok(series) = recv_channel.recv().await {
-        send_event(&mut series_sender, series.start.timestamp_nanos(), series).await?;
+        send_event(
+            &mut series_sender,
+            series
+                .start
+                .timestamp_nanos_opt()
+                .expect("valid timestamp range"),
+            series,
+        )
+        .await?;
     }
     Ok(())
 }
