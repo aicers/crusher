@@ -826,10 +826,7 @@ async fn send_time_series(
     send_record_header(&mut series_sender, RecordType::PeriodicTimeSeries).await?;
     send_event(
         &mut series_sender,
-        series
-            .start
-            .timestamp_nanos_opt()
-            .expect("valid timestamp range"),
+        series.start.timestamp_nanos_opt().unwrap_or(i64::MAX),
         series,
     )
     .await?;
@@ -846,10 +843,7 @@ async fn send_time_series(
     while let Ok(series) = recv_channel.recv().await {
         send_event(
             &mut series_sender,
-            series
-                .start
-                .timestamp_nanos_opt()
-                .expect("valid timestamp range"),
+            series.start.timestamp_nanos_opt().unwrap_or(i64::MAX),
             series,
         )
         .await?;
