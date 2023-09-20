@@ -63,9 +63,7 @@ async fn handle_connection(conn: quinn::Connecting) {
     let conn_len = u32::try_from(conn_raw_event.len()).unwrap().to_le_bytes();
 
     let (mut send, _) = connection.accept_bi().await.unwrap();
-    let ts = Utc::now()
-        .timestamp_nanos_opt()
-        .expect("valid timestamp range");
+    let ts = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
     let mut send_buf: Vec<u8> = Vec::new();
     send_buf.extend(ts.to_le_bytes());
     send_buf.extend(conn_len);
