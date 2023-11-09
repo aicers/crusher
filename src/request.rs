@@ -119,7 +119,7 @@ impl Client {
             )
             .await
             {
-                Ok(_) => return Ok(()),
+                Ok(()) => return Ok(()),
                 Err(e) => {
                     if let Some(e) = e.downcast_ref::<ConnectionError>() {
                         match e {
@@ -185,7 +185,7 @@ async fn connect(
             }
             Ok(())
         },
-        _ = wait_shutdown.notified() => {
+        () = wait_shutdown.notified() => {
             info!("Shutting down request channel");
             endpoint.close(0_u32.into(), &[]);
             Ok(())

@@ -16,12 +16,13 @@ use giganto_client::{
         network::{
             Conn, DceRpc, Dns, Ftp, Http, Kerberos, Ldap, Mqtt, Nfs, Ntlm, Rdp, Smb, Smtp, Ssh, Tls,
         },
-        receive_ack_timestamp, send_event, send_record_header, RecordType,
+        receive_ack_timestamp, send_event, send_record_header,
     },
     publish::{
         receive_crusher_data, receive_crusher_stream_start_message, send_stream_request,
         stream::{NodeType, RequestCrusherStream, RequestStreamRecord},
     },
+    RawEventKind,
 };
 use lazy_static::lazy_static;
 use num_traits::ToPrimitive;
@@ -44,8 +45,8 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const INGEST_PROTOCOL_VERSION: &str = "0.12.2";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.12.2";
+const INGEST_PROTOCOL_VERSION: &str = "0.15.0";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.15.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
@@ -261,7 +262,7 @@ async fn ingest_connection_control(
 
                 loop {
                     tokio::select! {
-                        _ = connection_notify.notified() => {
+                        () = connection_notify.notified() => {
                             drop(connection_notify);
                             INGEST_CHANNEL.write().await.clear();
                             error!(
@@ -270,7 +271,7 @@ async fn ingest_connection_control(
                             );
                             continue 'connection;
                         }
-                        _ = wait_shutdown.notified() => {
+                        () = wait_shutdown.notified() => {
                             info!("Shutting down ingest channel");
                             endpoint.close(0u32.into(), &[]);
                             return Ok(());
@@ -372,7 +373,7 @@ async fn publish_connection_control(
                 }
                 loop {
                     tokio::select! {
-                        _ = connection_notify.notified() => {
+                        () = connection_notify.notified() => {
                             drop(connection_notify);
                             error!(
                                 "Stream channel closed. Retry connection to {} after {} seconds.",
@@ -381,7 +382,7 @@ async fn publish_connection_control(
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                             continue 'connection;
                         }
-                        _ = wait_shutdown.notified() => {
+                        () = wait_shutdown.notified() => {
                             info!("Shutting down publish channel");
                             endpoint.close(0u32.into(), &[]);
                             wait_shutdown.notify_one();
@@ -823,7 +824,7 @@ async fn send_time_series(
     };
 
     // First data transmission (record type + series data)
-    send_record_header(&mut series_sender, RecordType::PeriodicTimeSeries).await?;
+    send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
     send_event(
         &mut series_sender,
         series.start.timestamp_nanos_opt().unwrap_or(i64::MAX),
