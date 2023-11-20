@@ -332,7 +332,7 @@ async fn publish_connection_control(
     'connection: loop {
         let connection_notify = Arc::new(Notify::new());
         match publish_connect(endpoint, server_addr, server_name, version).await {
-            Ok((conn, send)) => loop {
+            Ok((conn, send)) => {
                 let req_send = Arc::new(Mutex::new(send));
                 for req_pol in active_policy_list.read().await.values() {
                     if let Err(e) = process_network_stream(
@@ -426,7 +426,7 @@ async fn publish_connection_control(
                         }
                     }
                 }
-            },
+            }
             Err(e) => {
                 if let Some(e) = e.downcast_ref::<ConnectionError>() {
                     match e {
