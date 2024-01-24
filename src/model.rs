@@ -14,6 +14,9 @@ use std::net::IpAddr;
 #[derive(Clone, Copy, IntoPrimitive, Deserialize, Debug)]
 #[repr(u32)]
 pub enum Interval {
+    FifteenSeconds = 15,
+    ThirtySeconds = 30,
+    OneMinutes = 60,
     FiveMinutes = 300,
     TenMinutes = 600,
     FifteenMinutes = 900,
@@ -24,6 +27,9 @@ pub enum Interval {
 impl From<RequestedInterval> for Interval {
     fn from(i: RequestedInterval) -> Self {
         match i {
+            RequestedInterval::FifteenSeconds => Self::FifteenSeconds,
+            RequestedInterval::ThirtySeconds => Self::ThirtySeconds,
+            RequestedInterval::OneMinutes => Self::OneMinutes,
             RequestedInterval::FiveMinutes => Self::FiveMinutes,
             RequestedInterval::TenMinutes => Self::TenMinutes,
             RequestedInterval::FifteenMinutes => Self::FifteenMinutes,

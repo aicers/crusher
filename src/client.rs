@@ -15,7 +15,7 @@ pub fn config(certs: Vec<Certificate>, key: PrivateKey, files: Vec<Vec<u8>>) -> 
             .into_iter()
             .map(rustls::Certificate)
             .collect();
-        if let Some(cert) = root_cert.get(0) {
+        if let Some(cert) = root_cert.first() {
             root_store.add(cert)?;
         }
     }
