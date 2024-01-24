@@ -58,11 +58,14 @@ pub enum RequestedKind {
 #[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
 #[repr(u32)]
 pub enum RequestedInterval {
-    FiveMinutes = 0,
-    TenMinutes = 1,
-    FifteenMinutes = 2,
-    ThirtyMinutes = 3,
-    OneHour = 4,
+    FifteenSeconds = 0,
+    ThirtySeconds = 1,
+    OneMinutes = 2,
+    FiveMinutes = 3,
+    TenMinutes = 4,
+    FifteenMinutes = 5,
+    ThirtyMinutes = 6,
+    OneHour = 7,
 }
 
 #[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
