@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
         Settings::new()?
     };
 
-    let _guard = init_tracing(&settings.log_path)?;
+    let _guard = init_tracing(&settings.log_dir)?;
 
     loop {
         let config_reload = Arc::new(Notify::new());

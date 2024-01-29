@@ -937,8 +937,8 @@ dependencies = [
 
 [[package]]
 name = "oinq"
-version = "0.9.1"
-source = "git+https://github.com/petabi/oinq.git?tag=0.9.1#ba4ff6ee95165dc61d904485c5298a0e4a9f6b05"
+version = "0.10.0"
+source = "git+https://github.com/petabi/oinq.git?tag=0.10.0#664ba9d5bd2ca88211c3a30998b27b2e8d1965f4"
 dependencies = [
  "async-trait",
  "bincode",
