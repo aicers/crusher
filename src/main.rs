@@ -8,12 +8,18 @@ use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 use anyhow::{anyhow, bail, Context, Result};
 use rustls::{Certificate, PrivateKey};
 use settings::Settings;
+use std::path::Path;
 use std::{collections::HashMap, env, fs, process::exit, sync::Arc};
 use tokio::{
     sync::{Notify, RwLock},
     task,
 };
+use tracing::metadata::LevelFilter;
 use tracing::{error, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{
+    fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+};
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 const USAGE: &str = "\
@@ -37,7 +43,8 @@ async fn main() -> Result<()> {
         Settings::new()?
     };
 
-    tracing_subscriber::fmt::init();
+    let _guard = init_tracing(&settings.log_path)?;
+
     loop {
         let config_reload = Arc::new(Notify::new());
         let notify_shutdown = Arc::new(Notify::new());
@@ -173,4 +180,35 @@ fn to_private_key(pem: &[u8]) -> Result<PrivateKey> {
         }
         _ => Err(anyhow!("unknown private key format")),
     }
+}
+
+fn init_tracing(path: &Path) -> Result<WorkerGuard> {
+    if !path.exists() {
+        bail!("Path not found {path:?}");
+    }
+
+    let file_name = format!("{}.log", env!("CARGO_PKG_NAME"));
+    if std::fs::File::create(path.join(&file_name)).is_err() {
+        bail!("Cannot create file. {}/{file_name}", path.display());
+    }
+
+    let file_appender = tracing_appender::rolling::never(path, file_name);
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+
+    let layer_file = fmt::Layer::default()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(file_writer)
+        .with_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()));
+
+    let layered_subscriber = tracing_subscriber::registry().with(layer_file);
+    #[cfg(debug_assertions)]
+    let layered_subscriber = layered_subscriber.with(
+        fmt::Layer::default()
+            .with_ansi(true)
+            .with_filter(EnvFilter::from_default_env()),
+    );
+    layered_subscriber.init();
+
+    Ok(guard)
 }
