@@ -9,6 +9,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Modified logging behavior for debug and release builds
+- Changed logs to stdout and file
 - Changed `REVIEW_PROTOCOL_VERSION` to "0.27.0"
 - Changed `PUBLISH_PROTOCOL_VERSION` to "0.17.0"
 

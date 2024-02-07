@@ -33,6 +33,7 @@ The following is key values in the TOML configuration file.
 * `review_address`: IP address and port number of `review`.
 * `last_timestamp_data`: File that stores the timestamp of the last time series
   per `sampling policy`.
+* `log_path`: Path to the log file.
 
 Example
 
@@ -46,6 +47,7 @@ giganto_publish_address = "127.0.0.1:38371"
 review_name = "localhost"
 review_address ="127.0.0.1:38390"
 last_timestamp_data = "tests/time_data.json"
+log_path = "/var/log/myapp.log"
 ```
 
 By default, giganto reads the config file from the following directories:

@@ -33,6 +33,7 @@ pub struct Settings {
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub review_address: SocketAddr, // IP address & port to review
     pub last_timestamp_data: PathBuf, // Path to the last series timestamp data file
+    pub log_path: PathBuf,
 }
 
 impl Settings {
