@@ -4,7 +4,7 @@ use async_channel::Sender;
 use async_trait::async_trait;
 use bincode::Options;
 use num_enum::TryFromPrimitive;
-use oinq::{request, Configuration};
+use oinq::{request, Config};
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use rustls::{Certificate, PrivateKey};
 use serde::Deserialize;
@@ -21,6 +21,7 @@ use tokio::{
 use tracing::{error, info, trace, warn};
 
 const REVIEW_PROTOCOL_VERSION: &str = "0.27.0";
+const MAX_RETRIES: u8 = 3;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RequestedPolicy {
@@ -235,8 +236,31 @@ struct RequestHandler {
 #[async_trait]
 impl oinq::request::Handler for RequestHandler {
     async fn reboot(&mut self) -> Result<(), String> {
-        roxy::reboot().map_err(|e| format!("cannot restart the system: {e}"))?;
-        Ok(())
+        for attempt in 1..=MAX_RETRIES {
+            if let Err(e) = roxy::reboot() {
+                if attempt == MAX_RETRIES {
+                    return Err(format!("cannot restart the system: {e}"));
+                }
+            } else {
+                return Ok(());
+            }
+        }
+
+        Err(String::from("cannot restart the system"))
+    }
+
+    async fn shutdown(&mut self) -> Result<(), String> {
+        for attempt in 1..=MAX_RETRIES {
+            if let Err(e) = roxy::power_off() {
+                if attempt == MAX_RETRIES {
+                    return Err(format!("cannot shutdown the system: {e}"));
+                }
+            } else {
+                return Ok(());
+            }
+        }
+
+        Err(String::from("cannot shutdown the system"))
     }
 
     async fn resource_usage(&mut self) -> Result<(String, oinq::ResourceUsage), String> {
@@ -294,17 +318,41 @@ impl oinq::request::Handler for RequestHandler {
         Ok(())
     }
 
-    async fn get_config(&mut self) -> Result<Configuration, String> {
-        let conf =
-            crate::settings::get_config().map_err(|e| format!("failed to get config: {e}"))?;
-        Ok(conf)
-    }
-
-    async fn set_config(&mut self, conf: Configuration) -> Result<(), String> {
-        info!("start set configuration");
-        crate::settings::set_config(conf).map_err(|e| format!("failed to set config: {e}"))?;
+    async fn reload_config(&mut self) -> Result<(), String> {
+        info!("start reloading configuration");
         self.config_reload.notify_one();
         Ok(())
+    }
+
+    async fn get_config(&mut self) -> Result<Config, String> {
+        for attempt in 1..=MAX_RETRIES {
+            match crate::settings::get_config() {
+                Ok(conf) => return Ok(conf),
+                Err(e) => {
+                    if attempt == MAX_RETRIES {
+                        return Err(format!("failed to get config: {e}"));
+                    }
+                }
+            }
+        }
+
+        Err(String::from("failed to get config"))
+    }
+
+    async fn set_config(&mut self, conf: Config) -> Result<(), String> {
+        info!("start set configuration");
+        for attempt in 1..=MAX_RETRIES {
+            if let Err(e) = crate::settings::set_config(&conf) {
+                if attempt == MAX_RETRIES {
+                    return Err(format!("failed to set config: {e}"));
+                }
+            } else {
+                self.config_reload.notify_one();
+                return Ok(());
+            }
+        }
+
+        Err(String::from("failed to set config"))
     }
 
     async fn process_list(&mut self) -> Result<Vec<request::Process>, String> {

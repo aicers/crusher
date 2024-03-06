@@ -5,12 +5,22 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Support `shutdown`, `reload_config` via `oinq`.
+
+### Changed
+
+- Changed CrusherConfig with oinq `Config`.
+- Modified logging behavior for debug and release builds
+- Changed logs to stdout and file
+
 ## [0.3.2] - 2024-01-25
 
 ### Changed
 
-- Modified logging behavior for debug and release builds
-- Changed logs to stdout and file
 - Changed `REVIEW_PROTOCOL_VERSION` to "0.27.0"
 - Changed `PUBLISH_PROTOCOL_VERSION` to "0.17.0"
 
@@ -52,6 +62,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Send the generated `time series` to `giganto`'s ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.3.2...main
 [0.3.2]: https://github.com/aicers/crusher/compare/0.3.1...0.3.2
 [0.3.1]: https://github.com/aicers/crusher/compare/0.3.0...0.3.1
 [0.3.0]: https://github.com/aicers/crusher/compare/0.2.0...0.3.0

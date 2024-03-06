@@ -1,7 +1,7 @@
 //! Configurations for the application.
 use anyhow::{Context, Result};
-use config::{builder::DefaultState, Config, ConfigBuilder, ConfigError, File};
-use oinq::Configuration;
+use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File};
+use oinq::{request::CrusherConfig, Config};
 use serde::{de::Error, Deserialize, Deserializer};
 use std::{
     fs::{self, OpenOptions},
@@ -33,7 +33,7 @@ pub struct Settings {
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub review_address: SocketAddr, // IP address & port to review
     pub last_timestamp_data: PathBuf, // Path to the last series timestamp data file
-    pub log_path: PathBuf,
+    pub log_dir: PathBuf,
 }
 
 impl Settings {
@@ -75,7 +75,7 @@ fn default_config_builder() -> ConfigBuilder<DefaultState> {
     let key_path = config_dir.join("key.pem");
     let last_timestamp_path = config_dir.join("time_data.json");
 
-    Config::builder()
+    cfg::builder()
         .set_default("cert", cert_path.to_str().expect("path to string"))
         .expect("default cert dir")
         .set_default("key", key_path.to_str().expect("path to string"))
@@ -111,10 +111,16 @@ where
         .map_err(|e| D::Error::custom(format!("invalid address \"{addr}\": {e}")))
 }
 
-pub fn get_config() -> Result<Configuration> {
+pub fn get_config() -> Result<Config> {
     let toml = fs::read_to_string(DEFAULT_TOML).context("toml not found")?;
     let doc = toml.parse::<Document>()?;
 
+    let review_address = doc
+        .get("review_address")
+        .context("\"review_address\" not found")?
+        .to_string()
+        .trim_matches('\"')
+        .parse::<SocketAddr>()?;
     let giganto_publish_address = doc
         .get("giganto_publish_address")
         .context("\"giganto_publish_address\" not found")?
@@ -128,28 +134,25 @@ pub fn get_config() -> Result<Configuration> {
         .trim_matches('\"')
         .parse::<SocketAddr>()?;
 
-    Ok(Configuration {
-        hog_sources: None,
-        hog_protocols: None,
-        publish_address: Some(giganto_publish_address),
-        ingest_address: Some(giganto_ingest_address),
-        dump_file: None,
-        dump_size: None,
-        log_options: None,
-        giganto_name: None,
-    })
+    Ok(Config::Crusher(CrusherConfig {
+        review_address,
+        giganto_publish_address: Some(giganto_publish_address),
+        giganto_ingest_address: Some(giganto_ingest_address),
+    }))
 }
 
-#[allow(clippy::needless_pass_by_value)]
-pub fn set_config(conf: Configuration) -> Result<()> {
+pub fn set_config(config: &Config) -> Result<()> {
     let toml = fs::read_to_string(DEFAULT_TOML).context("toml not found")?;
     let mut doc = toml.parse::<Document>()?;
 
-    if let Some(giganto_ingest_address) = conf.ingest_address {
-        doc["giganto_ingest_address"] = value(giganto_ingest_address.to_string());
-    }
-    if let Some(giganto_publish_address) = conf.publish_address {
-        doc["giganto_publish_address"] = value(giganto_publish_address.to_string());
+    if let Config::Crusher(conf) = config {
+        doc["review_address"] = value(conf.review_address.to_string());
+        if let Some(giganto_ingest_address) = conf.giganto_ingest_address {
+            doc["giganto_ingest_address"] = value(giganto_ingest_address.to_string());
+        }
+        if let Some(giganto_publish_address) = conf.giganto_publish_address {
+            doc["giganto_publish_address"] = value(giganto_publish_address.to_string());
+        }
     }
 
     let output = doc.to_string();
