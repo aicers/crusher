@@ -16,7 +16,7 @@ const DEFAULT_GIGANTO_INGEST_ADDRESS: &str = "[::]:38370";
 const DEFAULT_GIGANTO_PUBLISH_ADDRESS: &str = "[::]:38371";
 const DEFAULT_REVIEW_NAME: &str = "localhost";
 const DEFAULT_REVIEW_ADDRESS: &str = "[::]:38390";
-const DEFAULT_TOML: &str = "/usr/local/aice/conf/crusher.toml";
+pub const TEMP_TOML_POST_FIX: &str = ".temp.toml";
 
 /// The application settings.
 #[derive(Clone, Debug, Deserialize)]
@@ -111,8 +111,8 @@ where
         .map_err(|e| D::Error::custom(format!("invalid address \"{addr}\": {e}")))
 }
 
-pub fn get_config() -> Result<Config> {
-    let toml = fs::read_to_string(DEFAULT_TOML).context("toml not found")?;
+pub fn get_config(config_path: &str) -> Result<Config> {
+    let toml = fs::read_to_string(config_path).context("toml not found")?;
     let doc = toml.parse::<Document>()?;
 
     let review_address = doc
@@ -141,9 +141,11 @@ pub fn get_config() -> Result<Config> {
     }))
 }
 
-pub fn set_config(config: &Config) -> Result<()> {
-    let toml = fs::read_to_string(DEFAULT_TOML).context("toml not found")?;
-    let mut doc = toml.parse::<Document>()?;
+pub fn set_config(config: &Config, config_path: &str) -> Result<()> {
+    let tmp_path = format!("{config_path}{TEMP_TOML_POST_FIX}");
+    fs::copy(config_path, &tmp_path)?;
+    let config_toml = fs::read_to_string(&tmp_path).context("toml not found")?;
+    let mut doc = config_toml.parse::<Document>()?;
 
     if let Config::Crusher(conf) = config {
         doc["review_address"] = value(conf.review_address.to_string());
@@ -159,7 +161,7 @@ pub fn set_config(config: &Config) -> Result<()> {
     let mut toml_file = OpenOptions::new()
         .write(true)
         .truncate(true)
-        .open(DEFAULT_TOML)?;
+        .open(&tmp_path)?;
     writeln!(toml_file, "{output}")?;
 
     Ok(())

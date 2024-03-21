@@ -8,6 +8,7 @@ use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 use anyhow::{anyhow, bail, Context, Result};
 use rustls::{Certificate, PrivateKey};
 use settings::Settings;
+pub use settings::TEMP_TOML_POST_FIX;
 use std::path::Path;
 use std::{collections::HashMap, env, fs, process::exit, sync::Arc};
 use tokio::{
@@ -22,6 +23,7 @@ use tracing_subscriber::{
 };
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
+const DEFAULT_TOML: &str = "/usr/local/aice/conf/crusher.toml";
 const USAGE: &str = "\
 USAGE:
     crusher [CONFIG]
@@ -37,11 +39,12 @@ ARG:
 #[tokio::main]
 async fn main() -> Result<()> {
     let config_filename = parse();
-    let mut settings = if let Some(config_filename) = config_filename.clone() {
-        Settings::from_file(&config_filename)?
+    let (mut settings, config_path) = if let Some(config_filename) = config_filename.clone() {
+        (Settings::from_file(&config_filename)?, config_filename)
     } else {
-        Settings::new()?
+        (Settings::new()?, DEFAULT_TOML.to_string())
     };
+    let temp_path = format!("{config_path}{TEMP_TOML_POST_FIX}");
 
     let _guard = init_tracing(&settings.log_dir)?;
 
@@ -91,6 +94,7 @@ async fn main() -> Result<()> {
             Arc::clone(&delete_policy_ids),
             config_reload.clone(),
             notify_shutdown.clone(),
+            config_path.clone(),
         ));
 
         let subscribe_client = subscribe::Client::new(
@@ -110,19 +114,23 @@ async fn main() -> Result<()> {
         ));
         loop {
             config_reload.notified().await;
-            if let Some(config_filename) = config_filename.clone() {
-                match Settings::from_file(&config_filename) {
-                    Ok(new_settings) => {
-                        settings = new_settings;
-                        notify_shutdown.notify_waiters();
-                        notify_shutdown.notified().await;
-                        break;
-                    }
-                    Err(e) => {
-                        error!("Failed to load the new configuration: {:?}", e);
-                        warn!("Run Crusher with the previous config");
-                        continue;
-                    }
+            match Settings::from_file(&temp_path) {
+                Ok(new_settings) => {
+                    settings = new_settings;
+                    notify_shutdown.notify_waiters();
+                    notify_shutdown.notified().await;
+                    fs::rename(&temp_path, &config_path).unwrap_or_else(|e| {
+                        error!("Failed to rename the new configuration file: {e}");
+                    });
+                    break;
+                }
+                Err(e) => {
+                    error!("Failed to load the new configuration: {:?}", e);
+                    warn!("Run Crusher with the previous config");
+                    fs::remove_file(&temp_path).unwrap_or_else(|e| {
+                        error!("Failed to remove the temporary file: {e}");
+                    });
+                    continue;
                 }
             }
         }
