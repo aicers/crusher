@@ -3,7 +3,7 @@ use crate::request::{RequestedInterval, RequestedPeriod, RequestedPolicy};
 use super::subscribe::{Event, INGEST_CHANNEL};
 use anyhow::{anyhow, bail, Result};
 use async_channel::Sender;
-use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, TimeZone, Timelike, Utc};
 use giganto_client::publish::stream::RequestStreamRecord;
 use num_enum::IntoPrimitive;
 use num_traits::ToPrimitive;
@@ -146,8 +146,8 @@ fn time_slot(policy: &Policy, time: DateTime<Utc>) -> Result<usize> {
             .offset
             .to_i64()
             .ok_or_else(|| anyhow!("failed to convert offset"))?;
-    let Some(offset_time) = NaiveDateTime::from_timestamp_opt(offset_time, 0) else {
-        bail!("failed to create NaiveDateTime from timestamp");
+    let Some(offset_time) = DateTime::from_timestamp(offset_time, 0) else {
+        bail!("failed to create DateTime<Utc> from timestamp");
     };
 
     let seconds_of_day =
@@ -173,8 +173,8 @@ fn start_time(policy: &Policy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
         .to_i64()
         .ok_or_else(|| anyhow!("failed to convert offset"))?;
     let offset_time = time.timestamp() + offset;
-    let Some(offset_time) = NaiveDateTime::from_timestamp_opt(offset_time, 0) else {
-        bail!("failed to create NaiveDateTime from timestamp");
+    let Some(offset_time) = DateTime::from_timestamp(offset_time, 0) else {
+        bail!("failed to create DateTime<Utc> from timestamp");
     };
 
     let seconds_of_day =
@@ -191,9 +191,9 @@ fn start_time(policy: &Policy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
             .to_i64()
             .ok_or_else(|| anyhow!("failed to convert start of the period"))?;
 
-    let Some(datetime) = NaiveDateTime::from_timestamp_opt(start_offset_time - offset, 0) else {
-        bail!("failed to create NaiveDateTime from timestamp");
+    let Some(datetime) = DateTime::from_timestamp(start_offset_time - offset, 0) else {
+        bail!("failed to create DateTime<Utc> from timestamp");
     };
 
-    Ok(DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc))
+    Ok(datetime)
 }
