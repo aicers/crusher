@@ -1,4 +1,7 @@
-use crate::client::{self, SERVER_RETRY_INTERVAL};
+use crate::{
+    client::{self, SERVER_RETRY_INTERVAL},
+    TEMP_TOML_POST_FIX,
+};
 use anyhow::{bail, Error, Result};
 use async_channel::Sender;
 use async_trait::async_trait;
@@ -10,6 +13,7 @@ use rustls::{Certificate, PrivateKey};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
+    fs,
     net::{IpAddr, SocketAddr},
     process::exit,
     sync::Arc,
@@ -106,6 +110,7 @@ impl Client {
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,
         config_reload: Arc<Notify>,
         wait_shutdown: Arc<Notify>,
+        config_path: String,
     ) -> Result<()> {
         loop {
             match connect(
@@ -117,6 +122,7 @@ impl Client {
                 delete_policy_ids.clone(),
                 config_reload.clone(),
                 wait_shutdown.clone(),
+                config_path.clone(),
             )
             .await
             {
@@ -159,6 +165,7 @@ async fn connect(
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     config_reload: Arc<Notify>,
     wait_shutdown: Arc<Notify>,
+    config_path: String,
 ) -> Result<()> {
     let connection = endpoint.connect(server_address, server_name)?.await?;
 
@@ -176,6 +183,7 @@ async fn connect(
         active_policy_list,
         delete_policy_ids,
         config_reload: config_reload.clone(),
+        config_path,
     };
 
     tokio::select! {
@@ -231,6 +239,7 @@ struct RequestHandler {
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     config_reload: Arc<Notify>,
+    config_path: String,
 }
 
 #[async_trait]
@@ -326,7 +335,7 @@ impl oinq::request::Handler for RequestHandler {
 
     async fn get_config(&mut self) -> Result<Config, String> {
         for attempt in 1..=MAX_RETRIES {
-            match crate::settings::get_config() {
+            match crate::settings::get_config(&self.config_path) {
                 Ok(conf) => return Ok(conf),
                 Err(e) => {
                     if attempt == MAX_RETRIES {
@@ -342,8 +351,10 @@ impl oinq::request::Handler for RequestHandler {
     async fn set_config(&mut self, conf: Config) -> Result<(), String> {
         info!("start set configuration");
         for attempt in 1..=MAX_RETRIES {
-            if let Err(e) = crate::settings::set_config(&conf) {
+            if let Err(e) = crate::settings::set_config(&conf, &self.config_path) {
                 if attempt == MAX_RETRIES {
+                    fs::remove_file(format!("{}{TEMP_TOML_POST_FIX}", self.config_path))
+                        .unwrap_or_else(|e| error!("failed to remove the temporary file: {e}"));
                     return Err(format!("failed to set config: {e}"));
                 }
             } else {
