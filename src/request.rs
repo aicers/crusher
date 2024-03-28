@@ -7,8 +7,8 @@ use async_channel::Sender;
 use async_trait::async_trait;
 use bincode::Options;
 use num_enum::TryFromPrimitive;
-use oinq::{request, Config};
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
+use review_protocol::{request, types as protocol_types, HandshakeError};
 use rustls::{Certificate, PrivateKey};
 use serde::Deserialize;
 use std::{
@@ -205,8 +205,8 @@ async fn connect(
 async fn handshake(
     conn: &Connection,
     protocol: &str,
-) -> Result<(SendStream, RecvStream), oinq::message::HandshakeError> {
-    let (send, recv) = oinq::message::client_handshake(
+) -> Result<(SendStream, RecvStream), HandshakeError> {
+    let (send, recv) = review_protocol::client::handshake(
         conn,
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
@@ -221,9 +221,9 @@ async fn handle_incoming(handler: RequestHandler, conn: &Connection) -> Result<(
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 let mut hdl = handler.clone();
-                tokio::spawn(
-                    async move { oinq::request::handle(&mut hdl, &mut send, &mut recv).await },
-                );
+                tokio::spawn(async move {
+                    review_protocol::request::handle(&mut hdl, &mut send, &mut recv).await
+                });
             }
             Err(e) => {
                 conn.close(VarInt::from_u32(0), b"Lost server connection");
@@ -243,7 +243,7 @@ struct RequestHandler {
 }
 
 #[async_trait]
-impl oinq::request::Handler for RequestHandler {
+impl review_protocol::request::Handler for RequestHandler {
     async fn reboot(&mut self) -> Result<(), String> {
         for attempt in 1..=MAX_RETRIES {
             if let Err(e) = roxy::reboot() {
@@ -272,9 +272,9 @@ impl oinq::request::Handler for RequestHandler {
         Err(String::from("cannot shutdown the system"))
     }
 
-    async fn resource_usage(&mut self) -> Result<(String, oinq::ResourceUsage), String> {
+    async fn resource_usage(&mut self) -> Result<(String, protocol_types::ResourceUsage), String> {
         let usg = roxy::resource_usage().await;
-        let usg = oinq::ResourceUsage {
+        let usg = protocol_types::ResourceUsage {
             cpu_usage: usg.cpu_usage,
             total_memory: usg.total_memory,
             used_memory: usg.used_memory,
@@ -333,7 +333,7 @@ impl oinq::request::Handler for RequestHandler {
         Ok(())
     }
 
-    async fn get_config(&mut self) -> Result<Config, String> {
+    async fn get_config(&mut self) -> Result<protocol_types::Config, String> {
         for attempt in 1..=MAX_RETRIES {
             match crate::settings::get_config(&self.config_path) {
                 Ok(conf) => return Ok(conf),
@@ -348,7 +348,7 @@ impl oinq::request::Handler for RequestHandler {
         Err(String::from("failed to get config"))
     }
 
-    async fn set_config(&mut self, conf: Config) -> Result<(), String> {
+    async fn set_config(&mut self, conf: protocol_types::Config) -> Result<(), String> {
         info!("start set configuration");
         for attempt in 1..=MAX_RETRIES {
             if let Err(e) = crate::settings::set_config(&conf, &self.config_path) {

@@ -1,7 +1,7 @@
 //! Configurations for the application.
 use anyhow::{Context, Result};
 use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File};
-use oinq::{request::CrusherConfig, Config};
+use review_protocol::types::{Config, CrusherConfig};
 use serde::{de::Error, Deserialize, Deserializer};
 use std::{
     fs::{self, OpenOptions},
