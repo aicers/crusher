@@ -239,7 +239,7 @@ async fn timeseries_with_conn() {
     while min < 10 {
         // 3times
         let conn_event = gen_conn();
-        let dur = Duration::minutes(min);
+        let dur = chrono::TimeDelta::try_minutes(min).unwrap();
 
         let time = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2022, 11, 17)
