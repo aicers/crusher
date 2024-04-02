@@ -72,21 +72,19 @@ async fn handle_connection(conn: quinn::Connecting) {
 }
 
 fn config_server() -> ServerConfig {
-    let (cert, key, ca_certs) = cert_key();
+    let (cert, key, root_pem) = cert_key();
 
-    let mut client_auth_roots = rustls::RootCertStore::empty();
-    for ca_cert in ca_certs {
-        let root_cert: Vec<rustls::Certificate> = rustls_pemfile::certs(&mut &*ca_cert)
-            .unwrap()
-            .into_iter()
-            .map(rustls::Certificate)
-            .collect();
-        if let Some(cert) = root_cert.get(0) {
-            client_auth_roots.add(cert).unwrap();
-        }
+    let mut client_auth_root = rustls::RootCertStore::empty();
+    let root_certs: Vec<rustls::Certificate> = rustls_pemfile::certs(&mut &*root_pem)
+        .unwrap()
+        .into_iter()
+        .map(rustls::Certificate)
+        .collect();
+    if let Some(cert) = root_certs.get(0) {
+        client_auth_root.add(cert).unwrap();
     }
 
-    let client_auth = rustls::server::AllowAnyAuthenticatedClient::new(client_auth_roots).boxed();
+    let client_auth = rustls::server::AllowAnyAuthenticatedClient::new(client_auth_root).boxed();
     let server_crypto = rustls::ServerConfig::builder()
         .with_safe_defaults()
         .with_client_cert_verifier(client_auth)
@@ -103,7 +101,7 @@ fn config_server() -> ServerConfig {
 }
 
 fn client() -> Client {
-    let (cert, key, ca_certs) = cert_key();
+    let (cert, key, root_pem) = cert_key();
     let (_, rx) = async_channel::unbounded();
 
     Client::new(
@@ -113,17 +111,17 @@ fn client() -> Client {
         PathBuf::from(LAST_TIME_SERIES_PATH),
         cert,
         key,
-        ca_certs,
+        &root_pem,
         rx,
     )
 }
 
-fn cert_key() -> (Vec<Certificate>, PrivateKey, Vec<Vec<u8>>) {
+fn cert_key() -> (Vec<Certificate>, PrivateKey, Vec<u8>) {
     let cert_pem = fs::read(CERT_PATH).unwrap();
     let cert = to_cert_chain(&cert_pem).unwrap();
     let key_pem = fs::read(KEY_PATH).unwrap();
     let key = to_private_key(&key_pem).unwrap();
-    let ca_certs = vec![fs::read(CA_CERT_PATH).unwrap()];
+    let ca_certs = fs::read(CA_CERT_PATH).unwrap();
 
     (cert, key, ca_certs)
 }

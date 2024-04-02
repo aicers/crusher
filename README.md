@@ -23,14 +23,14 @@ The following is key values in the TOML configuration file.
 
 * `key`: Crusher's private key file.
 * `cert`: Crusher's certificate file.
-* `roots`: RootCA file. (for Giganto, Review)
+* `root`: RootCA file. (for Giganto, Review)
 * `giganto_name`: the name of the Giganto. This must match with the DNS name in
   the certificate.
-* `giganto_ingest_address`: IP address and port number of `Giganto ingest`.
-* `giganto_publish_address`: IP address and port number of `Giganto publish`.
+* `giganto_ingest_srv_addr`: IP address and port number of `Giganto ingest`.
+* `giganto_publish_srv_addr`: IP address and port number of `Giganto publish`.
 * `review_name`: the name of the review. This must match with the DNS name in
   the certificate.
-* `review_address`: IP address and port number of `review`.
+* `review_rpc_srv_addr`: IP address and port number of `review`.
 * `last_timestamp_data`: File that stores the timestamp of the last time series
   per `sampling policy`.
 * `log_dir`: Path to the log file.
@@ -40,12 +40,12 @@ Example
 ```toml
 key = "key.pem"
 cert = "cert.pem"
-roots = ["ca1.pem", "ca2.pem", "ca3.pem"]
+root = "root.pem"
 giganto_name = "localhost"
-giganto_ingest_address = "127.0.0.1:38370"
-giganto_publish_address = "127.0.0.1:38371"
+giganto_ingest_srv_addr = "127.0.0.1:38370"
+giganto_publish_srv_addr = "127.0.0.1:38371"
 review_name = "localhost"
-review_address ="127.0.0.1:38390"
+review_rpc_srv_addr ="127.0.0.1:38390"
 last_timestamp_data = "tests/time_data.json"
 log_dir = "/data/logs/apps"
 ```

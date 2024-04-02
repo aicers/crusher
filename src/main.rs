@@ -67,12 +67,12 @@ async fn main() -> Result<()> {
             )
         })?;
         let key = to_private_key(&key_pem).context("cannot read private key")?;
-
-        let mut files: Vec<Vec<u8>> = Vec::new();
-        for root in &settings.roots {
-            let file = fs::read(root).expect("Failed to read file");
-            files.push(file);
-        }
+        let root_pem = fs::read(&settings.root).with_context(|| {
+            format!(
+                "failed to read root certificate file: {}",
+                settings.root.display()
+            )
+        })?;
 
         read_last_timestamp(&settings.last_timestamp_data).await?;
 
@@ -80,11 +80,11 @@ async fn main() -> Result<()> {
             async_channel::bounded::<RequestedPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
 
         let request_client = request::Client::new(
-            settings.review_address,
+            settings.review_rpc_srv_addr,
             settings.review_name,
             cert.clone(),
             key.clone(),
-            files.clone(),
+            &root_pem,
             request_send,
         );
         let runtime_policy_list = Arc::new(RwLock::new(HashMap::new())); // current sampling_policy value
@@ -98,13 +98,13 @@ async fn main() -> Result<()> {
         ));
 
         let subscribe_client = subscribe::Client::new(
-            settings.giganto_ingest_address,
-            settings.giganto_publish_address,
+            settings.giganto_ingest_srv_addr,
+            settings.giganto_publish_srv_addr,
             settings.giganto_name,
             settings.last_timestamp_data,
             cert,
             key,
-            files,
+            &root_pem,
             request_recv,
         );
         task::spawn(subscribe_client.run(

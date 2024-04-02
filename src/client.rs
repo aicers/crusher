@@ -7,17 +7,15 @@ use tokio::time::Duration;
 pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(5_000);
 pub const SERVER_RETRY_INTERVAL: u64 = 3;
 
-pub fn config(certs: Vec<Certificate>, key: PrivateKey, files: Vec<Vec<u8>>) -> Result<Endpoint> {
+pub fn config(certs: Vec<Certificate>, key: PrivateKey, root_pem: &[u8]) -> Result<Endpoint> {
     let mut root_store = rustls::RootCertStore::empty();
-    for file in files {
-        let root_cert: Vec<rustls::Certificate> = rustls_pemfile::certs(&mut &*file)
-            .context("invalid PEM-encoded certificate")?
-            .into_iter()
-            .map(rustls::Certificate)
-            .collect();
-        if let Some(cert) = root_cert.first() {
-            root_store.add(cert)?;
-        }
+    let root_certs: Vec<rustls::Certificate> = rustls_pemfile::certs(&mut &*root_pem)
+        .context("invalid PEM-encoded certificate")?
+        .into_iter()
+        .map(rustls::Certificate)
+        .collect();
+    if let Some(cert) = root_certs.first() {
+        root_store.add(cert).context("failed to add root cert")?;
     }
 
     let tls_config = rustls::ClientConfig::builder()
