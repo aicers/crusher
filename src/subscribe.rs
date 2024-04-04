@@ -186,10 +186,10 @@ impl Client {
         last_series_time_path: PathBuf,
         certs: Vec<Certificate>,
         key: PrivateKey,
-        files: Vec<Vec<u8>>,
+        root_pem: &[u8],
         request_recv: Receiver<RequestedPolicy>,
     ) -> Self {
-        let endpoint = client::config(certs, key, files)
+        let endpoint = client::config(certs, key, root_pem)
             .expect("Server configuration error with cert, key or root");
         Client {
             ingest_addr,

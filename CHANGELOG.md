@@ -21,6 +21,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `crusher.toml`, the temporary file is named as `crusher.toml.temp.toml`.
   - If the reload trigger succeeds, the new configuration is applied from the
     temporary file; otherwise, the temporary file is deleted.
+- Changed configuration fields name.
+  - `roots` to `root`.
+  - `giganto_ingest_address` to `giganto_ingest_srv_addr`.
+  - `giganto_publish_address` to `giganto_publish_srv_addr`.
+  - `review_address` to `review_rpc_srv_addr`.
 
 ## [0.3.2] - 2024-01-25
 

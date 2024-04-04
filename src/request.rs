@@ -91,10 +91,10 @@ impl Client {
         server_name: String,
         certs: Vec<Certificate>,
         key: PrivateKey,
-        files: Vec<Vec<u8>>,
+        root_pem: &[u8],
         request_send: Sender<RequestedPolicy>,
     ) -> Self {
-        let endpoint = client::config(certs, key, files)
+        let endpoint = client::config(certs, key, root_pem)
             .expect("server configuration error with cert, key or root");
         Client {
             server_address,
