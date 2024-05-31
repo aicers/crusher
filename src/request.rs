@@ -1,5 +1,5 @@
 use crate::{
-    client::{self, SERVER_RETRY_INTERVAL},
+    client::{self, Certs, SERVER_RETRY_INTERVAL},
     TEMP_TOML_POST_FIX,
 };
 use anyhow::{bail, Error, Result};
@@ -8,8 +8,7 @@ use async_trait::async_trait;
 use bincode::Options;
 use num_enum::TryFromPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
-use review_protocol::{request, types as protocol_types, HandshakeError};
-use rustls::{Certificate, PrivateKey};
+use review_protocol::{types as protocol_types, HandshakeError};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -89,13 +88,11 @@ impl Client {
     pub fn new(
         server_address: SocketAddr,
         server_name: String,
-        certs: Vec<Certificate>,
-        key: PrivateKey,
-        root_pem: &[u8],
+        certs: &Arc<Certs>,
         request_send: Sender<RequestedPolicy>,
     ) -> Self {
-        let endpoint = client::config(certs, key, root_pem)
-            .expect("server configuration error with cert, key or root");
+        let endpoint =
+            client::config(certs).expect("server configuration error with cert, key or root");
         Client {
             server_address,
             server_name,
@@ -366,11 +363,11 @@ impl review_protocol::request::Handler for RequestHandler {
         Err(String::from("failed to set config"))
     }
 
-    async fn process_list(&mut self) -> Result<Vec<request::Process>, String> {
+    async fn process_list(&mut self) -> Result<Vec<protocol_types::Process>, String> {
         let list = roxy::process_list().await;
         let list = list
             .into_iter()
-            .map(|p| request::Process {
+            .map(|p| protocol_types::Process {
                 user: p.user,
                 cpu_usage: p.cpu_usage,
                 mem_usage: p.mem_usage,
