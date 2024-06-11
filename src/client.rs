@@ -1,32 +1,44 @@
-use anyhow::{Context, Result};
-use quinn::{ClientConfig, Endpoint, TransportConfig};
-use rustls::{Certificate, PrivateKey};
+use anyhow::Result;
+use quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Endpoint, TransportConfig};
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer},
+    RootCertStore,
+};
 use std::sync::Arc;
 use tokio::time::Duration;
 
 pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(5_000);
 pub const SERVER_RETRY_INTERVAL: u64 = 3;
 
-pub fn config(certs: Vec<Certificate>, key: PrivateKey, root_pem: &[u8]) -> Result<Endpoint> {
-    let mut root_store = rustls::RootCertStore::empty();
-    let root_certs: Vec<rustls::Certificate> = rustls_pemfile::certs(&mut &*root_pem)
-        .context("invalid PEM-encoded certificate")?
-        .into_iter()
-        .map(rustls::Certificate)
-        .collect();
-    if let Some(cert) = root_certs.first() {
-        root_store.add(cert).context("failed to add root cert")?;
-    }
+#[allow(clippy::struct_field_names)]
+pub struct Certs {
+    pub certs: Vec<CertificateDer<'static>>,
+    pub key: PrivateKeyDer<'static>,
+    pub root: RootCertStore,
+}
 
-    let tls_config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)?;
+impl Clone for Certs {
+    fn clone(&self) -> Self {
+        Self {
+            certs: self.certs.clone(),
+            key: self.key.clone_key(),
+            root: self.root.clone(),
+        }
+    }
+}
+
+pub fn config(certs: &Arc<Certs>) -> Result<Endpoint> {
+    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(certs.root.clone())
+    .with_client_auth_cert(certs.certs.clone(), certs.key.clone_key())?;
 
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
 
-    let mut config = ClientConfig::new(Arc::new(tls_config));
+    let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
     config.transport_config(Arc::new(transport));
 
     let mut endpoint =

@@ -10,6 +10,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Support `shutdown`, `reload_config` via `oinq`.
+- Added a `Certs` to store commonly used certificate information.
 
 ### Changed
 
@@ -26,6 +27,21 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   - `giganto_ingest_address` to `giganto_ingest_srv_addr`.
   - `giganto_publish_address` to `giganto_publish_srv_addr`.
   - `review_address` to `review_rpc_srv_addr`.
+- Update giganto-client to version `0.17.0`. Updating to this version results
+  in the following changes.
+  - Bump dependencies.
+    - Update quinn to version `0.11`.
+    - Update rustls to version `0.23`.
+    - Update review-protocol to version `0.3`.
+  - Update the protocol version of the giganto ingest, publish module.
+    - Changed `PUBLISH_PROTOCOL_VERSION` to "0.21.0-alpha.1"
+    - Changed `INGEST_PROTOCOL_VERSION` to "0.21.0-alpha.1"
+- Changed the form of timeseries sent to giganto to `Vec<(i64,Vec<u8>)>`.
+  Currently, giganto has changed to send and receive a certain number of
+  events at once to optimize sending and receiving large amounts of data.
+  For timeseries, one event is generated per period, and it takes too long
+  to collect and send a certain number of timeseries events, so it was
+  changed to send only one event as a vector.
 
 ## [0.3.2] - 2024-01-25
 

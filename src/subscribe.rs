@@ -2,7 +2,7 @@
 mod tests;
 
 use crate::{
-    client::{self, SERVER_RETRY_INTERVAL},
+    client::{self, Certs, SERVER_RETRY_INTERVAL},
     model::{convert_policy, time_series, Period, TimeSeries},
     request::{RequestedKind, RequestedPolicy},
 };
@@ -11,12 +11,12 @@ use async_channel::{Receiver, Sender};
 use chrono::{TimeZone, Utc};
 use giganto_client::{
     connection::client_handshake,
-    frame::RecvError,
+    frame::{send_raw, RecvError},
     ingest::{
         network::{
             Conn, DceRpc, Dns, Ftp, Http, Kerberos, Ldap, Mqtt, Nfs, Ntlm, Rdp, Smb, Smtp, Ssh, Tls,
         },
-        receive_ack_timestamp, send_event, send_record_header,
+        receive_ack_timestamp, send_record_header,
     },
     publish::{
         receive_crusher_data, receive_crusher_stream_start_message, send_stream_request,
@@ -27,7 +27,6 @@ use giganto_client::{
 use lazy_static::lazy_static;
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
-use rustls::{Certificate, PrivateKey};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -45,8 +44,8 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-const INGEST_PROTOCOL_VERSION: &str = "0.15.0";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.17.0";
+const INGEST_PROTOCOL_VERSION: &str = "0.21.0-alpha.1";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.21.0-alpha.1";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
@@ -184,13 +183,11 @@ impl Client {
         publish_addr: SocketAddr,
         server_name: String,
         last_series_time_path: PathBuf,
-        certs: Vec<Certificate>,
-        key: PrivateKey,
-        root_pem: &[u8],
+        certs: &Arc<Certs>,
         request_recv: Receiver<RequestedPolicy>,
     ) -> Self {
-        let endpoint = client::config(certs, key, root_pem)
-            .expect("Server configuration error with cert, key or root");
+        let endpoint =
+            client::config(certs).expect("Server configuration error with cert, key or root");
         Client {
             ingest_addr,
             publish_addr,
@@ -825,12 +822,10 @@ async fn send_time_series(
 
     // First data transmission (record type + series data)
     send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
-    send_event(
-        &mut series_sender,
-        series.start.timestamp_nanos_opt().unwrap_or(i64::MAX),
-        series,
-    )
-    .await?;
+
+    let serde_series = bincode::serialize(&series)?;
+    let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
+    send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
 
     // Receive start time of giganto last saved time series.
     tokio::spawn(receive_time_series_timestamp(
@@ -842,13 +837,16 @@ async fn send_time_series(
 
     // Data transmission after the first time (only series data)
     while let Ok(series) = recv_channel.recv().await {
-        send_event(
-            &mut series_sender,
-            series.start.timestamp_nanos_opt().unwrap_or(i64::MAX),
-            series,
-        )
-        .await?;
+        let serde_series = bincode::serialize(&series)?;
+        let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
+        send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
     }
+    Ok(())
+}
+
+async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -> Result<()> {
+    let buf = bincode::serialize(&events)?;
+    send_raw(send, &buf).await?;
     Ok(())
 }
 
@@ -870,7 +868,7 @@ async fn receive_time_series_timestamp(
                     .send((sampling_policy_id.clone(), timestamp))
                     .await?;
             }
-            Err(RecvError::ReadError(quinn::ReadExactError::FinishedEarly)) => {
+            Err(RecvError::ReadError(quinn::ReadExactError::FinishedEarly(_))) => {
                 break;
             }
             Err(e) => {

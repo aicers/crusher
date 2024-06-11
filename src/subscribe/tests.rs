@@ -1,14 +1,14 @@
 use super::{Client, Conn};
 use crate::{
+    client::Certs,
     model::{Interval, Period, Policy, TimeSeries},
-    to_cert_chain, to_private_key,
+    to_cert_chain, to_private_key, to_root_cert,
 };
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use giganto_client::publish::stream::RequestStreamRecord;
 use lazy_static::lazy_static;
-use quinn::{Connection, Endpoint, ServerConfig};
-use rustls::{Certificate, PrivateKey};
+use quinn::{crypto::rustls::QuicServerConfig, Connection, Endpoint, ServerConfig};
 use std::{
     collections::HashMap,
     fs,
@@ -54,7 +54,7 @@ impl TestServer {
     }
 }
 
-async fn handle_connection(conn: quinn::Connecting) {
+async fn handle_connection(conn: quinn::Incoming) {
     let connection = conn.await.unwrap();
     connection_handshake(&connection).await;
 
@@ -72,26 +72,26 @@ async fn handle_connection(conn: quinn::Connecting) {
 }
 
 fn config_server() -> ServerConfig {
-    let (cert, key, root_pem) = cert_key();
+    let certs = cert_key();
 
-    let mut client_auth_root = rustls::RootCertStore::empty();
-    let root_certs: Vec<rustls::Certificate> = rustls_pemfile::certs(&mut &*root_pem)
-        .unwrap()
-        .into_iter()
-        .map(rustls::Certificate)
-        .collect();
-    if let Some(cert) = root_certs.get(0) {
-        client_auth_root.add(cert).unwrap();
-    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let client_auth = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(certs.root.clone()),
+        provider.clone(),
+    )
+    .build()
+    .expect("Failed to build client certificate verifier");
 
-    let client_auth = rustls::server::AllowAnyAuthenticatedClient::new(client_auth_root).boxed();
-    let server_crypto = rustls::ServerConfig::builder()
-        .with_safe_defaults()
+    let server_crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("Failed to set default tls protocol version")
         .with_client_cert_verifier(client_auth)
-        .with_single_cert(cert, key)
+        .with_single_cert(certs.certs.clone(), certs.key.clone_key())
         .unwrap();
 
-    let mut server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(server_crypto).expect("Failed to generate TLS server config"),
+    ));
 
     Arc::get_mut(&mut server_config.transport)
         .unwrap()
@@ -101,7 +101,7 @@ fn config_server() -> ServerConfig {
 }
 
 fn client() -> Client {
-    let (cert, key, root_pem) = cert_key();
+    let certs = cert_key();
     let (_, rx) = async_channel::unbounded();
 
     Client::new(
@@ -109,21 +109,24 @@ fn client() -> Client {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_PUBLISH_PORT),
         String::from(HOST),
         PathBuf::from(LAST_TIME_SERIES_PATH),
-        cert,
-        key,
-        &root_pem,
+        &Arc::new(certs),
         rx,
     )
 }
 
-fn cert_key() -> (Vec<Certificate>, PrivateKey, Vec<u8>) {
+fn cert_key() -> Certs {
     let cert_pem = fs::read(CERT_PATH).unwrap();
     let cert = to_cert_chain(&cert_pem).unwrap();
     let key_pem = fs::read(KEY_PATH).unwrap();
     let key = to_private_key(&key_pem).unwrap();
-    let ca_certs = fs::read(CA_CERT_PATH).unwrap();
+    let root_pem = fs::read(CA_CERT_PATH).unwrap();
+    let root_cert = to_root_cert(&root_pem).unwrap();
 
-    (cert, key, ca_certs)
+    Certs {
+        certs: cert.clone(),
+        key: key.clone_key(),
+        root: root_cert.clone(),
+    }
 }
 
 async fn connection_handshake(conn: &Connection) {
@@ -193,6 +196,7 @@ fn gen_conn() -> Conn {
         resp_port: 80,
         proto: 6,
         service: String::new(),
+        conn_state: "OK".to_string(),
         duration: tmp_dur.num_nanoseconds().unwrap(),
         orig_bytes: 77,
         resp_bytes: 295,

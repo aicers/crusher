@@ -57,4 +57,4 @@ By default, giganto reads the config file from the following directories:
 
 ## Copyright
 
-* Copyright 2023 ClumL Inc.
+* Copyright 2023-2024 ClumL Inc.

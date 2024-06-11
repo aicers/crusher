@@ -6,7 +6,8 @@ mod subscribe;
 
 use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 use anyhow::{anyhow, bail, Context, Result};
-use rustls::{Certificate, PrivateKey};
+use client::Certs;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use settings::Settings;
 pub use settings::TEMP_TOML_POST_FIX;
 use std::path::Path;
@@ -73,6 +74,12 @@ async fn main() -> Result<()> {
                 settings.root.display()
             )
         })?;
+        let root_cert = to_root_cert(&root_pem)?;
+        let certs = Arc::new(Certs {
+            certs: cert.clone(),
+            key: key.clone_key(),
+            root: root_cert.clone(),
+        });
 
         read_last_timestamp(&settings.last_timestamp_data).await?;
 
@@ -82,9 +89,7 @@ async fn main() -> Result<()> {
         let request_client = request::Client::new(
             settings.review_rpc_srv_addr,
             settings.review_name,
-            cert.clone(),
-            key.clone(),
-            &root_pem,
+            &certs,
             request_send,
         );
         let runtime_policy_list = Arc::new(RwLock::new(HashMap::new())); // current sampling_policy value
@@ -102,9 +107,7 @@ async fn main() -> Result<()> {
             settings.giganto_publish_srv_addr,
             settings.giganto_name,
             settings.last_timestamp_data,
-            cert,
-            key,
-            &root_pem,
+            &certs,
             request_recv,
         );
         task::spawn(subscribe_client.run(
@@ -170,24 +173,30 @@ fn version() -> String {
     format!("crusher {}", env!("CARGO_PKG_VERSION"))
 }
 
-fn to_cert_chain(pem: &[u8]) -> Result<Vec<Certificate>> {
-    let certs = rustls_pemfile::certs(&mut &*pem).context("cannot parse certificate chain")?;
-    if certs.is_empty() {
-        bail!("no certificate found");
-    }
-    Ok(certs.into_iter().map(Certificate).collect())
+fn to_cert_chain(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
+    let certs = rustls_pemfile::certs(&mut &*pem)
+        .collect::<Result<_, _>>()
+        .context("cannot parse certificate chain")?;
+    Ok(certs)
 }
 
-fn to_private_key(pem: &[u8]) -> Result<PrivateKey> {
+fn to_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     match rustls_pemfile::read_one(&mut &*pem)
         .context("cannot parse private key")?
         .ok_or_else(|| anyhow!("empty private key"))?
     {
-        rustls_pemfile::Item::PKCS8Key(key) | rustls_pemfile::Item::RSAKey(key) => {
-            Ok(PrivateKey(key))
-        }
+        rustls_pemfile::Item::Pkcs1Key(key) => Ok(key.into()),
+        rustls_pemfile::Item::Pkcs8Key(key) => Ok(key.into()),
         _ => Err(anyhow!("unknown private key format")),
     }
+}
+
+fn to_root_cert(pem: &[u8]) -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+    if let Some(Ok(cert)) = rustls_pemfile::certs(&mut &*pem).next() {
+        root_store.add(cert).context("failed to add root cert")?;
+    };
+    Ok(root_store)
 }
 
 fn init_tracing(path: &Path) -> Result<WorkerGuard> {

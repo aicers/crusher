@@ -9,7 +9,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
 };
-use toml_edit::{value, Document};
+use toml_edit::{value, DocumentMut};
 
 const DEFAULT_GIGANTO_NAME: &str = "localhost";
 const DEFAULT_GIGANTO_INGEST_SRV_ADDR: &str = "[::]:38370";
@@ -113,7 +113,7 @@ where
 
 pub fn get_config(config_path: &str) -> Result<Config> {
     let toml = fs::read_to_string(config_path).context("toml not found")?;
-    let doc = toml.parse::<Document>()?;
+    let doc = toml.parse::<DocumentMut>()?;
 
     let review_rpc_srv_addr = doc
         .get("review_rpc_srv_addr")
@@ -145,7 +145,7 @@ pub fn set_config(config: &Config, config_path: &str) -> Result<()> {
     let tmp_path = format!("{config_path}{TEMP_TOML_POST_FIX}");
     fs::copy(config_path, &tmp_path)?;
     let config_toml = fs::read_to_string(&tmp_path).context("toml not found")?;
-    let mut doc = config_toml.parse::<Document>()?;
+    let mut doc = config_toml.parse::<DocumentMut>()?;
 
     if let Config::Crusher(conf) = config {
         doc["review_rpc_srv_addr"] = value(conf.review_address.to_string());
