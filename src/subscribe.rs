@@ -1,11 +1,16 @@
 #[cfg(test)]
 mod tests;
 
-use crate::{
-    client::{self, Certs, SERVER_RETRY_INTERVAL},
-    model::{convert_policy, time_series, Period, TimeSeries},
-    request::{RequestedKind, RequestedPolicy},
+use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    io::{BufReader, BufWriter},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::exit,
+    sync::Arc,
 };
+
 use anyhow::{bail, Context, Error, Result};
 use async_channel::{Receiver, Sender};
 use chrono::{TimeZone, Utc};
@@ -28,21 +33,18 @@ use lazy_static::lazy_static;
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{BufReader, BufWriter},
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    process::exit,
-    sync::Arc,
-};
 use tokio::{
     sync::{Mutex, Notify, RwLock},
     task,
     time::{sleep, Duration},
 };
 use tracing::{error, info, trace, warn};
+
+use crate::{
+    client::{self, Certs, SERVER_RETRY_INTERVAL},
+    model::{convert_policy, time_series, Period, TimeSeries},
+    request::{RequestedKind, RequestedPolicy},
+};
 
 const INGEST_PROTOCOL_VERSION: &str = "0.21.0-alpha.1";
 const PUBLISH_PROTOCOL_VERSION: &str = "0.21.0-alpha.1";

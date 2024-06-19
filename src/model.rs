@@ -1,6 +1,5 @@
-use crate::request::{RequestedInterval, RequestedPeriod, RequestedPolicy};
+use std::net::IpAddr;
 
-use super::subscribe::{Event, INGEST_CHANNEL};
 use anyhow::{anyhow, bail, Result};
 use async_channel::Sender;
 use chrono::{DateTime, TimeZone, Timelike, Utc};
@@ -8,7 +7,9 @@ use giganto_client::publish::stream::RequestStreamRecord;
 use num_enum::IntoPrimitive;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+
+use super::subscribe::{Event, INGEST_CHANNEL};
+use crate::request::{RequestedInterval, RequestedPeriod, RequestedPolicy};
 
 // Interval should be able to divide any of the Period values.
 #[derive(Clone, Copy, IntoPrimitive, Deserialize, Debug)]

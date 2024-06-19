@@ -1,10 +1,11 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Endpoint, TransportConfig};
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     RootCertStore,
 };
-use std::sync::Arc;
 use tokio::time::Duration;
 
 pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(5_000);
