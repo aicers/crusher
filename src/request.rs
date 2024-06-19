@@ -1,7 +1,11 @@
-use crate::{
-    client::{self, Certs, SERVER_RETRY_INTERVAL},
-    TEMP_TOML_POST_FIX,
+use std::{
+    collections::HashMap,
+    fs,
+    net::{IpAddr, SocketAddr},
+    process::exit,
+    sync::Arc,
 };
+
 use anyhow::{bail, Error, Result};
 use async_channel::Sender;
 use async_trait::async_trait;
@@ -10,18 +14,16 @@ use num_enum::TryFromPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use review_protocol::{types as protocol_types, HandshakeError};
 use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    fs,
-    net::{IpAddr, SocketAddr},
-    process::exit,
-    sync::Arc,
-};
 use tokio::{
     sync::{Notify, RwLock},
     time::{sleep, Duration},
 };
 use tracing::{error, info, trace, warn};
+
+use crate::{
+    client::{self, Certs, SERVER_RETRY_INTERVAL},
+    TEMP_TOML_POST_FIX,
+};
 
 const REVIEW_PROTOCOL_VERSION: &str = "0.27.0";
 const MAX_RETRIES: u8 = 3;

@@ -14,6 +14,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Apply Group imports by StdExternalCrate.
+  - Modify the code with this command:
+    - `cargo fmt -- --config group_imports=StdExternalCrate`.
+  - Add `--config group_imports=StdExternalCrate` to the CI process like:
+    - `cargo fmt -- --check --config group_imports=StdExternalCrate`
 - Changed CrusherConfig with oinq `Config`.
 - Modified logging behavior for debug and release builds
 - Changed logs to stdout and file

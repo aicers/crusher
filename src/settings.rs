@@ -1,14 +1,15 @@
 //! Configurations for the application.
-use anyhow::{Context, Result};
-use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File};
-use review_protocol::types::{Config, CrusherConfig};
-use serde::{de::Error, Deserialize, Deserializer};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
     net::SocketAddr,
     path::PathBuf,
 };
+
+use anyhow::{Context, Result};
+use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File};
+use review_protocol::types::{Config, CrusherConfig};
+use serde::{de::Error, Deserialize, Deserializer};
 use toml_edit::{value, DocumentMut};
 
 const DEFAULT_GIGANTO_NAME: &str = "localhost";

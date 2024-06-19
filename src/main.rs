@@ -4,14 +4,14 @@ mod request;
 mod settings;
 mod subscribe;
 
-use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
+use std::path::Path;
+use std::{collections::HashMap, env, fs, process::exit, sync::Arc};
+
 use anyhow::{anyhow, bail, Context, Result};
 use client::Certs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use settings::Settings;
 pub use settings::TEMP_TOML_POST_FIX;
-use std::path::Path;
-use std::{collections::HashMap, env, fs, process::exit, sync::Arc};
 use tokio::{
     sync::{Notify, RwLock},
     task,
@@ -22,6 +22,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
     fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
+
+use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 const DEFAULT_TOML: &str = "/usr/local/aice/conf/crusher.toml";
