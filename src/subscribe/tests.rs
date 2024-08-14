@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::{
     collections::HashMap,
     fs,
@@ -8,7 +9,6 @@ use std::{
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use giganto_client::publish::stream::RequestStreamRecord;
-use lazy_static::lazy_static;
 use quinn::{crypto::rustls::QuicServerConfig, Connection, Endpoint, ServerConfig};
 use tokio::sync::{Mutex, Notify, RwLock};
 
@@ -19,9 +19,7 @@ use crate::{
     to_cert_chain, to_private_key, to_root_cert,
 };
 
-lazy_static! {
-    pub(crate) static ref TOKEN: Mutex<u32> = Mutex::new(0);
-}
+pub(crate) static TOKEN: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
 
 const CERT_PATH: &str = "tests/cert.pem";
 const KEY_PATH: &str = "tests/key.pem";

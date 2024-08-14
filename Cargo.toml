@@ -14,7 +14,6 @@ chrono = { version = "0.4", features = ["serde"] }
 config = { version = "0.14", features = ["toml"], default-features = false }
 directories = "5.0"
 giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.17.0" }
-lazy_static = "1"
 num_enum = "0.7"
 num-traits = "0.2"
 quinn = { version = "0.11", features = ["ring"] }
@@ -32,6 +31,3 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 x509-parser = "0.16"
-
-[dev-dependencies]
-lazy_static = "1"
