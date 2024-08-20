@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests;
 
+use std::sync::LazyLock;
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -29,7 +30,6 @@ use giganto_client::{
     },
     RawEventKind,
 };
-use lazy_static::lazy_static;
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
 use serde_json::Value;
@@ -52,13 +52,13 @@ const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
 
-lazy_static! {
-    // A hashmap for data transfer to an already created asynchronous task
-    pub static ref INGEST_CHANNEL: RwLock<HashMap<String, Sender<TimeSeries>>> =
-        RwLock::new(HashMap::new());
-    // A hashmap for last series timestamp
-    pub static ref LAST_TRANSFER_TIME: RwLock<HashMap<String,i64>> = RwLock::new(HashMap::new());
-}
+// A hashmap for data transfer to an already created asynchronous task
+pub static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+// A hashmap for last series timestamp
+pub static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 impl From<RequestedKind> for RequestStreamRecord {
     fn from(k: RequestedKind) -> Self {
@@ -358,13 +358,11 @@ async fn publish_connection_control(
                                     _ => {}
                                 }
                             }
-                            if let Some(e) = cause.downcast_ref::<ConnectionError>() {
-                                match e {
-                                    ConnectionError::TimedOut | ConnectionError::LocallyClosed => {
-                                        continue 'connection;
-                                    }
-                                    _ => {}
-                                }
+                            if let Some(
+                                ConnectionError::TimedOut | ConnectionError::LocallyClosed,
+                            ) = cause.downcast_ref::<ConnectionError>()
+                            {
+                                continue 'connection;
                             }
                         }
                         bail!("Cannot recover from open stream error: {}", e);
@@ -411,13 +409,8 @@ async fn publish_connection_control(
                                             _ => {}
                                         }
                                     }
-                                    if let Some(e) = cause.downcast_ref::<ConnectionError>() {
-                                        match e {
-                                            ConnectionError::TimedOut | ConnectionError::LocallyClosed => {
-                                                continue 'connection;
-                                            }
-                                            _ => {}
-                                        }
+                                    if let Some(ConnectionError::TimedOut | ConnectionError::LocallyClosed) = cause.downcast_ref::<ConnectionError>() {
+                                        continue 'connection;
                                     }
                                 }
                                 bail!("Cannot recover from open stream error: {}", e);
