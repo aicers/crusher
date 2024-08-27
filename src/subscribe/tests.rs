@@ -73,17 +73,11 @@ async fn handle_connection(conn: quinn::Incoming) {
 fn config_server() -> ServerConfig {
     let certs = cert_key();
 
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let client_auth = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(certs.root.clone()),
-        provider.clone(),
-    )
-    .build()
-    .expect("Failed to build client certificate verifier");
+    let client_auth = rustls::server::WebPkiClientVerifier::builder(Arc::new(certs.root.clone()))
+        .build()
+        .expect("Failed to build client certificate verifier");
 
-    let server_crypto = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("Failed to set default tls protocol version")
+    let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_auth)
         .with_single_cert(certs.certs.clone(), certs.key.clone_key())
         .unwrap();

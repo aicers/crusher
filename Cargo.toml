@@ -21,7 +21,10 @@ review-protocol = { git = "https://github.com/petabi/review-protocol.git", featu
     "client",
 ], tag = "0.3.0" }
 roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.2.1" }
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -29,12 +29,9 @@ impl Clone for Certs {
 }
 
 pub fn config(certs: &Arc<Certs>) -> Result<Endpoint> {
-    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(certs.root.clone())
-    .with_client_auth_cert(certs.certs.clone(), certs.key.clone_key())?;
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(certs.root.clone())
+        .with_client_auth_cert(certs.certs.clone(), certs.key.clone_key())?;
 
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
