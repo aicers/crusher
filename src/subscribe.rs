@@ -20,7 +20,8 @@ use giganto_client::{
     frame::{send_raw, RecvError},
     ingest::{
         network::{
-            Conn, DceRpc, Dns, Ftp, Http, Kerberos, Ldap, Mqtt, Nfs, Ntlm, Rdp, Smb, Smtp, Ssh, Tls,
+            Bootp, Conn, DceRpc, Dhcp, Dns, Ftp, Http, Kerberos, Ldap, Mqtt, Nfs, Ntlm, Rdp, Smb,
+            Smtp, Ssh, Tls,
         },
         receive_ack_timestamp, send_record_header,
     },
@@ -46,8 +47,8 @@ use crate::{
     request::{RequestedKind, RequestedPolicy},
 };
 
-const INGEST_PROTOCOL_VERSION: &str = "0.21.0-alpha.1";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.21.0-alpha.1";
+const INGEST_PROTOCOL_VERSION: &str = "0.21.0";
+const PUBLISH_PROTOCOL_VERSION: &str = "0.21.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
@@ -78,6 +79,8 @@ impl From<RequestedKind> for RequestStreamRecord {
             RequestedKind::Tls => Self::Tls,
             RequestedKind::Smb => Self::Smb,
             RequestedKind::Nfs => Self::Nfs,
+            RequestedKind::Bootp => Self::Bootp,
+            RequestedKind::Dhcp => Self::Dhcp,
         }
     }
 }
@@ -98,6 +101,8 @@ pub(crate) enum Event {
     Tls(Tls),
     Smb(Smb),
     Nfs(Nfs),
+    Bootp(Bootp),
+    Dhcp(Dhcp),
 }
 
 impl Event {
@@ -118,6 +123,8 @@ impl Event {
             Self::Tls(evt) => evt.column_value(column),
             Self::Smb(evt) => evt.column_value(column),
             Self::Nfs(evt) => evt.column_value(column),
+            Self::Bootp(evt) => evt.column_value(column),
+            Self::Dhcp(evt) => evt.column_value(column),
         }
     }
 }
@@ -168,6 +175,10 @@ impl ColumnValue for Tls {}
 impl ColumnValue for Smb {}
 
 impl ColumnValue for Nfs {}
+
+impl ColumnValue for Bootp {}
+
+impl ColumnValue for Dhcp {}
 
 pub struct Client {
     ingest_addr: SocketAddr,
@@ -779,6 +790,36 @@ async fn receiver(
                         };
                         if let Err(e) =
                             time_series(&policy, &mut series, time, &Event::Nfs(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+
+                    RequestStreamRecord::Bootp => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Bootp>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Bootp(event), &sender)
+                                .await
+                        {
+                            error_in_ts(&e);
+                        }
+                    }
+
+                    RequestStreamRecord::Dhcp => {
+                        let (time, Ok(event)) = (
+                            Utc.timestamp_nanos(timestamp),
+                            bincode::deserialize::<Dhcp>(&raw_event),
+                        ) else {
+                            continue;
+                        };
+                        if let Err(e) =
+                            time_series(&policy, &mut series, time, &Event::Dhcp(event), &sender)
                                 .await
                         {
                             error_in_ts(&e);

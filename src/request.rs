@@ -25,7 +25,7 @@ use crate::{
     TEMP_TOML_POST_FIX,
 };
 
-const REVIEW_PROTOCOL_VERSION: &str = "0.27.0";
+const REVIEW_PROTOCOL_VERSION: &str = "0.38.0";
 const MAX_RETRIES: u8 = 3;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -59,6 +59,8 @@ pub enum RequestedKind {
     Tls = 12,
     Smb = 13,
     Nfs = 14,
+    Bootp = 15,
+    Dhcp = 16,
 }
 
 #[derive(Debug, Deserialize, TryFromPrimitive, Clone)]

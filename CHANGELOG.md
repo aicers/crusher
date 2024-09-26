@@ -14,11 +14,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Apply Group imports by StdExternalCrate.
-  - Modify the code with this command:
-    - `cargo fmt -- --config group_imports=StdExternalCrate`.
-  - Add `--config group_imports=StdExternalCrate` to the CI process like:
-    - `cargo fmt -- --check --config group_imports=StdExternalCrate`
+- Applied code import ordering by `StdExternalCrate`. From now on, all code is
+  expected to be formatted using `cargo fmt -- --config group_imports=StdExternalCrate`.
 - Changed CrusherConfig with oinq `Config`.
 - Modified logging behavior for debug and release builds
 - Changed logs to stdout and file
@@ -33,15 +30,16 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   - `giganto_ingest_address` to `giganto_ingest_srv_addr`.
   - `giganto_publish_address` to `giganto_publish_srv_addr`.
   - `review_address` to `review_rpc_srv_addr`.
-- Updated giganto-client to version `0.17.0`. Updating to this version results
+- Updated giganto-client to version "0.20.0". Updating to this version results
   in the following changes.
-  - Bump dependencies.
-    - Update quinn to version `0.11`.
-    - Update rustls to version `0.23`.
-    - Update review-protocol to version `0.3`.
-  - Update the protocol version of the giganto ingest, publish module.
-    - Changed `PUBLISH_PROTOCOL_VERSION` to "0.21.0-alpha.1"
-    - Changed `INGEST_PROTOCOL_VERSION` to "0.21.0-alpha.1"
+  - Updated the version of quinn, rustls from 0.10, 0.21 to 0.11, 0.23. With the
+    update to this version, the usage of the quinn and rustls crates has
+    changed, so code affected by the update has also been modified.
+  - Updated the protocol version of the review, giganto.
+    - Changed `REVIEW_PROTOCOL_VERSION` to "0.38.0".
+    - Changed `PUBLISH_PROTOCOL_VERSION` to "0.21.0".
+    - Changed `INGEST_PROTOCOL_VERSION` to "0.21.0".
+  - Added more network data type. (`Bootp`, `Dhcp`)
 - Changed the form of timeseries sent to giganto to `Vec<(i64,Vec<u8>)>`.
   Currently, giganto has changed to send and receive a certain number of
   events at once to optimize sending and receiving large amounts of data.
