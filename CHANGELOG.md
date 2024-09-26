@@ -28,11 +28,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   - If the reload trigger succeeds, the new configuration is applied from the
     temporary file; otherwise, the temporary file is deleted.
 - Changed configuration fields name.
-  - `roots` to `root`.
+  - `roots` to `ca_certs`. It also introduces support for multiple CA
+     certificates.
   - `giganto_ingest_address` to `giganto_ingest_srv_addr`.
   - `giganto_publish_address` to `giganto_publish_srv_addr`.
   - `review_address` to `review_rpc_srv_addr`.
-- Update giganto-client to version `0.17.0`. Updating to this version results
+- Updated giganto-client to version `0.17.0`. Updating to this version results
   in the following changes.
   - Bump dependencies.
     - Update quinn to version `0.11`.

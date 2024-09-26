@@ -15,7 +15,7 @@ pub const SERVER_RETRY_INTERVAL: u64 = 3;
 pub struct Certs {
     pub certs: Vec<CertificateDer<'static>>,
     pub key: PrivateKeyDer<'static>,
-    pub root: RootCertStore,
+    pub ca_certs: RootCertStore,
 }
 
 impl Clone for Certs {
@@ -23,14 +23,14 @@ impl Clone for Certs {
         Self {
             certs: self.certs.clone(),
             key: self.key.clone_key(),
-            root: self.root.clone(),
+            ca_certs: self.ca_certs.clone(),
         }
     }
 }
 
 pub fn config(certs: &Arc<Certs>) -> Result<Endpoint> {
     let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(certs.root.clone())
+        .with_root_certificates(certs.ca_certs.clone())
         .with_client_auth_cert(certs.certs.clone(), certs.key.clone_key())?;
 
     let mut transport = TransportConfig::default();

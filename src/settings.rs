@@ -22,15 +22,15 @@ pub const TEMP_TOML_POST_FIX: &str = ".temp.toml";
 /// The application settings.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Settings {
-    pub cert: PathBuf,        // Path to the certificate file
-    pub key: PathBuf,         // Path to the private key file
-    pub root: PathBuf,        // Path to the rootCA file
-    pub giganto_name: String, // host name to giganto
+    pub cert: PathBuf,          // Path to the certificate file
+    pub key: PathBuf,           // Path to the private key file
+    pub ca_certs: Vec<PathBuf>, // Path to the ca certificate file
+    pub giganto_name: String,   // host name to giganto
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub giganto_ingest_srv_addr: SocketAddr, // IP address & port to giganto
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub giganto_publish_srv_addr: SocketAddr, // IP address & port to giganto
-    pub review_name: String,  // host name to review
+    pub review_name: String,    // host name to review
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub review_rpc_srv_addr: SocketAddr, // IP address & port to review
     pub last_timestamp_data: PathBuf, // Path to the last series timestamp data file

@@ -189,7 +189,7 @@ impl Client {
         request_recv: Receiver<RequestedPolicy>,
     ) -> Self {
         let endpoint =
-            client::config(certs).expect("Server configuration error with cert, key or root");
+            client::config(certs).expect("Server configuration error with cert, key or ca_certs");
         Client {
             ingest_addr,
             publish_addr,
