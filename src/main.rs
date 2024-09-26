@@ -4,12 +4,14 @@ mod request;
 mod settings;
 mod subscribe;
 
-use std::path::Path;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::{collections::HashMap, env, fs, process::exit, sync::Arc};
 
 use anyhow::{anyhow, bail, Context, Result};
 use client::Certs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pemfile::Item;
 use settings::Settings;
 pub use settings::TEMP_TOML_POST_FIX;
 use tokio::{
@@ -70,17 +72,12 @@ async fn main() -> Result<()> {
             )
         })?;
         let key = to_private_key(&key_pem).context("cannot read private key")?;
-        let root_pem = fs::read(&settings.root).with_context(|| {
-            format!(
-                "failed to read root certificate file: {}",
-                settings.root.display()
-            )
-        })?;
-        let root_cert = to_root_cert(&root_pem)?;
+        let ca_cert_paths = settings.ca_certs.clone();
+        let ca_certs = to_ca_certs(&ca_cert_paths).context("failed to read CA certificates")?;
         let certs = Arc::new(Certs {
             certs: cert.clone(),
             key: key.clone_key(),
-            root: root_cert.clone(),
+            ca_certs: ca_certs.clone(),
         });
 
         read_last_timestamp(&settings.last_timestamp_data).await?;
@@ -193,12 +190,23 @@ fn to_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     }
 }
 
-fn to_root_cert(pem: &[u8]) -> Result<rustls::RootCertStore> {
-    let mut root_store = rustls::RootCertStore::empty();
-    if let Some(Ok(cert)) = rustls_pemfile::certs(&mut &*pem).next() {
-        root_store.add(cert).context("failed to add root cert")?;
-    };
-    Ok(root_store)
+fn to_ca_certs(root_cert_paths: &Vec<PathBuf>) -> Result<rustls::RootCertStore> {
+    let mut root_cert = rustls::RootCertStore::empty();
+
+    for root in root_cert_paths {
+        let file =
+            fs::File::open(root).with_context(|| format!("Failed to open file: {root:?}"))?;
+        let mut reader = BufReader::new(file);
+
+        while let Some(item) = rustls_pemfile::read_one(&mut reader)? {
+            if let Item::X509Certificate(cert) = item {
+                let cert_der = cert;
+                root_cert.add(cert_der).context("Failed to add root cert")?;
+            }
+        }
+    }
+
+    Ok(root_cert)
 }
 
 fn init_tracing(path: &Path) -> Result<WorkerGuard> {

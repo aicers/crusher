@@ -16,14 +16,14 @@ use super::{Client, Conn};
 use crate::{
     client::Certs,
     model::{Interval, Period, Policy, TimeSeries},
-    to_cert_chain, to_private_key, to_root_cert,
+    to_ca_certs, to_cert_chain, to_private_key,
 };
 
 pub(crate) static TOKEN: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
 
 const CERT_PATH: &str = "tests/cert.pem";
 const KEY_PATH: &str = "tests/key.pem";
-const CA_CERT_PATH: &str = "tests/root.pem";
+const CA_CERT_PATH: &str = "tests/ca_cert.pem";
 const HOST: &str = "localhost";
 const TEST_INGEST_PORT: u16 = 60190;
 const TEST_PUBLISH_PORT: u16 = 60191;
@@ -73,9 +73,10 @@ async fn handle_connection(conn: quinn::Incoming) {
 fn config_server() -> ServerConfig {
     let certs = cert_key();
 
-    let client_auth = rustls::server::WebPkiClientVerifier::builder(Arc::new(certs.root.clone()))
-        .build()
-        .expect("Failed to build client certificate verifier");
+    let client_auth =
+        rustls::server::WebPkiClientVerifier::builder(Arc::new(certs.ca_certs.clone()))
+            .build()
+            .expect("Failed to build client certificate verifier");
 
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_auth)
@@ -112,13 +113,13 @@ fn cert_key() -> Certs {
     let cert = to_cert_chain(&cert_pem).unwrap();
     let key_pem = fs::read(KEY_PATH).unwrap();
     let key = to_private_key(&key_pem).unwrap();
-    let root_pem = fs::read(CA_CERT_PATH).unwrap();
-    let root_cert = to_root_cert(&root_pem).unwrap();
+    let ca_certs_paths = vec![PathBuf::from(CA_CERT_PATH)];
+    let ca_certs = to_ca_certs(&ca_certs_paths).unwrap();
 
     Certs {
         certs: cert.clone(),
         key: key.clone_key(),
-        root: root_cert.clone(),
+        ca_certs: ca_certs.clone(),
     }
 }
 

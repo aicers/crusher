@@ -23,7 +23,7 @@ The following is key values in the TOML configuration file.
 
 * `key`: Crusher's private key file.
 * `cert`: Crusher's certificate file.
-* `root`: RootCA file. (for Giganto, Review)
+* `ca_certs`: CA certificate files. (for Giganto, Review)
 * `giganto_name`: the name of the Giganto. This must match with the DNS name in
   the certificate.
 * `giganto_ingest_srv_addr`: IP address and port number of `Giganto ingest`.
@@ -40,7 +40,7 @@ Example
 ```toml
 key = "key.pem"
 cert = "cert.pem"
-root = "root.pem"
+ca_certs = ["ca_cert_1.pem", "ca_cert_2.pem"]
 giganto_name = "localhost"
 giganto_ingest_srv_addr = "127.0.0.1:38370"
 giganto_publish_srv_addr = "127.0.0.1:38371"

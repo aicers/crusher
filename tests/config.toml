@@ -1,6 +1,6 @@
 key = "tests/key.pem"
 cert = "tests/cert.pem"
-root = "tests/root.pem"
+ca_certs = ["tests/ca_cert.pem"]
 giganto_name = "localhost"
 giganto_ingest_srv_addr = "127.0.0.1:38370"
 giganto_publish_srv_addr = "127.0.0.1:38371"

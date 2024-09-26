@@ -94,7 +94,7 @@ impl Client {
         request_send: Sender<RequestedPolicy>,
     ) -> Self {
         let endpoint =
-            client::config(certs).expect("server configuration error with cert, key or root");
+            client::config(certs).expect("server configuration error with cert, key or ca_certs");
         Client {
             server_address,
             server_name,
