@@ -46,6 +46,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   For timeseries, one event is generated per period, and it takes too long
   to collect and send a certain number of timeseries events, so it was
   changed to send only one event as a vector.
+- Updated review-protocol to version 0.6.0.
+  - Modified to use `ConnectionBuilder` to simplify the handling of connections
+    with Central Manager.
+  - As `set_config` was removed from `review-protocol::request::handler`,
+    Removed the `set_config` related code from the crusher.
 
 ## [0.3.2] - 2024-01-25
 

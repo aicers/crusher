@@ -1,7 +1,6 @@
 //! Configurations for the application.
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self},
     net::SocketAddr,
     path::PathBuf,
 };
@@ -10,7 +9,7 @@ use anyhow::{Context, Result};
 use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File};
 use review_protocol::types::{Config, CrusherConfig};
 use serde::{de::Error, Deserialize, Deserializer};
-use toml_edit::{value, DocumentMut};
+use toml_edit::DocumentMut;
 
 const DEFAULT_GIGANTO_NAME: &str = "localhost";
 const DEFAULT_GIGANTO_INGEST_SRV_ADDR: &str = "[::]:38370";
@@ -24,7 +23,7 @@ pub const TEMP_TOML_POST_FIX: &str = ".temp.toml";
 pub struct Settings {
     pub cert: PathBuf,          // Path to the certificate file
     pub key: PathBuf,           // Path to the private key file
-    pub ca_certs: Vec<PathBuf>, // Path to the ca certificate file
+    pub ca_certs: Vec<PathBuf>, // Path to the CA certificate file
     pub giganto_name: String,   // host name to giganto
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub giganto_ingest_srv_addr: SocketAddr, // IP address & port to giganto
@@ -116,12 +115,6 @@ pub fn get_config(config_path: &str) -> Result<Config> {
     let toml = fs::read_to_string(config_path).context("toml not found")?;
     let doc = toml.parse::<DocumentMut>()?;
 
-    let review_rpc_srv_addr = doc
-        .get("review_rpc_srv_addr")
-        .context("\"review_rpc_srv_addr\" not found")?
-        .to_string()
-        .trim_matches('\"')
-        .parse::<SocketAddr>()?;
     let giganto_publish_srv_addr = doc
         .get("giganto_publish_srv_addr")
         .context("\"giganto_publish_srv_addr\" not found")?
@@ -136,34 +129,7 @@ pub fn get_config(config_path: &str) -> Result<Config> {
         .parse::<SocketAddr>()?;
 
     Ok(Config::Crusher(CrusherConfig {
-        review_address: review_rpc_srv_addr,
         giganto_publish_address: Some(giganto_publish_srv_addr),
         giganto_ingest_address: Some(giganto_ingest_srv_addr),
     }))
-}
-
-pub fn set_config(config: &Config, config_path: &str) -> Result<()> {
-    let tmp_path = format!("{config_path}{TEMP_TOML_POST_FIX}");
-    fs::copy(config_path, &tmp_path)?;
-    let config_toml = fs::read_to_string(&tmp_path).context("toml not found")?;
-    let mut doc = config_toml.parse::<DocumentMut>()?;
-
-    if let Config::Crusher(conf) = config {
-        doc["review_rpc_srv_addr"] = value(conf.review_address.to_string());
-        if let Some(giganto_ingest_srv_addr) = conf.giganto_ingest_address {
-            doc["giganto_ingest_srv_addr"] = value(giganto_ingest_srv_addr.to_string());
-        }
-        if let Some(giganto_publish_srv_addr) = conf.giganto_publish_address {
-            doc["giganto_publish_srv_addr"] = value(giganto_publish_srv_addr.to_string());
-        }
-    }
-
-    let output = doc.to_string();
-    let mut toml_file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-    writeln!(toml_file, "{output}")?;
-
-    Ok(())
 }

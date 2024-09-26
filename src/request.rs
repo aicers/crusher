@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs,
+    io::ErrorKind,
     net::{IpAddr, SocketAddr},
     process::exit,
     sync::Arc,
@@ -11,8 +11,10 @@ use async_channel::Sender;
 use async_trait::async_trait;
 use bincode::Options;
 use num_enum::TryFromPrimitive;
-use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
-use review_protocol::{types as protocol_types, HandshakeError};
+use review_protocol::{
+    client::{Connection, ConnectionBuilder},
+    types as protocol_types,
+};
 use serde::Deserialize;
 use tokio::{
     sync::{Notify, RwLock},
@@ -20,10 +22,7 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-use crate::{
-    client::{self, Certs, SERVER_RETRY_INTERVAL},
-    TEMP_TOML_POST_FIX,
-};
+use crate::client::SERVER_RETRY_INTERVAL;
 
 const REVIEW_PROTOCOL_VERSION: &str = "0.38.0";
 const MAX_RETRIES: u8 = 3;
@@ -84,24 +83,28 @@ pub enum RequestedPeriod {
 pub struct Client {
     server_address: SocketAddr,
     server_name: String,
-    endpoint: Endpoint,
     request_send: Sender<RequestedPolicy>,
+    cert: Vec<u8>,
+    key: Vec<u8>,
+    ca_certs: Vec<Vec<u8>>,
 }
 
 impl Client {
     pub fn new(
         server_address: SocketAddr,
         server_name: String,
-        certs: &Arc<Certs>,
         request_send: Sender<RequestedPolicy>,
+        cert: Vec<u8>,
+        key: Vec<u8>,
+        ca_certs: Vec<Vec<u8>>,
     ) -> Self {
-        let endpoint =
-            client::config(certs).expect("server configuration error with cert, key or ca_certs");
         Client {
             server_address,
             server_name,
-            endpoint,
             request_send,
+            cert,
+            key,
+            ca_certs,
         }
     }
 
@@ -115,10 +118,7 @@ impl Client {
     ) -> Result<()> {
         loop {
             match connect(
-                &self.endpoint,
-                self.server_address,
-                &self.server_name,
-                &self.request_send,
+                &self,
                 active_policy_list.clone(),
                 delete_policy_ids.clone(),
                 config_reload.clone(),
@@ -129,12 +129,11 @@ impl Client {
             {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if let Some(e) = e.downcast_ref::<ConnectionError>() {
-                        match e {
-                            ConnectionError::ConnectionClosed(_)
-                            | ConnectionError::ApplicationClosed(_)
-                            | ConnectionError::Reset
-                            | ConnectionError::TimedOut => {
+                    if let Some(e) = e.downcast_ref::<std::io::Error>() {
+                        match e.kind() {
+                            ErrorKind::ConnectionAborted
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::TimedOut => {
                                 error!(
                                     "Retry connection to {} after {} seconds.",
                                     self.server_address, SERVER_RETRY_INTERVAL,
@@ -142,7 +141,7 @@ impl Client {
                                 sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                                 continue;
                             }
-                            ConnectionError::TransportError(_) => {
+                            ErrorKind::InvalidData => {
                                 error!("Invalid peer certificate contents");
                                 exit(0);
                             }
@@ -158,29 +157,28 @@ impl Client {
 
 #[allow(clippy::too_many_arguments)]
 async fn connect(
-    endpoint: &Endpoint,
-    server_address: SocketAddr,
-    server_name: &str,
-    request_send: &Sender<RequestedPolicy>,
+    client: &Client,
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     config_reload: Arc<Notify>,
     wait_shutdown: Arc<Notify>,
     config_path: String,
 ) -> Result<()> {
-    let connection = endpoint.connect(server_address, server_name)?.await?;
-
-    handshake(&connection, REVIEW_PROTOCOL_VERSION)
-        .await
-        .map_err(|e| {
-            error!("Review handshake failed: {:#}", e);
-            Error::new(e)
-        })?;
-
-    info!("Connection established to server {}", server_address);
+    let mut conn_builder = ConnectionBuilder::new(
+        &client.server_name,
+        client.server_address,
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        REVIEW_PROTOCOL_VERSION,
+        &client.cert,
+        &client.key,
+    )?;
+    conn_builder.root_certs(&client.ca_certs)?;
+    let conn = conn_builder.connect().await?;
+    info!("Connection established to server {}", client.server_address);
 
     let request_handler = RequestHandler {
-        request_send: request_send.clone(),
+        request_send: client.request_send.clone(),
         active_policy_list,
         delete_policy_ids,
         config_reload: config_reload.clone(),
@@ -188,7 +186,7 @@ async fn connect(
     };
 
     tokio::select! {
-        res = handle_incoming(request_handler, &connection) => {
+        res = handle_incoming(request_handler, &conn) => {
             if let Err(e) = res {
                 warn!("control channel failed: {}", e);
                 return Err(e);
@@ -197,24 +195,9 @@ async fn connect(
         },
         () = wait_shutdown.notified() => {
             info!("Shutting down request channel");
-            endpoint.close(0_u32.into(), &[]);
             Ok(())
         }
     }
-}
-
-async fn handshake(
-    conn: &Connection,
-    protocol: &str,
-) -> Result<(SendStream, RecvStream), HandshakeError> {
-    let (send, recv) = review_protocol::client::handshake(
-        conn,
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-        protocol,
-    )
-    .await?;
-    Ok((send, recv))
 }
 
 async fn handle_incoming(handler: RequestHandler, conn: &Connection) -> Result<()> {
@@ -227,7 +210,6 @@ async fn handle_incoming(handler: RequestHandler, conn: &Connection) -> Result<(
                 });
             }
             Err(e) => {
-                conn.close(VarInt::from_u32(0), b"Lost server connection");
                 return Err(Error::new(e));
             }
         }
@@ -347,24 +329,6 @@ impl review_protocol::request::Handler for RequestHandler {
         }
 
         Err(String::from("failed to get config"))
-    }
-
-    async fn set_config(&mut self, conf: protocol_types::Config) -> Result<(), String> {
-        info!("start set configuration");
-        for attempt in 1..=MAX_RETRIES {
-            if let Err(e) = crate::settings::set_config(&conf, &self.config_path) {
-                if attempt == MAX_RETRIES {
-                    fs::remove_file(format!("{}{TEMP_TOML_POST_FIX}", self.config_path))
-                        .unwrap_or_else(|e| error!("failed to remove the temporary file: {e}"));
-                    return Err(format!("failed to set config: {e}"));
-                }
-            } else {
-                self.config_reload.notify_one();
-                return Ok(());
-            }
-        }
-
-        Err(String::from("failed to set config"))
     }
 
     async fn process_list(&mut self) -> Result<Vec<protocol_types::Process>, String> {

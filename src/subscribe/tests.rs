@@ -113,8 +113,8 @@ fn cert_key() -> Certs {
     let cert = to_cert_chain(&cert_pem).unwrap();
     let key_pem = fs::read(KEY_PATH).unwrap();
     let key = to_private_key(&key_pem).unwrap();
-    let ca_certs_paths = vec![PathBuf::from(CA_CERT_PATH)];
-    let ca_certs = to_ca_certs(&ca_certs_paths).unwrap();
+    let ca_certs_pem = vec![fs::read(CA_CERT_PATH).unwrap()];
+    let ca_certs = to_ca_certs(&ca_certs_pem).unwrap();
 
     Certs {
         certs: cert.clone(),

@@ -4,14 +4,12 @@ mod request;
 mod settings;
 mod subscribe;
 
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::{collections::HashMap, env, fs, process::exit, sync::Arc};
 
 use anyhow::{anyhow, bail, Context, Result};
 use client::Certs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls_pemfile::Item;
 use settings::Settings;
 pub use settings::TEMP_TOML_POST_FIX;
 use tokio::{
@@ -72,8 +70,14 @@ async fn main() -> Result<()> {
             )
         })?;
         let key = to_private_key(&key_pem).context("cannot read private key")?;
-        let ca_cert_paths = settings.ca_certs.clone();
-        let ca_certs = to_ca_certs(&ca_cert_paths).context("failed to read CA certificates")?;
+        let mut ca_certs_pem = Vec::new();
+        for ca_cert in settings.ca_certs {
+            let file = fs::read(&ca_cert).with_context(|| {
+                format!("failed to read CA certificate file: {}", ca_cert.display())
+            })?;
+            ca_certs_pem.push(file);
+        }
+        let ca_certs = to_ca_certs(&ca_certs_pem).context("failed to read CA certificates")?;
         let certs = Arc::new(Certs {
             certs: cert.clone(),
             key: key.clone_key(),
@@ -88,8 +92,10 @@ async fn main() -> Result<()> {
         let request_client = request::Client::new(
             settings.review_rpc_srv_addr,
             settings.review_name,
-            &certs,
             request_send,
+            cert_pem,
+            key_pem,
+            ca_certs_pem,
         );
         let runtime_policy_list = Arc::new(RwLock::new(HashMap::new())); // current sampling_policy value
         let delete_policy_ids = Arc::new(RwLock::new(Vec::new()));
@@ -190,22 +196,18 @@ fn to_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     }
 }
 
-fn to_ca_certs(root_cert_paths: &Vec<PathBuf>) -> Result<rustls::RootCertStore> {
+fn to_ca_certs(ca_certs_pem: &Vec<Vec<u8>>) -> Result<rustls::RootCertStore> {
     let mut root_cert = rustls::RootCertStore::empty();
-
-    for root in root_cert_paths {
-        let file =
-            fs::File::open(root).with_context(|| format!("Failed to open file: {root:?}"))?;
-        let mut reader = BufReader::new(file);
-
-        while let Some(item) = rustls_pemfile::read_one(&mut reader)? {
-            if let Item::X509Certificate(cert) = item {
-                let cert_der = cert;
-                root_cert.add(cert_der).context("Failed to add root cert")?;
-            }
+    for ca_cert_pem in ca_certs_pem {
+        let root_certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut &**ca_cert_pem)
+            .collect::<Result<_, _>>()
+            .context("invalid PEM-encoded certificate")?;
+        if let Some(cert) = root_certs.first() {
+            root_cert
+                .add(cert.to_owned())
+                .context("failed to add CA certificate")?;
         }
     }
-
     Ok(root_cert)
 }
 

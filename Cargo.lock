@@ -1298,16 +1298,17 @@ checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 
 [[package]]
 name = "review-protocol"
-version = "0.3.0"
-source = "git+https://github.com/petabi/review-protocol.git?tag=0.3.0#25f110bb751b0c66df1dbbaf77e48985afb57eb3"
+version = "0.6.0"
+source = "git+https://github.com/petabi/review-protocol.git?tag=0.6.0#6cd6b9a404fadc83980d813fcd3a38bf6b7b5253"
 dependencies = [
- "anyhow",
  "async-trait",
  "bincode",
  "ipnet",
  "num_enum",
  "oinq",
  "quinn",
+ "rustls",
+ "rustls-pemfile",
  "semver",
  "serde",
  "thiserror",
