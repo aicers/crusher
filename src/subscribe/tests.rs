@@ -196,6 +196,8 @@ fn gen_conn() -> Conn {
         resp_bytes: 295,
         orig_pkts: 397,
         resp_pkts: 511,
+        orig_l2_bytes: 51235,
+        resp_l2_bytes: 48203,
     }
 }
 
