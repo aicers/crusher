@@ -5,7 +5,7 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2024-09-27
 
 ### Added
 
@@ -19,11 +19,6 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Changed CrusherConfig with oinq `Config`.
 - Modified logging behavior for debug and release builds
 - Changed logs to stdout and file
-- Updated `set_config` function to record requested configuration changes
-  to a temporary toml file. Given the original configuration file name as
-  `crusher.toml`, the temporary file is named as `crusher.toml.temp.toml`.
-  - If the reload trigger succeeds, the new configuration is applied from the
-    temporary file; otherwise, the temporary file is deleted.
 - Changed configuration fields name.
   - `roots` to `ca_certs`. It also introduces support for multiple CA
      certificates.
@@ -97,7 +92,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Send the generated `time series` to `giganto`'s ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
-[Unreleased]: https://github.com/aicers/crusher/compare/0.3.2...main
+[0.4.0]: https://github.com/aicers/crusher/compare/0.3.2...0.4.0
 [0.3.2]: https://github.com/aicers/crusher/compare/0.3.1...0.3.2
 [0.3.1]: https://github.com/aicers/crusher/compare/0.3.0...0.3.1
 [0.3.0]: https://github.com/aicers/crusher/compare/0.2.0...0.3.0
