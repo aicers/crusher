@@ -1,15 +1,9 @@
 //! Configurations for the application.
-use std::{
-    fs::{self},
-    net::SocketAddr,
-    path::PathBuf,
-};
+use std::{net::SocketAddr, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File};
-use review_protocol::types::{Config, CrusherConfig};
 use serde::{de::Error, Deserialize, Deserializer};
-use toml_edit::DocumentMut;
 
 const DEFAULT_GIGANTO_NAME: &str = "localhost";
 const DEFAULT_GIGANTO_INGEST_SRV_ADDR: &str = "[::]:38370";
@@ -109,27 +103,4 @@ where
     let addr = String::deserialize(deserializer)?;
     addr.parse()
         .map_err(|e| D::Error::custom(format!("invalid address \"{addr}\": {e}")))
-}
-
-pub fn get_config(config_path: &str) -> Result<Config> {
-    let toml = fs::read_to_string(config_path).context("toml not found")?;
-    let doc = toml.parse::<DocumentMut>()?;
-
-    let giganto_publish_srv_addr = doc
-        .get("giganto_publish_srv_addr")
-        .context("\"giganto_publish_srv_addr\" not found")?
-        .to_string()
-        .trim_matches('\"')
-        .parse::<SocketAddr>()?;
-    let giganto_ingest_srv_addr = doc
-        .get("giganto_ingest_srv_addr")
-        .context("\"giganto_ingest_srv_addr\" not found")?
-        .to_string()
-        .trim_matches('\"')
-        .parse::<SocketAddr>()?;
-
-    Ok(Config::Crusher(CrusherConfig {
-        giganto_publish_address: Some(giganto_publish_srv_addr),
-        giganto_ingest_address: Some(giganto_ingest_srv_addr),
-    }))
 }

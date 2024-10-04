@@ -104,7 +104,6 @@ async fn main() -> Result<()> {
             Arc::clone(&delete_policy_ids),
             config_reload.clone(),
             notify_shutdown.clone(),
-            config_path.clone(),
         ));
 
         let subscribe_client = subscribe::Client::new(

@@ -24,7 +24,7 @@ use tracing::{error, info, trace, warn};
 
 use crate::client::SERVER_RETRY_INTERVAL;
 
-const REVIEW_PROTOCOL_VERSION: &str = "0.38.0";
+const REVIEW_PROTOCOL_VERSION: &str = "0.39.0";
 const MAX_RETRIES: u8 = 3;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,7 +114,6 @@ impl Client {
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,
         config_reload: Arc<Notify>,
         wait_shutdown: Arc<Notify>,
-        config_path: String,
     ) -> Result<()> {
         loop {
             match connect(
@@ -123,7 +122,6 @@ impl Client {
                 delete_policy_ids.clone(),
                 config_reload.clone(),
                 wait_shutdown.clone(),
-                config_path.clone(),
             )
             .await
             {
@@ -162,7 +160,6 @@ async fn connect(
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     config_reload: Arc<Notify>,
     wait_shutdown: Arc<Notify>,
-    config_path: String,
 ) -> Result<()> {
     let mut conn_builder = ConnectionBuilder::new(
         &client.server_name,
@@ -182,7 +179,6 @@ async fn connect(
         active_policy_list,
         delete_policy_ids,
         config_reload: config_reload.clone(),
-        config_path,
     };
 
     tokio::select! {
@@ -222,7 +218,6 @@ struct RequestHandler {
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     config_reload: Arc<Notify>,
-    config_path: String,
 }
 
 #[async_trait]
@@ -314,21 +309,6 @@ impl review_protocol::request::Handler for RequestHandler {
         info!("start reloading configuration");
         self.config_reload.notify_one();
         Ok(())
-    }
-
-    async fn get_config(&mut self) -> Result<protocol_types::Config, String> {
-        for attempt in 1..=MAX_RETRIES {
-            match crate::settings::get_config(&self.config_path) {
-                Ok(conf) => return Ok(conf),
-                Err(e) => {
-                    if attempt == MAX_RETRIES {
-                        return Err(format!("failed to get config: {e}"));
-                    }
-                }
-            }
-        }
-
-        Err(String::from("failed to get config"))
     }
 
     async fn process_list(&mut self) -> Result<Vec<protocol_types::Process>, String> {

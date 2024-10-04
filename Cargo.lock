@@ -1301,8 +1301,8 @@ checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 
 [[package]]
 name = "review-protocol"
-version = "0.6.0"
-source = "git+https://github.com/petabi/review-protocol.git?tag=0.6.0#6cd6b9a404fadc83980d813fcd3a38bf6b7b5253"
+version = "0.7.0"
+source = "git+https://github.com/petabi/review-protocol.git?tag=0.7.0#b99317dd77c89836c21df9368494e9bf12b7d749"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1314,6 +1314,7 @@ dependencies = [
  "rustls-pemfile",
  "semver",
  "serde",
+ "serde_repr",
  "thiserror",
 ]
 
@@ -1552,6 +1553,17 @@ dependencies = [
  "memchr",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_repr"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c64451ba24fc7a6a2d60fc75dd9c83c90903b19028d4eff35e88fc1e86564e9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
