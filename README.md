@@ -4,7 +4,7 @@ Crusher generates statistics from raw events.
 
 ## Requirements
 
-* REview 0.38.0 or higher
+* REview 0.39.0 or higher
 * Giganto 0.21.0 or higher
 
 ## Usage

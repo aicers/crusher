@@ -5,6 +5,15 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Changed `REVIEW_PROTOCOL_VERSION` to "0.39.0"
+- Updated review-protocol to version "0.7.0".
+  - As `get_config` was removed from `review-protocol::request::handler`,
+    Removed the `get_config` related code from the crusher.
+
 ## [0.4.0] - 2024-09-27
 
 ### Added
@@ -41,7 +50,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   For timeseries, one event is generated per period, and it takes too long
   to collect and send a certain number of timeseries events, so it was
   changed to send only one event as a vector.
-- Updated review-protocol to version 0.6.0.
+- Updated review-protocol to version "0.6.0".
   - Modified to use `ConnectionBuilder` to simplify the handling of connections
     with Central Manager.
   - As `set_config` was removed from `review-protocol::request::handler`,
@@ -92,6 +101,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Send the generated `time series` to `giganto`'s ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.4.0...main
 [0.4.0]: https://github.com/aicers/crusher/compare/0.3.2...0.4.0
 [0.3.2]: https://github.com/aicers/crusher/compare/0.3.1...0.3.2
 [0.3.1]: https://github.com/aicers/crusher/compare/0.3.0...0.3.1
