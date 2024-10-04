@@ -9,7 +9,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Changed `REVIEW_PROTOCOL_VERSION` to "0.39.0"
+- Correct how to refer to other required modules in the code.
+  - Changed `REVIEW_PROTOCOL_VERSION` to `REQUIRED_MANAGER_VERSION`.
+  - Used `REQUIRED_GIGANTO_VERSION` instead of names that include `INGEST` or `PUBLISH`.
+- Changed `REQUIRED_MANAGER_VERSION` to "0.39.0"
 - Updated review-protocol to version "0.7.0".
   - As `get_config` was removed from `review-protocol::request::handler`,
     Removed the `get_config` related code from the crusher.
