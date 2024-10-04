@@ -47,8 +47,7 @@ use crate::{
     request::{RequestedKind, RequestedPolicy},
 };
 
-const INGEST_PROTOCOL_VERSION: &str = "0.21.0";
-const PUBLISH_PROTOCOL_VERSION: &str = "0.21.0";
+const REQUIRED_GIGANTO_VERSION: &str = "0.21.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
@@ -226,7 +225,7 @@ impl Client {
                 self.endpoint.clone(),
                 wait_shutdown.clone(),
                 self.last_series_time_path.clone(),
-                INGEST_PROTOCOL_VERSION,
+                REQUIRED_GIGANTO_VERSION,
             ),
             publish_connection_control(
                 sender,
@@ -234,7 +233,7 @@ impl Client {
                 &self.server_name,
                 &self.endpoint,
                 wait_shutdown.clone(),
-                PUBLISH_PROTOCOL_VERSION,
+                REQUIRED_GIGANTO_VERSION,
                 &self.request_recv,
                 active_policy_list,
                 delete_policy_ids,
