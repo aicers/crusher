@@ -34,7 +34,7 @@ impl Settings {
     /// Creates a new `Settings` instance, populated from the default
     /// configuration file if it exists.
     pub fn new() -> Result<Self, ConfigError> {
-        let dirs = directories::ProjectDirs::from("com", "einsis", "crusher").expect("unreachable");
+        let dirs = directories::ProjectDirs::from("com", "cluml", "crusher").expect("unreachable");
         let config_path = dirs.config_dir().join("config.toml");
         if config_path.exists() {
             // `config::File` requires a `&str` path, so we can't use `config_path` directly.
@@ -63,7 +63,7 @@ impl Settings {
 
 /// Creates a new `ConfigBuilder` instance with the default configuration.
 fn default_config_builder() -> ConfigBuilder<DefaultState> {
-    let dirs = directories::ProjectDirs::from("com", "einsis", "crusher").expect("unreachable");
+    let dirs = directories::ProjectDirs::from("com", "cluml", "crusher").expect("unreachable");
     let config_dir = dirs.config_dir();
     let cert_path = config_dir.join("cert.pem");
     let key_path = config_dir.join("key.pem");

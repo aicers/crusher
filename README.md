@@ -53,7 +53,7 @@ log_dir = "/data/logs/apps"
 By default, giganto reads the config file from the following directories:
 
 * Linux: `$HOME/.config/crusher/config.toml`
-* macOS: `$HOME/Library/Application Support/com.einsis.crusher/config.toml`
+* macOS: `$HOME/Library/Application Support/com.cluml.crusher/config.toml`
 
 ## Copyright
 
