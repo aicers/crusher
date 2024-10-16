@@ -163,7 +163,7 @@ fn test_conn_model() -> (Policy, TimeSeries) {
             offset: 32_400,
             src_ip: None,
             dst_ip: None,
-            node: Some("einsis".to_string()),
+            node: Some("cluml".to_string()),
             column: None,
         },
         TimeSeries {
