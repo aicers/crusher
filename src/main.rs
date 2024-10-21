@@ -227,7 +227,11 @@ fn init_tracing(path: &Path) -> Result<WorkerGuard> {
         .with_ansi(false)
         .with_target(false)
         .with_writer(file_writer)
-        .with_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()));
+        .with_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        );
 
     let layered_subscriber = tracing_subscriber::registry().with(layer_file);
     #[cfg(debug_assertions)]
