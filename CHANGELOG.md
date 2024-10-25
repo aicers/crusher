@@ -5,6 +5,34 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Configuration options required for establishing a connection with the central
+  management server must be specified directly via command-line interface.
+  The following options and arguments are required:
+  - `--cert`: Specifies the certificate file for the current module.
+  - `--key`: Specifies the private key file for the certificate.
+  - `--ca-certs`: Specifies the CA certificate files. Multiple CA certificates
+    can be provided by using this option multiple times.
+  - The Manager server's name and address must be provided as a command-line
+    argument in the format `<server_name>@<server_ip>:<server_port>`.
+- The configuration file, previously provided as a positional command-line
+  argument, must now be specified using the `-c` option. This change allows for
+  additional command-line arguments to be used alongside the configuration file.
+  However, providing a local configuration file is optional.
+- If `log_dir` is not specified in the configuration file or the log file cannot
+  be created, logs will be printed to stdout.
+
+### Removed
+
+- Removed cert, key, ca_certs, review_name and review_rpc_srv_addr from the
+  configuration file; now mandatory via CLI.
+- Removed OS-specific configuration directory.
+  - Linux: $HOME/.config/crusher/config.toml
+  - macOS: $HOME/Library/Application Support/com.cluml.crusher/config.toml
+
 ## [0.4.1] - 2024-10-04
 
 ### Changed
@@ -33,7 +61,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Changed logs to stdout and file
 - Changed configuration fields name.
   - `roots` to `ca_certs`. It also introduces support for multiple CA
-     certificates.
+    certificates.
   - `giganto_ingest_address` to `giganto_ingest_srv_addr`.
   - `giganto_publish_address` to `giganto_publish_srv_addr`.
   - `review_address` to `review_rpc_srv_addr`.
@@ -104,6 +132,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Send the generated `time series` to `giganto`'s ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.4.1...main
 [0.4.1]: https://github.com/aicers/crusher/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/aicers/crusher/compare/0.3.2...0.4.0
 [0.3.2]: https://github.com/aicers/crusher/compare/0.3.1...0.3.2
