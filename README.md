@@ -83,9 +83,6 @@ last_timestamp_data = "tests/time_data.json"
 log_dir = "/data/logs/apps"
 ```
 
-By default, Crusher reads the config file from the following path:
-/usr/local/aice/conf/crusher.toml
-
 ## Copyright
 
 - Copyright 2023-2024 ClumL Inc.
