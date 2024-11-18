@@ -4,10 +4,13 @@ mod request;
 mod settings;
 mod subscribe;
 
+use std::net::SocketAddr;
 use std::path::Path;
-use std::{collections::HashMap, env, fs, process::exit, sync::Arc};
+use std::str::FromStr;
+use std::{collections::HashMap, env, fs, sync::Arc};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
+use clap::Parser;
 use client::Certs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use settings::Settings;
@@ -27,54 +30,83 @@ use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 const DEFAULT_TOML: &str = "/usr/local/aice/conf/crusher.toml";
-const USAGE: &str = "\
-USAGE:
-    crusher [CONFIG]
 
-FLAGS:
-    -h, --help       Prints help information
-    -V, --version    Prints version information
+#[derive(Debug, Clone)]
+pub struct ManagerServer {
+    name: String,
+    rpc_srv_addr: SocketAddr,
+}
 
-ARG:
-    <CONFIG>    A TOML config file
-";
+impl FromStr for ManagerServer {
+    type Err = anyhow::Error;
+
+    fn from_str(manager_server: &str) -> Result<Self> {
+        let (name, rpc_srv_addr) = manager_server
+            .split_once('@')
+            .context("cannot get information of the Manager server")?;
+        Ok(ManagerServer {
+            name: name.to_string(),
+            rpc_srv_addr: rpc_srv_addr
+                .parse()
+                .context("cannot parse the Manager server address")?,
+        })
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(version)]
+pub struct CmdLineArgs {
+    /// Path to the local configuration TOML file.
+    #[arg(short, value_name = "CONFIG_PATH")]
+    pub config: Option<String>,
+
+    /// Path to the certificate file.
+    #[arg(long, value_name = "CERT_PATH")]
+    pub cert: String,
+
+    /// Path to the key file.
+    #[arg(long, value_name = "KEY_PATH")]
+    pub key: String,
+
+    /// Path to the CA certificate files. Multiple paths can be specified by repeating this option.
+    #[arg(long, value_name = "CA_CERTS_PATH", required = true)]
+    pub ca_certs: Vec<String>,
+
+    /// Address of the Manager server formatted as `<server_name>@<server_ip>:<server_port>`.
+    #[arg(value_parser=clap::builder::ValueParser::new(ManagerServer::from_str))]
+    pub manager_server: ManagerServer,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_filename = parse();
-    let (mut settings, config_path) = if let Some(config_filename) = config_filename.clone() {
-        (Settings::from_file(&config_filename)?, config_filename)
-    } else {
-        (Settings::new()?, DEFAULT_TOML.to_string())
-    };
+    let args = CmdLineArgs::parse();
+
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TOML.to_string());
+
+    let mut settings = Settings::from_args(args.clone())?;
+
     let temp_path = format!("{config_path}{TEMP_TOML_POST_FIX}");
 
-    let _guard = init_tracing(&settings.log_dir)?;
+    let _guards = init_tracing(settings.log_dir.as_deref());
 
     loop {
         let config_reload = Arc::new(Notify::new());
         let notify_shutdown = Arc::new(Notify::new());
 
-        let cert_pem = fs::read(&settings.cert).with_context(|| {
-            format!(
-                "failed to read certificate file: {}",
-                settings.cert.display()
-            )
-        })?;
+        let cert_pem = fs::read(&args.cert)
+            .with_context(|| format!("failed to read certificate file: {}", args.cert))?;
         let cert = to_cert_chain(&cert_pem).context("cannot read certificate chain")?;
         assert!(!cert.is_empty());
-        let key_pem = fs::read(&settings.key).with_context(|| {
-            format!(
-                "failed to read private key file: {}",
-                settings.key.display()
-            )
-        })?;
+        let key_pem = fs::read(&args.key)
+            .with_context(|| format!("failed to read private key file: {}", args.key))?;
         let key = to_private_key(&key_pem).context("cannot read private key")?;
         let mut ca_certs_pem = Vec::new();
-        for ca_cert in settings.ca_certs {
-            let file = fs::read(&ca_cert).with_context(|| {
-                format!("failed to read CA certificate file: {}", ca_cert.display())
-            })?;
+        for ca_cert in &args.ca_certs {
+            let file = fs::read(ca_cert)
+                .with_context(|| format!("failed to read CA certificate file: {ca_cert}"))?;
             ca_certs_pem.push(file);
         }
         let ca_certs = to_ca_certs(&ca_certs_pem).context("failed to read CA certificates")?;
@@ -90,8 +122,8 @@ async fn main() -> Result<()> {
             async_channel::bounded::<RequestedPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
 
         let request_client = request::Client::new(
-            settings.review_rpc_srv_addr,
-            settings.review_name,
+            args.manager_server.rpc_srv_addr,
+            args.manager_server.name.clone(),
             request_send,
             cert_pem,
             key_pem,
@@ -144,39 +176,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Parses the command line arguments and returns the first argument.
-fn parse() -> Option<String> {
-    let mut args = env::args();
-    args.next()?;
-    let arg = args.next()?;
-    if args.next().is_some() {
-        eprintln!("Error: too many arguments");
-        exit(1);
-    }
-
-    if arg == "--help" || arg == "-h" {
-        println!("{}", version());
-        println!();
-        print!("{USAGE}");
-        exit(0);
-    }
-    if arg == "--version" || arg == "-V" {
-        println!("{}", version());
-        exit(0);
-    }
-    if arg.starts_with('-') {
-        eprintln!("Error: unknown option: {arg}");
-        eprintln!("\n{USAGE}");
-        exit(1);
-    }
-
-    Some(arg)
-}
-
-fn version() -> String {
-    format!("crusher {}", env!("CARGO_PKG_VERSION"))
-}
-
 fn to_cert_chain(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     let certs = rustls_pemfile::certs(&mut &*pem)
         .collect::<Result<_, _>>()
@@ -210,37 +209,54 @@ fn to_ca_certs(ca_certs_pem: &Vec<Vec<u8>>) -> Result<rustls::RootCertStore> {
     Ok(root_cert)
 }
 
-fn init_tracing(path: &Path) -> Result<WorkerGuard> {
-    if !path.exists() {
-        bail!("Path not found {path:?}");
-    }
-
+/// Initializes the tracing subscriber.
+///
+/// If `log_dir` is `None` or the runtime is in debug mode, logs will be printed to stdout.
+///
+/// Returns a vector of `WorkerGuard` that flushes the log when dropped.
+fn init_tracing(log_dir: Option<&Path>) -> Vec<WorkerGuard> {
+    let mut guards = vec![];
+    let subscriber = tracing_subscriber::Registry::default();
     let file_name = format!("{}.log", env!("CARGO_PKG_NAME"));
-    if std::fs::File::create(path.join(&file_name)).is_err() {
-        bail!("Cannot create file. {}/{file_name}", path.display());
-    }
 
-    let file_appender = tracing_appender::rolling::never(path, file_name);
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    let is_valid_file =
+        matches!(log_dir, Some(path) if std::fs::File::create(path.join(&file_name)).is_ok());
 
-    let layer_file = fmt::Layer::default()
-        .with_ansi(false)
-        .with_target(false)
-        .with_writer(file_writer)
-        .with_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
+    let stdout_layer = if !is_valid_file || cfg!(debug_assertions) {
+        let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+        guards.push(stdout_guard);
+        Some(
+            fmt::Layer::default()
+                .with_ansi(true)
+                .with_writer(stdout_writer)
+                .with_filter(EnvFilter::from_default_env()),
+        )
+    } else {
+        None
+    };
+
+    let file_layer = if is_valid_file {
+        let file_appender = tracing_appender::rolling::never(
+            log_dir.expect("verified by is_valid_file"),
+            file_name,
         );
+        let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
+        guards.push(file_guard);
+        Some(
+            fmt::Layer::default()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(file_writer)
+                .with_filter(
+                    EnvFilter::builder()
+                        .with_default_directive(LevelFilter::INFO.into())
+                        .from_env_lossy(),
+                ),
+        )
+    } else {
+        None
+    };
 
-    let layered_subscriber = tracing_subscriber::registry().with(layer_file);
-    #[cfg(debug_assertions)]
-    let layered_subscriber = layered_subscriber.with(
-        fmt::Layer::default()
-            .with_ansi(true)
-            .with_filter(EnvFilter::from_default_env()),
-    );
-    layered_subscriber.init();
-
-    Ok(guard)
+    subscriber.with(stdout_layer).with(file_layer).init();
+    guards
 }

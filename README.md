@@ -4,57 +4,88 @@ Crusher generates statistics from raw events.
 
 ## Requirements
 
-* REview 0.39.0 or higher
-* Giganto 0.21.0 or higher
+- REview 0.39.0 or higher
+- Giganto 0.21.0 or higher
 
 ## Usage
 
 You can run Crusher by invoking the following command:
 
 ```sh
-crusher path/to/config.toml
+crusher \
+ --cert <CERT_PATH> --key <KEY_PATH> --ca-certs <CA_CERTS_PATH> \
+ <SERVER_NAME>@<SERVER_IP>:<SERVER_PORT>
 ```
 
-where `config.toml` is a configuration file in TOML format.
+To run Crusher with a local configuration file, with multiple CA certificates:
+
+```sh
+crusher \
+ -c <CONFIG_PATH> \
+ --cert <CERT_PATH>
+ --key <KEY_PATH> \
+ --ca-certs <CA_CERTS_PATH> \
+ --ca-certs <CA_CERTS_PATH> \
+ <SERVER_NAME>@<SERVER_IP>:<SERVER_PORT>
+```
+
+In these commands:
+
+- `<CONFIG_PATH>` is the path to your TOML configuration file.
+- `<CERT_PATH>` is the path to the certificate file for the current module.
+- `<KEY_PATH>` is the path to the private key file for the current module.
+- `<CA_CERTS_PATH>` is a CA certificate files. Multiple CA certificates can be
+  specified by repeating the `--ca-certs` option.
+- `<SERVER_NAME>` is the name of the Manager server, and
+  `<SERVER_IP>:<SERVER_PORT>` is the IP address and port number of the Manager
+  server. Ensure that `<SERVER_NAME>` matches the DNS name specified in the certificate.
+
+## Example
+
+```sh
+crusher \
+ --cert path/to/cert.pem \
+ --key path/to/key.pem \
+ --ca-certs path/to/ca_cert.pem \
+ manager@10.0.0.1:38390
+```
+
+```sh
+crusher \
+ -c path/to/config.toml \
+ --cert path/to/cert.pem \
+ --key path/to/key.pem \
+ --ca-certs path/to/ca_cert.pem \
+ --ca-certs path/to/ca_cert2.pem \
+ manager@10.0.0.1:38390
+```
 
 ## Configuration file
 
 The following is key values in the TOML configuration file.
 
-* `key`: Crusher's private key file.
-* `cert`: Crusher's certificate file.
-* `ca_certs`: CA certificate files. (for Giganto, Review)
-* `giganto_name`: the name of the Giganto. This must match with the DNS name in
+- `giganto_name`: the name of the Giganto. This must match with the DNS name in
   the certificate.
-* `giganto_ingest_srv_addr`: IP address and port number of `Giganto ingest`.
-* `giganto_publish_srv_addr`: IP address and port number of `Giganto publish`.
-* `review_name`: the name of the review. This must match with the DNS name in
-  the certificate.
-* `review_rpc_srv_addr`: IP address and port number of `review`.
-* `last_timestamp_data`: File that stores the timestamp of the last time series
-  per `sampling policy`.
-* `log_dir`: Path to the log file.
+- `giganto_ingest_srv_addr`: Giganto's ingest IP address and port number.
+- `giganto_publish_srv_addr`: Giganto's publish IP address and port number.
+- `last_timestamp_data`: File that stores the timestamp of the last time series
+  per sampling policy.
+- `log_dir`: Path to the log directory. If the path is not provided or the log
+  file cannot be created in the directory, logs will be printed to stdout.
 
 Example
 
 ```toml
-key = "key.pem"
-cert = "cert.pem"
-ca_certs = ["ca_cert_1.pem", "ca_cert_2.pem"]
 giganto_name = "localhost"
 giganto_ingest_srv_addr = "127.0.0.1:38370"
 giganto_publish_srv_addr = "127.0.0.1:38371"
-review_name = "localhost"
-review_rpc_srv_addr ="127.0.0.1:38390"
 last_timestamp_data = "tests/time_data.json"
 log_dir = "/data/logs/apps"
 ```
 
-By default, giganto reads the config file from the following directories:
-
-* Linux: `$HOME/.config/crusher/config.toml`
-* macOS: `$HOME/Library/Application Support/com.cluml.crusher/config.toml`
+By default, Crusher reads the config file from the following path:
+/usr/local/aice/conf/crusher.toml
 
 ## Copyright
 
-* Copyright 2023-2024 ClumL Inc.
+- Copyright 2023-2024 ClumL Inc.
