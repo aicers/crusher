@@ -24,6 +24,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   However, providing a local configuration file is optional.
 - If `log_dir` is not specified in the configuration file or the log file cannot
   be created, logs will be printed to stdout.
+- Changed `REQUIRED_GIGANTO_VERSION` to `0.23.0-alpha.2`.
 
 ### Removed
 
