@@ -1,18 +1,15 @@
 mod client;
+mod logging;
 mod model;
 mod request;
 mod settings;
 mod subscribe;
 
-use std::fs::{create_dir_all, File, OpenOptions};
-use std::io::Write;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Mutex, PoisonError};
-use std::{collections::HashMap, env, fs, sync::Arc};
+use std::{collections::HashMap, fs, sync::Arc};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use client::Certs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -22,12 +19,7 @@ use tokio::{
     sync::{mpsc, Notify, RwLock},
     task,
 };
-use tracing::metadata::LevelFilter;
 use tracing::{error, info, warn};
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{
-    fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
-};
 
 use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 
@@ -84,7 +76,7 @@ pub struct CmdLineArgs {
 async fn main() -> Result<()> {
     let args = CmdLineArgs::parse();
     let mut settings = Settings::from_args(args.clone())?;
-    let mut log_manager = init_tracing(settings.log_dir.as_deref())?;
+    let mut log_manager = logging::init_tracing(settings.log_dir.as_deref())?;
     let (config_tx, mut config_rx) = mpsc::channel::<String>(CONFIG_CHANNEL_SIZE);
 
     loop {
@@ -155,9 +147,14 @@ async fn main() -> Result<()> {
                     error!("Failed to parse the configuration from the Manager server");
                     continue;
                 };
-                log_manager
-                    .dynamic_log_file_writer
-                    .change_log_dir(settings.log_dir.as_deref(), new_settings.log_dir.as_deref())?;
+                match (log_manager.change_log_dir)(
+                    settings.log_dir.as_deref(),
+                    new_settings.log_dir.as_deref(),
+                ) {
+                    Ok(Some(guard)) => log_manager.guard = guard,
+                    Err(e) => error!("Failed to update the log directory: {e}"),
+                    _ => {}
+                }
                 settings = new_settings;
                 notify_shutdown.notify_waiters();
                 notify_shutdown.notified().await;
@@ -200,122 +197,4 @@ fn to_ca_certs(ca_certs_pem: &Vec<Vec<u8>>) -> Result<rustls::RootCertStore> {
         }
     }
     Ok(root_cert)
-}
-
-/// Manages the log file and guards.
-///
-/// `_guards` will flush the logs when they are dropped.
-///
-/// `dynamic_log_file_writer` wraps the log file to allow changing its path dynamically.
-/// If the log file is not provided, logs will be ignored by using `std::io::sink()`.
-struct LogManager {
-    _guards: Vec<WorkerGuard>,
-    dynamic_log_file_writer: DynamicLogFileWriter,
-}
-
-#[derive(Clone)]
-struct DynamicLogFileWriter {
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-}
-
-impl DynamicLogFileWriter {
-    fn try_new(dir_path: Option<&Path>) -> Result<Self> {
-        Ok(Self {
-            writer: Arc::new(Mutex::new(DynamicLogFileWriter::create_writer(dir_path)?)),
-        })
-    }
-
-    fn create_log_file(dir_path: &Path) -> Result<File> {
-        if let Err(e) = create_dir_all(dir_path) {
-            bail!("Cannot create the directory recursively for {dir_path:?}: {e}");
-        }
-
-        let file_name = format!("{}.log", env!("CARGO_PKG_NAME"));
-
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir_path.join(file_name))
-            .map_err(|e| anyhow!("Cannot create the log file: {e}"));
-
-        file
-    }
-
-    fn create_writer(log_dir: Option<&Path>) -> Result<Box<dyn Write + Send>> {
-        match log_dir {
-            Some(dir) => Ok(Box::new(DynamicLogFileWriter::create_log_file(dir)?)),
-            None => Ok(Box::new(std::io::sink())),
-        }
-    }
-
-    fn change_log_dir(&mut self, old_dir: Option<&Path>, new_dir: Option<&Path>) -> Result<()> {
-        if old_dir.eq(&new_dir) {
-            info!("New log directory is the same as the old directory");
-            return Ok(());
-        }
-        if let Some(dir) = new_dir {
-            info!("Log directory will change to {}", dir.display());
-        }
-        let new_writer = DynamicLogFileWriter::create_writer(new_dir)?;
-        {
-            let mut old_writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-            *old_writer = new_writer;
-        }
-        if let Some(dir) = old_dir {
-            info!("Previous logs are in {}", dir.display());
-        }
-        Ok(())
-    }
-}
-
-impl Write for DynamicLogFileWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        writer.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        writer.flush()
-    }
-}
-
-/// Initializes the tracing subscriber.
-///
-/// If `log_dir` is `None` or the runtime is in debug mode, logs will be printed to stdout.
-fn init_tracing(log_dir: Option<&Path>) -> Result<LogManager> {
-    let dynamic_log_file_writer = DynamicLogFileWriter::try_new(log_dir)?;
-    let (file_writer, file_guard) = tracing_appender::non_blocking(dynamic_log_file_writer.clone());
-    let file_layer = fmt::Layer::default()
-        .with_ansi(false)
-        .with_target(false)
-        .with_writer(file_writer)
-        .with_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        );
-    let mut guards = vec![file_guard];
-
-    let stdout_layer = if log_dir.is_none() || cfg!(debug_assertions) {
-        let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
-        guards.push(stdout_guard);
-        Some(
-            fmt::Layer::default()
-                .with_ansi(true)
-                .with_writer(stdout_writer)
-                .with_filter(EnvFilter::from_default_env()),
-        )
-    } else {
-        None
-    };
-
-    tracing_subscriber::Registry::default()
-        .with(stdout_layer)
-        .with(file_layer)
-        .init();
-    Ok(LogManager {
-        _guards: guards,
-        dynamic_log_file_writer,
-    })
 }
