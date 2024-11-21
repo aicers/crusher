@@ -1,13 +1,13 @@
 mod client;
+mod logging;
 mod model;
 mod request;
 mod settings;
 mod subscribe;
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::str::FromStr;
-use std::{collections::HashMap, env, fs, sync::Arc};
+use std::{collections::HashMap, fs, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -16,20 +16,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use settings::Settings;
 pub use settings::TEMP_TOML_POST_FIX;
 use tokio::{
-    sync::{Notify, RwLock},
+    sync::{mpsc, Notify, RwLock},
     task,
 };
-use tracing::metadata::LevelFilter;
-use tracing::{error, warn};
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{
-    fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
-};
+use tracing::{error, info, warn};
 
 use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
-const DEFAULT_TOML: &str = "/usr/local/aice/conf/crusher.toml";
+const CONFIG_CHANNEL_SIZE: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct ManagerServer {
@@ -80,20 +75,11 @@ pub struct CmdLineArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CmdLineArgs::parse();
-
-    let config_path = args
-        .config
-        .clone()
-        .unwrap_or_else(|| DEFAULT_TOML.to_string());
-
     let mut settings = Settings::from_args(args.clone())?;
-
-    let temp_path = format!("{config_path}{TEMP_TOML_POST_FIX}");
-
-    let _guards = init_tracing(settings.log_dir.as_deref());
+    let mut log_manager = logging::init_tracing(settings.log_dir.as_deref())?;
+    let (config_tx, mut config_rx) = mpsc::channel::<String>(CONFIG_CHANNEL_SIZE);
 
     loop {
-        let config_reload = Arc::new(Notify::new());
         let notify_shutdown = Arc::new(Notify::new());
 
         let cert_pem = fs::read(&args.cert)
@@ -134,8 +120,8 @@ async fn main() -> Result<()> {
         task::spawn(request_client.run(
             Arc::clone(&runtime_policy_list),
             Arc::clone(&delete_policy_ids),
-            config_reload.clone(),
             notify_shutdown.clone(),
+            config_tx.clone(),
         ));
 
         let subscribe_client = subscribe::Client::new(
@@ -152,26 +138,30 @@ async fn main() -> Result<()> {
             notify_shutdown.clone(),
         ));
         loop {
-            config_reload.notified().await;
-            match Settings::from_file(&temp_path) {
-                Ok(new_settings) => {
-                    settings = new_settings;
-                    notify_shutdown.notify_waiters();
-                    notify_shutdown.notified().await;
-                    fs::rename(&temp_path, &config_path).unwrap_or_else(|e| {
-                        error!("Failed to rename the new configuration file: {e}");
-                    });
-                    break;
-                }
-                Err(e) => {
-                    error!("Failed to load the new configuration: {:?}", e);
-                    warn!("Run Crusher with the previous config");
-                    fs::remove_file(&temp_path).unwrap_or_else(|e| {
-                        error!("Failed to remove the temporary file: {e}");
-                    });
+            if let Some(config) = config_rx.recv().await {
+                if args.config.is_some() {
+                    warn!("Cannot update the configuration from the Manager server when a local configuration file is specified");
                     continue;
                 }
-            }
+                let Ok(new_settings) = Settings::from_str(&config) else {
+                    error!("Failed to parse the configuration from the Manager server");
+                    continue;
+                };
+                match (log_manager.change_log_dir)(
+                    settings.log_dir.as_deref(),
+                    new_settings.log_dir.as_deref(),
+                ) {
+                    Ok(Some(guard)) => log_manager.guard = guard,
+                    Err(e) => error!("Failed to update the log directory: {e}"),
+                    _ => {}
+                }
+                settings = new_settings;
+                notify_shutdown.notify_waiters();
+                notify_shutdown.notified().await;
+                info!("Updated the configuration from the Manager server");
+                break;
+            };
+            info!("No new configuration received from the Manager server");
         }
     }
 }
@@ -207,56 +197,4 @@ fn to_ca_certs(ca_certs_pem: &Vec<Vec<u8>>) -> Result<rustls::RootCertStore> {
         }
     }
     Ok(root_cert)
-}
-
-/// Initializes the tracing subscriber.
-///
-/// If `log_dir` is `None` or the runtime is in debug mode, logs will be printed to stdout.
-///
-/// Returns a vector of `WorkerGuard` that flushes the log when dropped.
-fn init_tracing(log_dir: Option<&Path>) -> Vec<WorkerGuard> {
-    let mut guards = vec![];
-    let subscriber = tracing_subscriber::Registry::default();
-    let file_name = format!("{}.log", env!("CARGO_PKG_NAME"));
-
-    let is_valid_file =
-        matches!(log_dir, Some(path) if std::fs::File::create(path.join(&file_name)).is_ok());
-
-    let stdout_layer = if !is_valid_file || cfg!(debug_assertions) {
-        let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
-        guards.push(stdout_guard);
-        Some(
-            fmt::Layer::default()
-                .with_ansi(true)
-                .with_writer(stdout_writer)
-                .with_filter(EnvFilter::from_default_env()),
-        )
-    } else {
-        None
-    };
-
-    let file_layer = if is_valid_file {
-        let file_appender = tracing_appender::rolling::never(
-            log_dir.expect("verified by is_valid_file"),
-            file_name,
-        );
-        let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
-        guards.push(file_guard);
-        Some(
-            fmt::Layer::default()
-                .with_ansi(false)
-                .with_target(false)
-                .with_writer(file_writer)
-                .with_filter(
-                    EnvFilter::builder()
-                        .with_default_directive(LevelFilter::INFO.into())
-                        .from_env_lossy(),
-                ),
-        )
-    } else {
-        None
-    };
-
-    subscriber.with(stdout_layer).with(file_layer).init();
-    guards
 }
