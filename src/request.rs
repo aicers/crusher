@@ -72,7 +72,7 @@ pub enum RequestedInterval {
     OneHour = 4,
 }
 
-#[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
+#[derive(Clone, Copy, Debug, Deserialize, TryFromPrimitive)]
 #[repr(u32)]
 pub enum RequestedPeriod {
     SixHours,
