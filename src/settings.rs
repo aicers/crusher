@@ -1,8 +1,8 @@
 //! Configurations for the application.
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
-use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File, FileFormat};
+use config::{builder::DefaultState, Config as cfg, ConfigBuilder, FileFormat};
 use serde::{de::Error, Deserialize, Deserializer};
 
 use crate::CmdLineArgs;
@@ -25,16 +25,6 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Creates a new `Settings` instance, populated from the given
-    /// configuration file.
-    pub fn from_file(cfg_path: &str) -> Result<Self, ConfigError> {
-        let s = default_config_builder()
-            .add_source(File::with_name(cfg_path))
-            .build()?;
-
-        s.try_deserialize()
-    }
-
     /// Creates a new `Settings` instance from the given command line arguments.
     pub fn from_args(args: CmdLineArgs) -> Result<Self> {
         let mut config_builder = default_config_builder()
@@ -49,7 +39,22 @@ impl Settings {
         config_builder
             .build()?
             .try_deserialize()
-            .context("failed to parse configuration file")
+            .context("Failed to parse the configuration file")
+    }
+}
+
+impl FromStr for Settings {
+    type Err = anyhow::Error;
+
+    fn from_str(config_toml: &str) -> Result<Self> {
+        default_config_builder()
+            .add_source(config::File::from_str(
+                config_toml,
+                config::FileFormat::Toml,
+            ))
+            .build()?
+            .try_deserialize()
+            .context("Failed to parse the configuration string")
     }
 }
 
@@ -57,11 +62,11 @@ impl Settings {
 fn default_config_builder() -> ConfigBuilder<DefaultState> {
     cfg::builder()
         .set_default("giganto_name", DEFAULT_GIGANTO_NAME)
-        .expect("verified by const datalake name")
+        .expect("Verified by const datalake name")
         .set_default("giganto_ingest_srv_addr", DEFAULT_GIGANTO_INGEST_SRV_ADDR)
-        .expect("verified by const datalake ingest server address")
+        .expect("Verified by const datalake ingest server address")
         .set_default("giganto_publish_srv_addr", DEFAULT_GIGANTO_PUBLISH_SRV_ADDR)
-        .expect("verified by const datalake publish server address")
+        .expect("Verified by const datalake publish server address")
 }
 
 /// Deserializes a socket address.

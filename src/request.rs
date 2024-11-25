@@ -112,16 +112,16 @@ impl Client {
         self,
         active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-        config_reload: Arc<Notify>,
         wait_shutdown: Arc<Notify>,
+        config_send: tokio::sync::mpsc::Sender<String>,
     ) -> Result<()> {
         loop {
             match connect(
                 &self,
                 active_policy_list.clone(),
                 delete_policy_ids.clone(),
-                config_reload.clone(),
                 wait_shutdown.clone(),
+                config_send.clone(),
             )
             .await
             {
@@ -158,8 +158,8 @@ async fn connect(
     client: &Client,
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-    config_reload: Arc<Notify>,
     wait_shutdown: Arc<Notify>,
+    config_send: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let mut conn_builder = ConnectionBuilder::new(
         &client.server_name,
@@ -171,18 +171,19 @@ async fn connect(
         &client.key,
     )?;
     conn_builder.root_certs(&client.ca_certs)?;
-    let conn = conn_builder.connect().await?;
+    let connection = conn_builder.connect().await?;
     info!("Connection established to server {}", client.server_address);
 
     let request_handler = RequestHandler {
         request_send: client.request_send.clone(),
         active_policy_list,
         delete_policy_ids,
-        config_reload: config_reload.clone(),
+        connection,
+        config_send,
     };
 
     tokio::select! {
-        res = handle_incoming(request_handler, &conn) => {
+        res = handle_incoming(request_handler) => {
             if let Err(e) = res {
                 warn!("control channel failed: {}", e);
                 return Err(e);
@@ -196,9 +197,9 @@ async fn connect(
     }
 }
 
-async fn handle_incoming(handler: RequestHandler, conn: &Connection) -> Result<()> {
+async fn handle_incoming(handler: RequestHandler) -> Result<()> {
     loop {
-        match conn.accept_bi().await {
+        match handler.connection.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 let mut hdl = handler.clone();
                 tokio::spawn(async move {
@@ -217,7 +218,8 @@ struct RequestHandler {
     request_send: Sender<RequestedPolicy>,
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-    config_reload: Arc<Notify>,
+    connection: Connection,
+    config_send: tokio::sync::mpsc::Sender<String>,
 }
 
 #[async_trait]
@@ -305,9 +307,20 @@ impl review_protocol::request::Handler for RequestHandler {
         Ok(())
     }
 
-    async fn reload_config(&mut self) -> Result<(), String> {
-        info!("start reloading configuration");
-        self.config_reload.notify_one();
+    async fn update_config(&mut self) -> Result<(), String> {
+        info!("Updating configuration");
+        match self.connection.get_config().await {
+            Ok(config) => {
+                self.config_send
+                    .send(config)
+                    .await
+                    .map_err(|e| format!("Failed to send config: {e}"))?;
+            }
+            Err(e) => {
+                return Err(format!("Failed to get config: {e}"));
+            }
+        };
+
         Ok(())
     }
 

@@ -7,6 +7,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Support `update_config` from the Manager server only when a local configuration
+  is not specified.
+
 ### Changed
 
 - Configuration options required for establishing a connection with the central
@@ -37,6 +42,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Removed OS-specific configuration directory.
   - Linux: $HOME/.config/crusher/config.toml
   - macOS: $HOME/Library/Application Support/com.cluml.crusher/config.toml
+- Removed `reload_config` functionality.
+- Removed default configuration file: /usr/local/aice/conf/crusher.toml
 
 ## [0.4.1] - 2024-10-04
 
