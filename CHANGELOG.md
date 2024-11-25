@@ -24,6 +24,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   However, providing a local configuration file is optional.
 - If `log_dir` is not specified in the configuration file or the log file cannot
   be created, logs will be printed to stdout.
+- Changed `source` to `sensor`, which is a more appropriate term for the name of
+  the device that sensed/captured the raw event.
+- Updated the protocol version of the review, giganto.
+  - Changed `REQUIRED_MANAGER_VERSION` to "0.41.0".
+  - Changed `REQUIRED_GIGANTO_VERSION` to "0.23.0".
 
 ### Removed
 
