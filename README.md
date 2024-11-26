@@ -5,7 +5,7 @@ Crusher generates statistics from raw events.
 ## Requirements
 
 - REview 0.39.0 or higher
-- Giganto 0.21.0 or higher
+- Giganto 0.23.0 or higher
 
 ## Usage
 
@@ -38,7 +38,8 @@ In these commands:
   specified by repeating the `--ca-certs` option.
 - `<SERVER_NAME>` is the name of the Manager server, and
   `<SERVER_IP>:<SERVER_PORT>` is the IP address and port number of the Manager
-  server. Ensure that `<SERVER_NAME>` matches the DNS name specified in the certificate.
+  server. Ensure that `<SERVER_NAME>` matches the DNS name specified in the
+  certificate.
 
 ## Example
 
