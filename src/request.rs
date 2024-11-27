@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{bail, Error, Result};
-use async_channel::Sender;
 use async_trait::async_trait;
 use bincode::Options;
 use num_enum::TryFromPrimitive;
@@ -17,12 +16,15 @@ use review_protocol::{
 };
 use serde::Deserialize;
 use tokio::{
-    sync::{Notify, RwLock},
+    sync::{broadcast, RwLock},
     time::{sleep, Duration},
 };
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, trace};
 
-use crate::client::SERVER_RETRY_INTERVAL;
+use crate::{
+    client::{Certs, SERVER_RETRY_INTERVAL},
+    ControlMessage,
+};
 
 const REQUIRED_MANAGER_VERSION: &str = "0.39.0";
 const MAX_RETRIES: u8 = 3;
@@ -80,52 +82,60 @@ pub enum RequestedPeriod {
     OneDay,
 }
 
+#[derive(Clone)]
 pub struct Client {
     server_address: SocketAddr,
     server_name: String,
-    request_send: Sender<RequestedPolicy>,
-    cert: Vec<u8>,
-    key: Vec<u8>,
-    ca_certs: Vec<Vec<u8>>,
+    connection: Option<Connection>,
+    request_send: async_channel::Sender<RequestedPolicy>,
+    control_send: broadcast::Sender<ControlMessage>,
+    certs: Certs,
+    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
 }
 
 impl Client {
     pub fn new(
         server_address: SocketAddr,
         server_name: String,
-        request_send: Sender<RequestedPolicy>,
-        cert: Vec<u8>,
-        key: Vec<u8>,
-        ca_certs: Vec<Vec<u8>>,
+        request_send: async_channel::Sender<RequestedPolicy>,
+        control_send: broadcast::Sender<ControlMessage>,
+        certs: Certs,
+        active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+        delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     ) -> Self {
         Client {
             server_address,
             server_name,
+            connection: None,
             request_send,
-            cert,
-            key,
-            ca_certs,
+            control_send,
+            certs,
+            active_policy_list,
+            delete_policy_ids,
         }
     }
 
-    pub async fn run(
-        self,
-        active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
-        delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-        wait_shutdown: Arc<Notify>,
-        config_send: tokio::sync::mpsc::Sender<String>,
-    ) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         loop {
-            match connect(
-                &self,
-                active_policy_list.clone(),
-                delete_policy_ids.clone(),
-                wait_shutdown.clone(),
-                config_send.clone(),
-            )
-            .await
-            {
-                Ok(()) => return Ok(()),
+            match self.connect().await {
+                Ok(connection) => {
+                    info!("Listening for incoming requests");
+                    match connection.accept_bi().await {
+                        Ok((mut send, mut recv)) => {
+                            let mut handler = self.clone();
+                            let _ = tokio::spawn(async move {
+                                review_protocol::request::handle(&mut handler, &mut send, &mut recv)
+                                    .await
+                            })
+                            .await?;
+                        }
+                        Err(e) => {
+                            // return Err(Error::new(e));
+                            error!("Fail to accept connection: {:?}", e);
+                        }
+                    }
+                }
                 Err(e) => {
                     if let Some(e) = e.downcast_ref::<std::io::Error>() {
                         match e.kind() {
@@ -151,79 +161,36 @@ impl Client {
             }
         }
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-async fn connect(
-    client: &Client,
-    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
-    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-    wait_shutdown: Arc<Notify>,
-    config_send: tokio::sync::mpsc::Sender<String>,
-) -> Result<()> {
-    let mut conn_builder = ConnectionBuilder::new(
-        &client.server_name,
-        client.server_address,
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-        REQUIRED_MANAGER_VERSION,
-        &client.cert,
-        &client.key,
-    )?;
-    conn_builder.root_certs(&client.ca_certs)?;
-    let connection = conn_builder.connect().await?;
-    info!("Connection established to server {}", client.server_address);
-
-    let request_handler = RequestHandler {
-        request_send: client.request_send.clone(),
-        active_policy_list,
-        delete_policy_ids,
-        connection,
-        config_send,
-    };
-
-    tokio::select! {
-        res = handle_incoming(request_handler) => {
-            if let Err(e) = res {
-                warn!("control channel failed: {}", e);
-                return Err(e);
-            }
-            Ok(())
-        },
-        () = wait_shutdown.notified() => {
-            info!("Shutting down request channel");
-            Ok(())
+    async fn connect(&mut self) -> Result<&Connection> {
+        if let Some(ref connection) = self.connection {
+            return Ok(connection);
         }
+        let mut conn_builder = ConnectionBuilder::new(
+            &self.server_name,
+            self.server_address,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            REQUIRED_MANAGER_VERSION,
+            &self.certs.cert_raw,
+            &self.certs.key_raw,
+        )?;
+        conn_builder.root_certs(&self.certs.ca_certs_raw)?;
+        self.connection = Some(conn_builder.connect().await?);
+        info!(
+            "Connection established to the Manager server {}",
+            self.server_address
+        );
+        Ok(self.connection.as_ref().expect("Verified by Some above"))
     }
-}
 
-async fn handle_incoming(handler: RequestHandler) -> Result<()> {
-    loop {
-        match handler.connection.accept_bi().await {
-            Ok((mut send, mut recv)) => {
-                let mut hdl = handler.clone();
-                tokio::spawn(async move {
-                    review_protocol::request::handle(&mut hdl, &mut send, &mut recv).await
-                });
-            }
-            Err(e) => {
-                return Err(Error::new(e));
-            }
-        }
+    pub async fn get_config(&mut self) -> Result<String> {
+        self.connect().await?.get_config().await.map_err(Error::new)
     }
-}
-
-#[derive(Clone)]
-struct RequestHandler {
-    request_send: Sender<RequestedPolicy>,
-    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
-    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-    connection: Connection,
-    config_send: tokio::sync::mpsc::Sender<String>,
 }
 
 #[async_trait]
-impl review_protocol::request::Handler for RequestHandler {
+impl review_protocol::request::Handler for Client {
     async fn reboot(&mut self) -> Result<(), String> {
         for attempt in 1..=MAX_RETRIES {
             if let Err(e) = roxy::reboot() {
@@ -309,11 +276,10 @@ impl review_protocol::request::Handler for RequestHandler {
 
     async fn update_config(&mut self) -> Result<(), String> {
         info!("Updating configuration");
-        match self.connection.get_config().await {
+        match self.get_config().await {
             Ok(config) => {
-                self.config_send
-                    .send(config)
-                    .await
+                self.control_send
+                    .send(ControlMessage::UpdateConfig(config))
                     .map_err(|e| format!("Failed to send config: {e}"))?;
             }
             Err(e) => {

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use config::{builder::DefaultState, Config as cfg, ConfigBuilder, FileFormat};
 use serde::{de::Error, Deserialize, Deserializer};
 
-use crate::CmdLineArgs;
+use crate::{logging::LogManager, CmdLineArgs};
 
 const DEFAULT_GIGANTO_NAME: &str = "localhost";
 const DEFAULT_GIGANTO_INGEST_SRV_ADDR: &str = "[::]:38370";
@@ -40,6 +40,28 @@ impl Settings {
             .build()?
             .try_deserialize()
             .context("Failed to parse the configuration file")
+    }
+
+    pub fn change_from_config(
+        settings: &mut Option<Self>,
+        config: &str,
+        log_manager: &mut LogManager,
+    ) -> Result<()> {
+        let new_settings = Settings::from_str(config)?;
+
+        if let Some(guard) = (log_manager.change_log_dir)(
+            settings.as_ref().and_then(|s| s.log_dir.as_deref()),
+            new_settings.log_dir.as_deref(),
+        )? {
+            log_manager.guard = guard;
+        };
+
+        if let Some(inner) = settings.as_mut() {
+            *inner = new_settings;
+        } else {
+            *settings = Some(new_settings);
+        }
+        Ok(())
     }
 }
 

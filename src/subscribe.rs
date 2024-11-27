@@ -32,7 +32,10 @@ use giganto_client::{
     RawEventKind,
 };
 use num_traits::ToPrimitive;
-use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
+use quinn::{
+    crypto::rustls::QuicClientConfig, ClientConfig, Connection, ConnectionError, Endpoint,
+    RecvStream, SendStream, TransportConfig, VarInt, WriteError,
+};
 use serde_json::Value;
 use tokio::{
     sync::{Mutex, Notify, RwLock},
@@ -42,7 +45,7 @@ use tokio::{
 use tracing::{error, info, trace, warn};
 
 use crate::{
-    client::{self, Certs, SERVER_RETRY_INTERVAL},
+    client::{Certs, SERVER_RETRY_INTERVAL},
     model::{convert_policy, time_series, Period, TimeSeries},
     request::{RequestedKind, RequestedPolicy},
 };
@@ -51,6 +54,7 @@ const REQUIRED_GIGANTO_VERSION: &str = "0.21.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(5_000);
 
 // A hashmap for data transfer to an already created asynchronous task
 pub static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
@@ -195,11 +199,11 @@ impl Client {
         publish_addr: SocketAddr,
         server_name: String,
         last_series_time_path: PathBuf,
-        certs: &Arc<Certs>,
+        certs: &Certs,
         request_recv: Receiver<RequestedPolicy>,
     ) -> Self {
         let endpoint =
-            client::config(certs).expect("Server configuration error with cert, key or ca_certs");
+            Self::endpoint(certs).expect("Server configuration error with cert, key or ca_certs");
         Client {
             ingest_addr,
             publish_addr,
@@ -242,6 +246,26 @@ impl Client {
         ) {
             error!("Giganto connection error occur : {}", e);
         }
+        wait_shutdown.notify_one();
+    }
+
+    fn endpoint(certs: &Certs) -> Result<Endpoint> {
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(certs.ca_certs.clone())
+            .with_client_auth_cert(certs.certs.clone(), certs.key.clone_key())?;
+
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+
+        let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
+        config.transport_config(Arc::new(transport));
+
+        let mut endpoint =
+            quinn::Endpoint::client("[::]:0".parse().expect("Failed to parse Endpoint addr"))
+                .expect("Failed to create endpoint");
+        endpoint.set_default_client_config(config);
+
+        Ok(endpoint)
     }
 }
 
@@ -392,7 +416,6 @@ async fn publish_connection_control(
                         () = wait_shutdown.notified() => {
                             info!("Shutting down publish channel");
                             endpoint.close(0u32.into(), &[]);
-                            wait_shutdown.notify_one();
                             return Ok(());
                         }
                         Ok(req_pol) = request_recv.recv() => {
