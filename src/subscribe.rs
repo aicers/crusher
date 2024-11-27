@@ -483,7 +483,7 @@ async fn publish_connect(
 async fn calculate_series_start_time(req_pol: &RequestedPolicy) -> Result<i64> {
     let mut start: i64 = 0;
     if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&req_pol.id.to_string()) {
-        let Some(period) = u32::from(Period::from(req_pol.period.clone())).to_i64() else {
+        let Some(period) = u32::from(Period::from(req_pol.period)).to_i64() else {
             bail!("Failed to convert period");
         };
         let Some(period_nano) = period.checked_mul(SECOND_TO_NANO) else {
