@@ -118,9 +118,7 @@ pub(crate) async fn time_series(
     event: &Event,
     send_channel: &Sender<TimeSeries>,
 ) -> Result<()> {
-    let Some(period) = u32::from(policy.period).to_i64() else {
-        bail!("failed to convert period")
-    };
+    let period = i64::from(u32::from(policy.period));
 
     if time.timestamp() - series.start.timestamp() > period {
         if let Some(sender) = INGEST_CHANNEL.read().await.get(&series.sampling_policy_id) {
@@ -142,11 +140,7 @@ pub(crate) async fn time_series(
 }
 
 fn time_slot(policy: &Policy, time: DateTime<Utc>) -> Result<usize> {
-    let offset_time = time.timestamp()
-        + policy
-            .offset
-            .to_i64()
-            .ok_or_else(|| anyhow!("failed to convert offset"))?;
+    let offset_time = time.timestamp() + i64::from(policy.offset);
     let Some(offset_time) = DateTime::from_timestamp(offset_time, 0) else {
         bail!("failed to create DateTime<Utc> from timestamp");
     };
@@ -169,10 +163,7 @@ fn event_value(sum_column: Option<usize>, event: &Event) -> f64 {
 }
 
 fn start_time(policy: &Policy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
-    let offset = policy
-        .offset
-        .to_i64()
-        .ok_or_else(|| anyhow!("failed to convert offset"))?;
+    let offset = i64::from(policy.offset);
     let offset_time = time.timestamp() + offset;
     let Some(offset_time) = DateTime::from_timestamp(offset_time, 0) else {
         bail!("failed to create DateTime<Utc> from timestamp");
@@ -180,17 +171,11 @@ fn start_time(policy: &Policy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
 
     let seconds_of_day =
         offset_time.hour() * 3600 + offset_time.minute() * 60 + offset_time.second();
-    let timestamp_of_midnight = offset_time.timestamp()
-        - seconds_of_day
-            .to_i64()
-            .ok_or_else(|| anyhow!("failed to convert seconds of the day"))?;
+    let timestamp_of_midnight = offset_time.timestamp() - i64::from(seconds_of_day);
 
     let period = u32::from(policy.period);
     let start_of_period = seconds_of_day / period * period;
-    let start_offset_time = timestamp_of_midnight
-        + start_of_period
-            .to_i64()
-            .ok_or_else(|| anyhow!("failed to convert start of the period"))?;
+    let start_offset_time = timestamp_of_midnight + i64::from(start_of_period);
 
     let Some(datetime) = DateTime::from_timestamp(start_offset_time - offset, 0) else {
         bail!("failed to create DateTime<Utc> from timestamp");
