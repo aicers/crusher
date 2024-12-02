@@ -148,7 +148,7 @@ fn time_slot(policy: &Policy, time: DateTime<Utc>) -> Result<usize> {
     let seconds_of_day =
         offset_time.hour() * 3600 + offset_time.minute() * 60 + offset_time.second();
     let (interval, period) = (u32::from(policy.interval), u32::from(policy.period));
-    let time_slot = (seconds_of_day - seconds_of_day / period * period) / interval;
+    let time_slot = seconds_of_day % period / interval;
 
     time_slot
         .to_usize()
