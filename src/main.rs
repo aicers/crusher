@@ -110,11 +110,11 @@ async fn main() -> Result<()> {
             ca_certs_pem.push(file);
         }
         let ca_certs = to_ca_certs(&ca_certs_pem).context("failed to read CA certificates")?;
-        let certs = Arc::new(Certs {
+        let certs = Certs {
             certs: cert.clone(),
             key: key.clone_key(),
             ca_certs: ca_certs.clone(),
-        });
+        };
 
         read_last_timestamp(&settings.last_timestamp_data).await?;
 

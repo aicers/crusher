@@ -103,7 +103,7 @@ fn client() -> Client {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_PUBLISH_PORT),
         String::from(HOST),
         PathBuf::from(LAST_TIME_SERIES_PATH),
-        &Arc::new(certs),
+        &certs,
         rx,
     )
 }

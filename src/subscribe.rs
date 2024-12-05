@@ -195,7 +195,7 @@ impl Client {
         publish_addr: SocketAddr,
         server_name: String,
         last_series_time_path: PathBuf,
-        certs: &Arc<Certs>,
+        certs: &Certs,
         request_recv: Receiver<RequestedPolicy>,
     ) -> Self {
         let endpoint =

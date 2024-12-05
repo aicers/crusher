@@ -28,7 +28,7 @@ impl Clone for Certs {
     }
 }
 
-pub fn config(certs: &Arc<Certs>) -> Result<Endpoint> {
+pub fn config(certs: &Certs) -> Result<Endpoint> {
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(certs.ca_certs.clone())
         .with_client_auth_cert(certs.certs.clone(), certs.key.clone_key())?;
