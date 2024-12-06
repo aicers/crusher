@@ -214,33 +214,40 @@ impl Client {
         self,
         active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-        wait_shutdown: Arc<Notify>,
-    ) {
+        shutdown: Arc<Notify>,
+    ) -> Result<()> {
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
-        if let Err(e) = tokio::try_join!(
-            ingest_connection_control(
-                receiver,
-                self.ingest_addr,
-                self.server_name.clone(),
-                self.endpoint.clone(),
-                wait_shutdown.clone(),
-                self.last_series_time_path.clone(),
-                REQUIRED_GIGANTO_VERSION,
-            ),
-            publish_connection_control(
-                sender,
-                self.publish_addr,
-                &self.server_name,
-                &self.endpoint,
-                wait_shutdown.clone(),
-                REQUIRED_GIGANTO_VERSION,
-                &self.request_recv,
-                active_policy_list,
-                delete_policy_ids,
-                self.last_series_time_path,
-            )
-        ) {
-            error!("Giganto connection error occur : {}", e);
+        tokio::select! {
+            Err(e) = async {tokio::try_join!(
+                ingest_connection_control(
+                    receiver,
+                    self.ingest_addr,
+                    self.server_name.clone(),
+                    self.endpoint.clone(),
+                    self.last_series_time_path.clone(),
+                    REQUIRED_GIGANTO_VERSION,
+                ),
+                publish_connection_control(
+                    sender,
+                    self.publish_addr,
+                    &self.server_name,
+                    &self.endpoint,
+                    REQUIRED_GIGANTO_VERSION,
+                    &self.request_recv,
+                    active_policy_list,
+                    delete_policy_ids,
+                    self.last_series_time_path.clone(),
+                )
+            )} => {
+                self.endpoint.close(0u32.into(), &[]);
+                bail!("Datalake connection error occured: {}", e);
+            }
+            () = shutdown.notified() => {
+                info!("Shutting down Datalake client");
+                self.endpoint.close(0u32.into(), &[]);
+                shutdown.notify_one();
+                Ok(())
+            }
         }
     }
 }
@@ -250,7 +257,6 @@ async fn ingest_connection_control(
     server_addr: SocketAddr,
     server_name: String,
     endpoint: Endpoint,
-    wait_shutdown: Arc<Notify>,
     last_series_time_path: PathBuf,
     version: &str,
 ) -> Result<()> {
@@ -279,11 +285,6 @@ async fn ingest_connection_control(
                                 server_addr,
                             );
                             continue 'connection;
-                        }
-                        () = wait_shutdown.notified() => {
-                            info!("Shutting down ingest channel");
-                            endpoint.close(0u32.into(), &[]);
-                            return Ok(());
                         }
                         Ok(series) = series_recv.recv() => {
                             // First time_series data receive
@@ -331,7 +332,6 @@ async fn publish_connection_control(
     server_addr: SocketAddr,
     server_name: &str,
     endpoint: &Endpoint,
-    wait_shutdown: Arc<Notify>,
     version: &str,
     request_recv: &Receiver<RequestedPolicy>,
     active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
@@ -388,12 +388,6 @@ async fn publish_connection_control(
                             );
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                             continue 'connection;
-                        }
-                        () = wait_shutdown.notified() => {
-                            info!("Shutting down publish channel");
-                            endpoint.close(0u32.into(), &[]);
-                            wait_shutdown.notify_one();
-                            return Ok(());
                         }
                         Ok(req_pol) = request_recv.recv() => {
                             if let Err(e) = process_network_stream(

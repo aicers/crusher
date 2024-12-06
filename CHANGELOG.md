@@ -7,9 +7,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
+### Removed
 
-- Replaced `reload_config` request handler with `update_config`.
+- Removed default configuration file: /usr/local/aice/conf/crusher.toml
+  - If a configuration file is not specified in the CLI argument, Crusher runs in
+    remote mode.
 
 ## [0.5.0] - 2024-11-26
 
