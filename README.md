@@ -84,8 +84,22 @@ last_timestamp_data = "tests/time_data.json"
 log_dir = "/data/logs/apps"
 ```
 
-By default, Crusher reads the config file from the following path:
-/usr/local/aice/conf/crusher.toml
+## Two Crusher modes
+
+- Remote mode (no configuration file is provided using the `-c` CLI option):
+  - Attempts to fetch the configuration from the Manager server on startup.
+  - Re-fetches and applies the remote configuration upon receiving an
+    `update_config` request from the Manager server.
+  - If a panic occurs, enters a wait mode to await an `update_config` request
+    from the Manager server.
+  - Logs are printed to stdout while in wait mode.
+- Local mode (a configuration file is provided using the `-c` CLI option):
+  - Ignores `update_config` requests from the Manager server.
+  - Does not enter wait mode, even in case of a panic.
+- Common behaviors:
+  - Logs are printed to stdout if `log_dir` is not specified in the
+    configuration.
+  - Panics if the CLI arguments for the Manager server are incorrect.
 
 ## Copyright
 
