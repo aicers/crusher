@@ -17,7 +17,6 @@ use super::{Client, Conn};
 use crate::{
     client::Certs,
     model::{Interval, Period, Policy, TimeSeries},
-    to_ca_certs, to_cert_chain, to_private_key,
 };
 
 pub(crate) static TOKEN: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
@@ -111,13 +110,16 @@ fn client() -> Client {
 
 fn cert_key() -> Certs {
     let cert_pem = fs::read(CERT_PATH).unwrap();
-    let cert = to_cert_chain(&cert_pem).unwrap();
+    let cert = Certs::to_cert_chain(&cert_pem).unwrap();
     let key_pem = fs::read(KEY_PATH).unwrap();
-    let key = to_private_key(&key_pem).unwrap();
+    let key = Certs::to_private_key(&key_pem).unwrap();
     let ca_certs_pem = vec![fs::read(CA_CERT_PATH).unwrap()];
-    let ca_certs = to_ca_certs(&ca_certs_pem).unwrap();
+    let ca_certs = Certs::to_ca_certs(&ca_certs_pem).unwrap();
 
     Certs {
+        cert_pem,
+        key_pem,
+        ca_certs_pem,
         certs: cert.clone(),
         key: key.clone_key(),
         ca_certs: ca_certs.clone(),
