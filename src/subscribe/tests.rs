@@ -16,7 +16,6 @@ use super::{Client, Conn};
 use crate::{
     client::Certs,
     model::{Interval, Period, Policy, TimeSeries},
-    to_ca_certs, to_cert_chain, to_private_key,
 };
 
 pub(crate) static TOKEN: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
@@ -109,14 +108,17 @@ fn client() -> Client {
 }
 
 fn cert_key() -> Certs {
-    let cert_pem = fs::read(CERT_PATH).unwrap();
-    let cert = to_cert_chain(&cert_pem).unwrap();
-    let key_pem = fs::read(KEY_PATH).unwrap();
-    let key = to_private_key(&key_pem).unwrap();
-    let ca_certs_pem = vec![fs::read(CA_CERT_PATH).unwrap()];
-    let ca_certs = to_ca_certs(&ca_certs_pem).unwrap();
+    let cert_raw = fs::read(CERT_PATH).unwrap();
+    let cert = Certs::to_cert_chain(&cert_raw).unwrap();
+    let key_raw = fs::read(KEY_PATH).unwrap();
+    let key = Certs::to_private_key(&key_raw).unwrap();
+    let ca_certs_raw = vec![fs::read(CA_CERT_PATH).unwrap()];
+    let ca_certs = Certs::to_ca_certs(&ca_certs_raw).unwrap();
 
     Certs {
+        cert_raw,
+        key_raw,
+        ca_certs_raw,
         certs: cert.clone(),
         key: key.clone_key(),
         ca_certs: ca_certs.clone(),
@@ -144,8 +146,7 @@ async fn connection_handshake(conn: &Connection) {
         .expect("Failed to receive handshake data");
     let len = u64::from_le_bytes(resp_len_buf);
 
-    let mut resp_buf = Vec::new();
-    resp_buf.resize(len.try_into().expect("Failed to convert data type"), 0);
+    let mut resp_buf = vec![0; len.try_into().expect("Failed to convert data type")];
     recv.read_exact(resp_buf.as_mut_slice()).await.unwrap();
 
     bincode::deserialize::<Option<&str>>(&resp_buf)
