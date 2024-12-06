@@ -7,9 +7,19 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added `get_config` method to `request::Client` to fetch the configuration from
+  the Manager server.
+
 ### Changed
 
 - Replaced `reload_config` request handler with `update_config`.
+- Introduced two Crusher modes, as detailed in `README.md`.
+
+### Removed
+
+- Removed default configuration file: /usr/local/aice/conf/crusher.toml
 
 ## [0.5.0] - 2024-11-26
 
