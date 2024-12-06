@@ -1,16 +1,13 @@
 //! Configurations for the application.
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
-use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File, FileFormat};
+use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File};
 use serde::{de::Error, Deserialize, Deserializer};
-
-use crate::CmdLineArgs;
 
 const DEFAULT_GIGANTO_NAME: &str = "localhost";
 const DEFAULT_GIGANTO_INGEST_SRV_ADDR: &str = "[::]:38370";
 const DEFAULT_GIGANTO_PUBLISH_SRV_ADDR: &str = "[::]:38371";
-pub const TEMP_TOML_POST_FIX: &str = ".temp.toml";
 
 /// The application settings.
 #[derive(Clone, Debug, Deserialize)]
@@ -34,22 +31,20 @@ impl Settings {
 
         s.try_deserialize()
     }
+}
 
-    /// Creates a new `Settings` instance from the given command line arguments.
-    pub fn from_args(args: CmdLineArgs) -> Result<Self> {
-        let mut config_builder = default_config_builder()
-            .set_override("cert", args.cert)?
-            .set_override("key", args.key)?
-            .set_override("ca_certs", args.ca_certs)?;
+impl FromStr for Settings {
+    type Err = anyhow::Error;
 
-        if let Some(config) = args.config {
-            config_builder = config_builder
-                .add_source(config::File::with_name(config.as_str()).format(FileFormat::Toml));
-        }
-        config_builder
+    fn from_str(config_toml: &str) -> Result<Self> {
+        default_config_builder()
+            .add_source(config::File::from_str(
+                config_toml,
+                config::FileFormat::Toml,
+            ))
             .build()?
             .try_deserialize()
-            .context("failed to parse configuration file")
+            .context("Failed to parse the configuration string")
     }
 }
 

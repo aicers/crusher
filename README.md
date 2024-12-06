@@ -32,6 +32,13 @@ crusher \
 In these commands:
 
 - `<CONFIG_PATH>` is the path to your TOML configuration file.
+  - If not provided, Crusher runs in remote mode:
+    - Attempts to fetch the configuration from the Manager server on startup.
+    - Updates the configuration upon a request from the Manager server.
+    - If an error occurs, waits for an updated configuration from the Manager
+      server.
+  - If provided, Crusher runs in local mode, which ignores configuration updates
+    from the Manager server.
 - `<CERT_PATH>` is the path to the certificate file for the current module.
 - `<KEY_PATH>` is the path to the private key file for the current module.
 - `<CA_CERTS_PATH>` is a CA certificate files. Multiple CA certificates can be
@@ -72,7 +79,8 @@ The following is key values in the TOML configuration file.
 - `last_timestamp_data`: File that stores the timestamp of the last time series
   per sampling policy.
 - `log_dir`: Path to the log directory. If the path is not provided or the log
-  file cannot be created in the directory, logs will be printed to stdout.
+  file cannot be created in the directory, logs will be printed to stdout. Once
+  set, it remains unchanged throughout the process.
 
 Example
 
@@ -84,9 +92,6 @@ last_timestamp_data = "tests/time_data.json"
 log_dir = "/data/logs/apps"
 ```
 
-By default, Crusher reads the config file from the following path:
-/usr/local/aice/conf/crusher.toml
-
 ## Copyright
 
-- Copyright 2023-2024 ClumL Inc.
+- Copyright 2023-2025 ClumL Inc.
