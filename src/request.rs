@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{bail, Error, Result};
+use anyhow::{bail, Context, Result};
 use async_channel::Sender;
 use async_trait::async_trait;
 use bincode::Options;
@@ -20,7 +20,7 @@ use tokio::{
     sync::{Notify, RwLock},
     time::{sleep, Duration},
 };
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, trace};
 
 use crate::client::SERVER_RETRY_INTERVAL;
 
@@ -80,6 +80,7 @@ pub enum RequestedPeriod {
     OneDay,
 }
 
+#[derive(Clone)]
 pub struct Client {
     server_address: SocketAddr,
     server_name: String,
@@ -87,9 +88,14 @@ pub struct Client {
     cert: Vec<u8>,
     key: Vec<u8>,
     ca_certs: Vec<Vec<u8>>,
+    config_reload: Arc<Notify>,
+    connection: Option<Connection>,
+    pub active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    pub delete_policy_ids: Arc<RwLock<Vec<u32>>>,
 }
 
 impl Client {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         server_address: SocketAddr,
         server_name: String,
@@ -97,6 +103,9 @@ impl Client {
         cert: Vec<u8>,
         key: Vec<u8>,
         ca_certs: Vec<Vec<u8>>,
+        config_reload: Arc<Notify>,
+        active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+        delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     ) -> Self {
         Client {
             server_address,
@@ -105,27 +114,27 @@ impl Client {
             cert,
             key,
             ca_certs,
+            config_reload,
+            connection: None,
+            active_policy_list,
+            delete_policy_ids,
         }
     }
 
-    pub async fn run(
-        self,
-        active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
-        delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-        config_reload: Arc<Notify>,
-        wait_shutdown: Arc<Notify>,
-    ) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         loop {
-            match connect(
-                &self,
-                active_policy_list.clone(),
-                delete_policy_ids.clone(),
-                config_reload.clone(),
-                wait_shutdown.clone(),
-            )
-            .await
-            {
-                Ok(()) => return Ok(()),
+            match self.connect().await {
+                Ok(connection) => {
+                    info!("Listening for incoming requests");
+                    match connection.accept_bi().await {
+                        Ok((mut send, mut recv)) => {
+                            review_protocol::request::handle(self, &mut send, &mut recv).await?;
+                        }
+                        Err(e) => {
+                            error!("Fail to accept connection: {:?}", e);
+                        }
+                    }
+                }
                 Err(e) => {
                     if let Some(e) = e.downcast_ref::<std::io::Error>() {
                         match e.kind() {
@@ -151,77 +160,42 @@ impl Client {
             }
         }
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-async fn connect(
-    client: &Client,
-    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
-    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-    config_reload: Arc<Notify>,
-    wait_shutdown: Arc<Notify>,
-) -> Result<()> {
-    let mut conn_builder = ConnectionBuilder::new(
-        &client.server_name,
-        client.server_address,
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-        REQUIRED_MANAGER_VERSION,
-        &client.cert,
-        &client.key,
-    )?;
-    conn_builder.root_certs(&client.ca_certs)?;
-    let conn = conn_builder.connect().await?;
-    info!("Connection established to server {}", client.server_address);
-
-    let request_handler = RequestHandler {
-        request_send: client.request_send.clone(),
-        active_policy_list,
-        delete_policy_ids,
-        config_reload: config_reload.clone(),
-    };
-
-    tokio::select! {
-        res = handle_incoming(request_handler, &conn) => {
-            if let Err(e) = res {
-                warn!("control channel failed: {}", e);
-                return Err(e);
-            }
-            Ok(())
-        },
-        () = wait_shutdown.notified() => {
-            info!("Shutting down request channel");
-            Ok(())
+    async fn connect(&mut self) -> Result<&Connection> {
+        if let Some(ref connection) = self.connection {
+            return Ok(connection);
         }
+        let mut conn_builder = ConnectionBuilder::new(
+            &self.server_name,
+            self.server_address,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            REQUIRED_MANAGER_VERSION,
+            &self.cert,
+            &self.key,
+        )?;
+        conn_builder.root_certs(&self.ca_certs)?;
+        self.connection = Some(conn_builder.connect().await?);
+        info!(
+            "Connection established to the Manager server {}",
+            self.server_address
+        );
+        self.connection
+            .as_ref()
+            .context("Failed to connect to the Manager server")
     }
-}
 
-async fn handle_incoming(handler: RequestHandler, conn: &Connection) -> Result<()> {
-    loop {
-        match conn.accept_bi().await {
-            Ok((mut send, mut recv)) => {
-                let mut hdl = handler.clone();
-                tokio::spawn(async move {
-                    review_protocol::request::handle(&mut hdl, &mut send, &mut recv).await
-                });
-            }
-            Err(e) => {
-                return Err(Error::new(e));
-            }
-        }
+    pub async fn get_config(&mut self) -> Result<String> {
+        self.connect()
+            .await?
+            .get_config()
+            .await
+            .context("Failed to get the configuration from the Manager server")
     }
-}
-
-#[derive(Clone)]
-struct RequestHandler {
-    request_send: Sender<RequestedPolicy>,
-    active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
-    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-    config_reload: Arc<Notify>,
 }
 
 #[async_trait]
-impl review_protocol::request::Handler for RequestHandler {
+impl review_protocol::request::Handler for Client {
     async fn reboot(&mut self) -> Result<(), String> {
         for attempt in 1..=MAX_RETRIES {
             if let Err(e) = roxy::reboot() {

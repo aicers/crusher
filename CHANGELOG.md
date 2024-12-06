@@ -7,9 +7,36 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added `get_config` method to `request::Client` to fetch the configuration from
+  the Manager server.
+
 ### Changed
 
 - Replaced `reload_config` request handler with `update_config`.
+- Two Crusher modes introduced:
+  - Remote mode (no configuration file is provided using the `-c` CLI option):
+    - Attempts to fetch the configuration from the Manager server on startup.
+    - Enters a wait mode if an error occurs, awaiting an `update_config` request
+      from the Manager server.
+    - Re-fetches and applies the remote configuration upon receiving an
+      `update_config` request from the Manager server.
+    - The first valid `log_dir` is applied and remains unchanged for the
+      duration of the process.
+  - Local mode (a configuration file is provided using the `-c` CLI option):
+    - Ignores `update_config` requests from the Manager server.
+    - Does not enter wait mode, even in case of an error.
+  - Common behaviors:
+    - Omitting `log_dir` is considered valid, defaulting to logging output to stdout.
+    - The application panics if the CLI arguments for the Manager server are invalid.
+- Changed the `request::Client` structure to include a `get_config` method.
+- Moved the `to_cert_chain`, `to_private_key`, `to_ca_certs` functions into
+  methods of the `Certs` struct for better modularity.
+
+### Removed
+
+- Removed default configuration file: /usr/local/aice/conf/crusher.toml
 
 ## [0.5.0] - 2024-11-26
 
