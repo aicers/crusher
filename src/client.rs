@@ -18,16 +18,6 @@ pub struct Certs {
     pub ca_certs: RootCertStore,
 }
 
-impl Clone for Certs {
-    fn clone(&self) -> Self {
-        Self {
-            certs: self.certs.clone(),
-            key: self.key.clone_key(),
-            ca_certs: self.ca_certs.clone(),
-        }
-    }
-}
-
 pub fn config(certs: &Certs) -> Result<Endpoint> {
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(certs.ca_certs.clone())
