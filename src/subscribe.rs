@@ -242,6 +242,7 @@ impl Client {
         ) {
             error!("Giganto connection error occur : {}", e);
         }
+        wait_shutdown.notify_one();
     }
 }
 
@@ -392,7 +393,6 @@ async fn publish_connection_control(
                         () = wait_shutdown.notified() => {
                             info!("Shutting down publish channel");
                             endpoint.close(0u32.into(), &[]);
-                            wait_shutdown.notify_one();
                             return Ok(());
                         }
                         Ok(req_pol) = request_recv.recv() => {
