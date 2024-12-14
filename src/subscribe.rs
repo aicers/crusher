@@ -47,7 +47,7 @@ use crate::{
     request::{RequestedKind, RequestedPolicy},
 };
 
-const REQUIRED_GIGANTO_VERSION: &str = "0.23.0";
+const REQUIRED_GIGANTO_VERSION: &str = "0.24.0-alpha.1";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
