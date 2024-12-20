@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::sync::LazyLock;
 use std::{
     collections::HashMap,
@@ -144,8 +145,7 @@ async fn connection_handshake(conn: &Connection) {
         .expect("Failed to receive handshake data");
     let len = u64::from_le_bytes(resp_len_buf);
 
-    let mut resp_buf = Vec::new();
-    resp_buf.resize(len.try_into().expect("Failed to convert data type"), 0);
+    let mut resp_buf = vec![0; len.try_into().expect("Failed to convert data type")];
     recv.read_exact(resp_buf.as_mut_slice()).await.unwrap();
 
     bincode::deserialize::<Option<&str>>(&resp_buf)
@@ -262,5 +262,8 @@ async fn timeseries_with_conn() {
         min += THREE_MIN;
     }
 
-    assert_eq!(timeseries.series[36], 3.0);
+    assert_eq!(
+        timeseries.series[36].partial_cmp(&3.0),
+        Some(Ordering::Equal),
+    );
 }
