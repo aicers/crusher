@@ -305,8 +305,8 @@ impl review_protocol::request::Handler for RequestHandler {
         Ok(())
     }
 
-    async fn reload_config(&mut self) -> Result<(), String> {
-        info!("start reloading configuration");
+    async fn update_config(&mut self) -> Result<(), String> {
+        info!("Updating configuration");
         self.config_reload.notify_one();
         Ok(())
     }
