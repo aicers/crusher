@@ -29,9 +29,8 @@ pub fn config(certs: &Certs) -> Result<Endpoint> {
     let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
     config.transport_config(Arc::new(transport));
 
-    let mut endpoint =
-        quinn::Endpoint::client("[::]:0".parse().expect("Failed to parse Endpoint addr"))
-            .expect("Failed to create endpoint");
+    let mut endpoint = quinn::Endpoint::client((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
+        .expect("Failed to create endpoint");
     endpoint.set_default_client_config(config);
 
     Ok(endpoint)
