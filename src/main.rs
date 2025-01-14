@@ -158,17 +158,17 @@ async fn main() -> Result<()> {
                     settings = new_settings;
                     notify_shutdown.notify_waiters();
                     notify_shutdown.notified().await;
-                    fs::rename(&temp_path, &config_path).unwrap_or_else(|e| {
+                    if let Err(e) = fs::rename(&temp_path, &config_path) {
                         error!("Failed to rename the new configuration file: {e}");
-                    });
+                    }
                     break;
                 }
                 Err(e) => {
                     error!("Failed to load the new configuration: {:?}", e);
                     warn!("Run Crusher with the previous config");
-                    fs::remove_file(&temp_path).unwrap_or_else(|e| {
+                    if let Err(e) = fs::remove_file(&temp_path) {
                         error!("Failed to remove the temporary file: {e}");
-                    });
+                    }
                     continue;
                 }
             }
