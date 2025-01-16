@@ -24,17 +24,28 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Update to the Latest Version of Rust
+        run: rustup update
       - name: Build Binary
         run: |
           cargo build --release
       - name: Create a Release and Upload Assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          name: ${{ env.TITLE }} ${{ env.TAG }}
-          draft: false
-          prerelease: false
-          files: |
-            ./target/release/${{ env.BINARY }}
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"tag_name": "${{ env.TAG }}", "name": "${{ env.TITLE }} ${{ env.TAG }}", "draft": false, "prerelease": false}' \
+            https://api.github.com/repos/${{ github.repository }}/releases \
+            -o release.json
+          if [ "$(jq -r .id release.json)" == "null" ]; then
+            echo "Failed to create release" >&2
+            exit 1
+          fi
+          RELEASE_ID=$(jq -r .id release.json)
+          FILE="target/release/${{ env.BINARY }}"
+          UPLOAD_URL="https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=${{ env.BINARY }}"
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$FILE" \
+            "${UPLOAD_URL}"
