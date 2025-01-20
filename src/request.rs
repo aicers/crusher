@@ -281,7 +281,7 @@ impl review_protocol::request::Handler for RequestHandler {
                 .write()
                 .await
                 .insert(policy.id, policy.clone());
-            trace!("Receive REview's policy: {:?}", policy);
+            trace!("Receive the Manager Server's policy: {:?}", policy);
             self.request_send
                 .send(policy)
                 .await
