@@ -26,8 +26,9 @@ use giganto_client::{
         receive_ack_timestamp, send_record_header,
     },
     publish::{
-        receive_crusher_data, receive_crusher_stream_start_message, send_stream_request,
-        stream::{NodeType, RequestCrusherStream, RequestStreamRecord},
+        receive_time_series_generator_data, receive_time_series_generator_stream_start_message,
+        send_stream_request,
+        stream::{NodeType, RequestStreamRecord, RequestTimeSeriesGeneratorStream},
     },
     RawEventKind,
 };
@@ -500,7 +501,7 @@ async fn process_network_stream(
     last_series_time_path: PathBuf,
 ) -> Result<()> {
     let start = calculate_series_start_time(&req_pol).await?;
-    let req_msg = RequestCrusherStream {
+    let req_msg = RequestTimeSeriesGeneratorStream {
         start,
         id: req_pol.id.to_string(),
         src_ip: req_pol.src_ip,
@@ -510,7 +511,7 @@ async fn process_network_stream(
     send_stream_request(
         &mut (*send.lock().await),
         RequestStreamRecord::from(req_pol.kind),
-        NodeType::Crusher,
+        NodeType::TimeSeriesGenerator,
         req_msg,
     )
     .await?;
@@ -543,7 +544,7 @@ async fn receiver(
     last_series_time_path: PathBuf,
 ) -> Result<()> {
     if let Ok(mut recv) = conn.accept_uni().await {
-        let Ok(id) = receive_crusher_stream_start_message(&mut recv).await else {
+        let Ok(id) = receive_time_series_generator_stream_start_message(&mut recv).await else {
             connection_notify.notify_one();
             warn!("Failed to receive stream id value");
             bail!("Failed to receive stream id value");
@@ -569,7 +570,8 @@ async fn receiver(
                     .retain(|&delete_id| delete_id != id);
                 break;
             }
-            if let Ok((raw_event, timestamp)) = receive_crusher_data(&mut recv).await {
+            if let Ok((raw_event, timestamp)) = receive_time_series_generator_data(&mut recv).await
+            {
                 match policy.kind {
                     RequestStreamRecord::Conn => {
                         let (time, Ok(event)) = (
