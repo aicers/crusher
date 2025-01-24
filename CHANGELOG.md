@@ -7,6 +7,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Updated review-protocol to version "07edf4d" (hash).
+  - Updated the signatures of `sampling_policy_list`, `delete_sampling_policy`.
+  - Replaced the `RequestedPolicy`, `Policy` structs with the `SamplingPolicy`.
+
 ### Removed
 
 - Removed default configuration file: /usr/local/aice/conf/crusher.toml

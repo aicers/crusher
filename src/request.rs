@@ -1,21 +1,12 @@
-use std::{
-    collections::HashMap,
-    io::ErrorKind,
-    net::{IpAddr, SocketAddr},
-    process::exit,
-    sync::Arc,
-};
+use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, process::exit, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use async_channel::Sender;
 use async_trait::async_trait;
-use bincode::Options;
-use num_enum::TryFromPrimitive;
 use review_protocol::{
     client::{Connection, ConnectionBuilder},
-    types as protocol_types,
+    types::{self as protocol_types, SamplingPolicy},
 };
-use serde::Deserialize;
 use tokio::{
     sync::{Notify, RwLock},
     time::{sleep, Duration},
@@ -24,72 +15,19 @@ use tracing::{error, info, trace};
 
 use crate::client::SERVER_RETRY_INTERVAL;
 
-const REQUIRED_MANAGER_VERSION: &str = "0.39.0";
+const REQUIRED_MANAGER_VERSION: &str = "0.42.0";
 const MAX_RETRIES: u8 = 3;
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct RequestedPolicy {
-    pub id: u32,
-    pub kind: RequestedKind,
-    pub interval: RequestedInterval,
-    pub period: RequestedPeriod,
-    pub offset: i32,
-    pub src_ip: Option<IpAddr>,
-    pub dst_ip: Option<IpAddr>,
-    pub node: Option<String>,
-    pub column: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
-#[repr(u32)]
-pub enum RequestedKind {
-    Conn = 0,
-    Dns = 1,
-    Http = 2,
-    Rdp = 3,
-    Smtp = 4,
-    Ntlm = 5,
-    Kerberos = 6,
-    Ssh = 7,
-    DceRpc = 8,
-    Ftp = 9,
-    Mqtt = 10,
-    Ldap = 11,
-    Tls = 12,
-    Smb = 13,
-    Nfs = 14,
-    Bootp = 15,
-    Dhcp = 16,
-}
-
-#[derive(Debug, Deserialize, TryFromPrimitive, Clone)]
-#[repr(u32)]
-pub enum RequestedInterval {
-    FiveMinutes = 0,
-    TenMinutes = 1,
-    FifteenMinutes = 2,
-    ThirtyMinutes = 3,
-    OneHour = 4,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, TryFromPrimitive)]
-#[repr(u32)]
-pub enum RequestedPeriod {
-    SixHours,
-    TwelveHours,
-    OneDay,
-}
 
 #[derive(Clone)]
 pub struct Client {
     server_address: SocketAddr,
     server_name: String,
-    request_send: Sender<RequestedPolicy>,
+    request_send: Sender<SamplingPolicy>,
     cert: Vec<u8>,
     key: Vec<u8>,
     ca_certs: Vec<Vec<u8>>,
     config_reload: Arc<Notify>,
-    pub active_policy_list: Arc<RwLock<HashMap<u32, RequestedPolicy>>>,
+    pub active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
     pub delete_policy_ids: Arc<RwLock<Vec<u32>>>,
 }
 
@@ -98,7 +36,7 @@ impl Client {
     pub fn new(
         server_address: SocketAddr,
         server_name: String,
-        request_send: Sender<RequestedPolicy>,
+        request_send: Sender<SamplingPolicy>,
         cert: Vec<u8>,
         key: Vec<u8>,
         ca_certs: Vec<Vec<u8>>,
@@ -219,6 +157,7 @@ impl Client {
                         },
                         Err(e) => {
                             eprintln!("{e}");
+                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                         },
                     };
                 }} => {},
@@ -282,10 +221,7 @@ impl review_protocol::request::Handler for Client {
         Ok((roxy::hostname(), usg))
     }
 
-    async fn sampling_policy_list(&mut self, policies: &[u8]) -> Result<(), String> {
-        let policies = bincode::DefaultOptions::new()
-            .deserialize::<Vec<RequestedPolicy>>(policies)
-            .map_err(|e| format!("Failed to deserialize policy: {e}"))?;
+    async fn sampling_policy_list(&mut self, policies: &[SamplingPolicy]) -> Result<(), String> {
         for policy in policies {
             if self
                 .active_policy_list
@@ -303,7 +239,7 @@ impl review_protocol::request::Handler for Client {
                 .insert(policy.id, policy.clone());
             trace!("Receive the Manager Server's policy: {:?}", policy);
             self.request_send
-                .send(policy)
+                .send(policy.clone())
                 .await
                 .map_err(|e| format!("send fail: {e}"))?;
         }
@@ -311,11 +247,8 @@ impl review_protocol::request::Handler for Client {
         Ok(())
     }
 
-    async fn delete_sampling_policy(&mut self, policy_ids: &[u8]) -> Result<(), String> {
-        let policy_ids = bincode::DefaultOptions::new()
-            .deserialize::<Vec<u32>>(policy_ids)
-            .map_err(|e| format!("Failed to deserialize policy id: {e}"))?;
-        for id in policy_ids {
+    async fn delete_sampling_policy(&mut self, policy_ids: &[u32]) -> Result<(), String> {
+        for &id in policy_ids {
             if let Some(deleted_policy) = self.active_policy_list.write().await.remove(&id) {
                 trace!("{} Deleted from runtime policy list.", deleted_policy.id);
                 self.delete_policy_ids.write().await.push(id);

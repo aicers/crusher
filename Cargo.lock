@@ -1291,7 +1291,7 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 [[package]]
 name = "review-protocol"
 version = "0.8.1"
-source = "git+https://github.com/petabi/review-protocol.git?tag=0.8.1#edc2953e80bee8129ccc84db981731ba99b02801"
+source = "git+https://github.com/petabi/review-protocol.git?rev=07edf4d#07edf4dd23b8685a7d29a27510d3598898fc7d24"
 dependencies = [
  "async-trait",
  "bincode",
