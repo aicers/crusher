@@ -1,9 +1,9 @@
 mod client;
 mod logging;
-mod model;
 mod request;
 mod settings;
 mod subscribe;
+mod time_series;
 
 use std::fs;
 use std::io::ErrorKind;
@@ -15,12 +15,12 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use client::Certs;
 use logging::init_tracing;
+use review_protocol::types::SamplingPolicy;
 use settings::Settings;
+use time_series::read_last_timestamp;
 use tokio::sync::Notify;
 use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
-
-use crate::{request::RequestedPolicy, subscribe::read_last_timestamp};
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
         &ca_certs_pem.iter().map(Vec::as_slice).collect::<Vec<_>>(),
     )?;
     let (request_send, request_recv) =
-        async_channel::bounded::<RequestedPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
+        async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
     let config_reload = Arc::new(Notify::new());
     let mut request_client = request::Client::new(
         args.manager_server.rpc_srv_addr,
@@ -141,7 +141,7 @@ async fn run(
     args: &CmdLineArgs,
     certs: &Certs,
     mut request_client: request::Client,
-    request_recv: async_channel::Receiver<RequestedPolicy>,
+    request_recv: async_channel::Receiver<SamplingPolicy>,
     config_reload: Arc<Notify>,
     guards: &mut Vec<WorkerGuard>,
 ) -> Result<()> {

@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::sync::LazyLock;
+use std::time::Duration;
 use std::{
     collections::HashMap,
     fs,
@@ -8,16 +9,13 @@ use std::{
     sync::Arc,
 };
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
-use giganto_client::publish::stream::RequestStreamRecord;
+use chrono::{DateTime, NaiveDate, Utc};
 use quinn::{crypto::rustls::QuicServerConfig, Connection, Endpoint, ServerConfig};
+use review_protocol::types::{SamplingKind, SamplingPolicy};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use super::{Client, Conn};
-use crate::{
-    client::Certs,
-    model::{Interval, Period, Policy, TimeSeries},
-};
+use crate::{client::Certs, time_series::TimeSeries};
 
 pub(crate) static TOKEN: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
 
@@ -29,6 +27,8 @@ const TEST_INGEST_PORT: u16 = 60190;
 const TEST_PUBLISH_PORT: u16 = 60191;
 const PROTOCOL_VERSION: &str = "0.4.0";
 const LAST_TIME_SERIES_PATH: &str = "tests/time_data.json";
+const SECS_PER_MINUTE: u64 = 60;
+const SECS_PER_DAY: u64 = 86_400;
 
 struct TestServer {
     server_config: ServerConfig,
@@ -153,13 +153,13 @@ async fn connection_handshake(conn: &Connection) {
         .expect("Incompatible version");
 }
 
-fn test_conn_model() -> (Policy, TimeSeries) {
+fn test_conn_model() -> (SamplingPolicy, TimeSeries) {
     (
-        Policy {
-            id: "0".to_string(),
-            kind: RequestStreamRecord::Conn,
-            interval: Interval::FifteenMinutes,
-            period: Period::OneDay,
+        SamplingPolicy {
+            id: 0,
+            kind: SamplingKind::Conn,
+            interval: Duration::from_secs(15 * SECS_PER_MINUTE),
+            period: Duration::from_secs(SECS_PER_DAY),
             offset: 32_400,
             src_ip: None,
             dst_ip: None,
@@ -181,7 +181,7 @@ fn test_conn_model() -> (Policy, TimeSeries) {
 }
 
 fn gen_conn() -> Conn {
-    let tmp_dur = Duration::nanoseconds(12345);
+    let tmp_dur = chrono::Duration::nanoseconds(12345);
 
     Conn {
         orig_addr: "192.168.4.76".parse::<IpAddr>().unwrap(),
@@ -226,7 +226,6 @@ async fn connect() {
 // period: 1day
 #[tokio::test]
 async fn timeseries_with_conn() {
-    use crate::model::time_series;
     use crate::subscribe::TimeSeries;
     const THREE_MIN: i64 = 3;
 
@@ -249,15 +248,15 @@ async fn timeseries_with_conn() {
             Utc,
         );
 
-        time_series(
-            &model,
-            &mut timeseries,
-            time,
-            &crate::subscribe::Event::Conn(conn_event),
-            &sender,
-        )
-        .await
-        .unwrap();
+        timeseries
+            .fill(
+                &model,
+                time,
+                &crate::subscribe::Event::Conn(conn_event),
+                &sender,
+            )
+            .await
+            .unwrap();
 
         min += THREE_MIN;
     }
