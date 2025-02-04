@@ -19,7 +19,7 @@ num-traits = "0.2"
 quinn = { version = "0.11", features = ["ring"] }
 review-protocol = { git = "https://github.com/petabi/review-protocol.git", features = [
     "client",
-], rev = "07edf4d" }
+], tag = "0.9.0" }
 roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.2.1" }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",

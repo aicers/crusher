@@ -9,7 +9,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Updated review-protocol to version "07edf4d" (hash).
+- Changed `REQUIRED_MANAGER_VERSION` to 0.42.0.
+- Updated review-protocol to version 0.9.0.
+  - Send the agent status to the manager.
   - Updated the signatures of `sampling_policy_list`, `delete_sampling_policy`.
   - Replaced the `RequestedPolicy`, `Policy` structs with the `SamplingPolicy`.
 

@@ -5,7 +5,7 @@ use async_channel::Sender;
 use async_trait::async_trait;
 use review_protocol::{
     client::{Connection, ConnectionBuilder},
-    types::{self as protocol_types, SamplingPolicy},
+    types::{self as protocol_types, SamplingPolicy, Status},
 };
 use tokio::{
     sync::{Notify, RwLock},
@@ -27,6 +27,7 @@ pub struct Client {
     key: Vec<u8>,
     ca_certs: Vec<Vec<u8>>,
     config_reload: Arc<Notify>,
+    status: Status,
     pub active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
     pub delete_policy_ids: Arc<RwLock<Vec<u32>>>,
 }
@@ -50,6 +51,7 @@ impl Client {
             key,
             ca_certs,
             config_reload,
+            status: Status::Ready,
             active_policy_list: Arc::new(RwLock::new(HashMap::new())),
             delete_policy_ids: Arc::new(RwLock::new(Vec::new())),
         }
@@ -113,6 +115,7 @@ impl Client {
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
             REQUIRED_MANAGER_VERSION,
+            self.status,
             &self.cert,
             &self.key,
         )?;
@@ -146,6 +149,7 @@ impl Client {
     /// and retry as needed.
     pub async fn enter_idle_mode(&mut self, health_check: bool) {
         println!("Entering idle mode");
+        self.status = Status::Idle;
         let config_reload = self.config_reload.clone();
         tokio::select! {
             () = async {
@@ -153,6 +157,7 @@ impl Client {
                     match self.try_connect(health_check).await {
                         Ok(()) => {
                             println!("The Manager server is now online");
+                            self.status = Status::Ready;
                             return
                         },
                         Err(e) => {
@@ -161,7 +166,9 @@ impl Client {
                         },
                     };
                 }} => {},
-            () = config_reload.notified() => {}
+            () = config_reload.notified() => {
+                self.status = Status::Ready;
+            }
         }
     }
 
@@ -171,10 +178,10 @@ impl Client {
             return Ok(());
         }
         let (mut send, mut recv) = connection.accept_bi().await?;
-        let mut update_handler = UpdateHandler {
+        let mut idle_mode_handler = IdleModeHandler {
             config_reload: self.config_reload.clone(),
         };
-        review_protocol::request::handle(&mut update_handler, &mut send, &mut recv).await?;
+        review_protocol::request::handle(&mut idle_mode_handler, &mut send, &mut recv).await?;
         Ok(())
     }
 }
@@ -281,12 +288,12 @@ impl review_protocol::request::Handler for Client {
     }
 }
 
-pub struct UpdateHandler {
+pub struct IdleModeHandler {
     config_reload: Arc<Notify>,
 }
 
 #[async_trait]
-impl review_protocol::request::Handler for UpdateHandler {
+impl review_protocol::request::Handler for IdleModeHandler {
     async fn update_config(&mut self) -> Result<(), String> {
         info!("Start updating configuration");
         self.config_reload.notify_one();
