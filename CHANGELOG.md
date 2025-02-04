@@ -14,6 +14,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   - Send the agent status to the manager.
   - Updated the signatures of `sampling_policy_list`, `delete_sampling_policy`.
   - Replaced the `RequestedPolicy`, `Policy` structs with the `SamplingPolicy`.
+- Updated giganto-client to version 0.22.0.
 
 ### Removed
 
