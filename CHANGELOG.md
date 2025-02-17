@@ -43,7 +43,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   be created, logs will be printed to stdout.
 - Changed `source` to `sensor`, which is a more appropriate term for the name of
   the device that sensed/captured the raw event.
-- Changed `REQUIRED_GIGANTO_VERSION` to "0.23.0".
+- Changed `REQUIRED_GIGANTO_VERSION` to 0.23.0.
 
 ### Removed
 
@@ -60,8 +60,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Correct how to refer to other required modules in the code.
   - Changed `REVIEW_PROTOCOL_VERSION` to `REQUIRED_MANAGER_VERSION`.
   - Used `REQUIRED_GIGANTO_VERSION` instead of names that include `INGEST` or `PUBLISH`.
-- Changed `REQUIRED_MANAGER_VERSION` to "0.39.0"
-- Updated review-protocol to version "0.7.0".
+- Changed `REQUIRED_MANAGER_VERSION` to 0.39.0.
+- Updated review-protocol to version 0.7.0.
   - As `get_config` was removed from `review-protocol::request::handler`,
     Removed the `get_config` related code from the crusher.
 
@@ -85,15 +85,15 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   - `giganto_ingest_address` to `giganto_ingest_srv_addr`.
   - `giganto_publish_address` to `giganto_publish_srv_addr`.
   - `review_address` to `review_rpc_srv_addr`.
-- Updated giganto-client to version "0.20.0". Updating to this version results
+- Updated giganto-client to version 0.20.0. Updating to this version results
   in the following changes.
   - Updated the version of quinn, rustls from 0.10, 0.21 to 0.11, 0.23. With the
     update to this version, the usage of the quinn and rustls crates has
     changed, so code affected by the update has also been modified.
   - Updated the protocol version of the review, giganto.
-    - Changed `REVIEW_PROTOCOL_VERSION` to "0.38.0".
-    - Changed `PUBLISH_PROTOCOL_VERSION` to "0.21.0".
-    - Changed `INGEST_PROTOCOL_VERSION` to "0.21.0".
+    - Changed `REVIEW_PROTOCOL_VERSION` to 0.38.0.
+    - Changed `PUBLISH_PROTOCOL_VERSION` to 0.21.0.
+    - Changed `INGEST_PROTOCOL_VERSION` to 0.21.0.
   - Added more network data type. (`Bootp`, `Dhcp`)
 - Changed the form of timeseries sent to giganto to `Vec<(i64,Vec<u8>)>`.
   Currently, giganto has changed to send and receive a certain number of
@@ -101,7 +101,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   For timeseries, one event is generated per period, and it takes too long
   to collect and send a certain number of timeseries events, so it was
   changed to send only one event as a vector.
-- Updated review-protocol to version "0.6.0".
+- Updated review-protocol to version 0.6.0.
   - Modified to use `ConnectionBuilder` to simplify the handling of connections
     with Central Manager.
   - As `set_config` was removed from `review-protocol::request::handler`,
@@ -111,8 +111,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Changed `REVIEW_PROTOCOL_VERSION` to "0.27.0"
-- Changed `PUBLISH_PROTOCOL_VERSION` to "0.17.0"
+- Changed `REVIEW_PROTOCOL_VERSION` to 0.27.0.
+- Changed `PUBLISH_PROTOCOL_VERSION` to 0.17.0.
 
 ## [0.3.1] - 2023-11-07
 
