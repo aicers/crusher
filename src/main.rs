@@ -61,8 +61,13 @@ pub struct CmdLineArgs {
     #[arg(long, value_name = "KEY_PATH")]
     pub key: String,
 
-    /// Path to the CA certificate files. Multiple paths can be specified by repeating this option.
-    #[arg(long, value_name = "CA_CERTS_PATH", required = true)]
+    /// Path to the CA certificate files. Multiple paths can be provided as a comma-separated list.
+    #[arg(
+        long,
+        value_name = "CA_CERTS_PATH",
+        required = true,
+        value_delimiter = ','
+    )]
     pub ca_certs: Vec<String>,
 
     /// Address of the Manager server formatted as `<server_name>@<server_ip>:<server_port>`.
