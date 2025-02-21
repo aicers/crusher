@@ -26,8 +26,7 @@ crusher \
  -c <CONFIG_PATH> \
  --cert <CERT_PATH> \
  --key <KEY_PATH> \
- --ca-certs <CA_CERTS_PATH> \
- --ca-certs <CA_CERTS_PATH> \
+ --ca-certs <CA_CERTS_PATH1>,<CA_CERTS_PATH2> \
  <SERVER_NAME>@<SERVER_IP>:<SERVER_PORT>
 ```
 
@@ -40,7 +39,8 @@ crusher \
     by the manager server.
 - `<CERT_PATH>`: Path to the certificate file (**required**).
 - `<KEY_PATH>`: Path to the private key file (**required**).
-- `<CA_CERTS_PATH>`: Path to the CA certificates file (**required**).
+- `<CA_CERTS_PATH>`: Path to the CA certificates file (**required**). Multiple
+  values can be provided as a comma-separated list.
 - `<SERVER_NAME>`: Name of the manager server. This must match with the DNS name
   in the certificate (**required**).
 - `<SERVER_IP>:<SERVER_PORT>`: The IP address and port number of the manager
