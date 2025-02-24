@@ -10,7 +10,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Changed the format of the `--ca-certs` CLI argument for multiple values
-  from `--ca-certs <PATH1> --ca-certs <PATH2>` to `--ca-certs <PATH1>[,<PATH2>]`
+  from `--ca-certs <PATH1> --ca-certs <PATH2>` to `--ca-certs <PATH1>[,<PATH2>,...]`
 
 ## [0.6.0] - 2025-02-20
 

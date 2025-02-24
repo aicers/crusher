@@ -26,7 +26,7 @@ crusher \
  -c <CONFIG_PATH> \
  --cert <CERT_PATH> \
  --key <KEY_PATH> \
- --ca-certs <CA_CERTS_PATH1>,<CA_CERTS_PATH2> \
+ --ca-certs <CA_CERTS_PATH1>[,<CA_CERTS_PATH2>,...] \
  <SERVER_NAME>@<SERVER_IP>:<SERVER_PORT>
 ```
 
