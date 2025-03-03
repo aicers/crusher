@@ -52,11 +52,11 @@ impl FromStr for Settings {
 fn default_config_builder() -> ConfigBuilder<DefaultState> {
     cfg::builder()
         .set_default("giganto_name", DEFAULT_GIGANTO_NAME)
-        .expect("verified by const datalake name")
+        .expect("verified by const data store's name")
         .set_default("giganto_ingest_srv_addr", DEFAULT_GIGANTO_INGEST_SRV_ADDR)
-        .expect("verified by const datalake ingest server address")
+        .expect("verified by const data store's ingest server address")
         .set_default("giganto_publish_srv_addr", DEFAULT_GIGANTO_PUBLISH_SRV_ADDR)
-        .expect("verified by const datalake publish server address")
+        .expect("verified by const data store's publish server address")
 }
 
 /// Deserializes a socket address.

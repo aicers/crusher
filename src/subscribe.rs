@@ -174,10 +174,10 @@ impl Client {
                 )
             )} => {
                 self.endpoint.close(0u32.into(), &[]);
-                bail!("Datalake connection error occured: {}", e);
+                bail!("Data store's connection error occurred: {}", e);
             }
             () = shutdown.notified() => {
-                info!("Shutting down Datalake client");
+                info!("Shutting down data store's client");
                 self.endpoint.close(0u32.into(), &[]);
                 shutdown.notify_one();
                 Ok(())
