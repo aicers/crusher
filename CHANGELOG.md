@@ -5,6 +5,17 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed the issue where the connection to the manager server was re-established
+  for each request instead of being reused. This caused unexpected behavior
+  where the node status was not updated on the manager server. The manager
+  server sends two consecutive requests (resource and ping) to check the node
+  status. If Crusher disconnects after handling the first request, the
+  subsequent request (ping, in this case) is not processed properly.
+
 ## [0.6.1] - 2025-03-14
 
 ### Changed
@@ -160,6 +171,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.6.1...main
 [0.6.1]: https://github.com/aicers/crusher/compare/0.6.0...0.6.1
 [0.6.0]: https://github.com/aicers/crusher/compare/0.5.0...0.6.0
 [0.5.0]: https://github.com/aicers/crusher/compare/0.4.1...0.5.0
