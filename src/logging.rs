@@ -5,6 +5,8 @@ use tracing::{info, level_filters::LevelFilter};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
+const LOG_FILE_NAME: &str = "time-series-generator.log";
+
 /// Initializes the tracing subscriber and returns a vector of `WorkerGuard` that flushes the log
 /// when dropped.
 ///
@@ -16,8 +18,7 @@ pub fn init_tracing(log_dir: Option<&Path>) -> anyhow::Result<Vec<WorkerGuard>> 
     let mut guards = vec![];
 
     let file_layer = if let Some(log_dir) = log_dir {
-        let file_name = format!("{}.log", env!("CARGO_PKG_NAME"));
-        let file_path = log_dir.join(&file_name);
+        let file_path = log_dir.join(LOG_FILE_NAME);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
