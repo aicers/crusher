@@ -1,2 +1,2 @@
 [env]
-LOG_FILE_NAME = "time_series_generator.log"
+LOG_FILENAME = "time_series_generator.log"
