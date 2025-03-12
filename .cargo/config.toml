@@ -1,0 +1,2 @@
+[env]
+LOG_FILE_NAME = "time_series_generator.log"
