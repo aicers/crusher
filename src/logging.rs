@@ -16,7 +16,7 @@ pub fn init_tracing(log_dir: Option<&Path>) -> anyhow::Result<Vec<WorkerGuard>> 
     let mut guards = vec![];
 
     let file_layer = if let Some(log_dir) = log_dir {
-        let file_path = log_dir.join(env!("LOG_FILE_NAME"));
+        let file_path = log_dir.join(env!("LOG_FILENAME"));
         let file = OpenOptions::new()
             .create(true)
             .append(true)
