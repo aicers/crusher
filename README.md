@@ -86,7 +86,7 @@ In the configuration file, you can specify the following options:
 <!-- markdownlint-enable -->
 
 - `giganto_name`: This must match with the DNS name in the certificate.
-- `log_dir`: The log file, named time-series-generator.log, is generated in the
+- `log_dir`: The log file, named time_series_generator.log, is generated in the
   specified directory. If not provided, logs are printed to stdout/stderr.
 
 ## Configuration Example
