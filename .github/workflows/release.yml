@@ -10,6 +10,14 @@ on:
         description: 'tag name'
         required: true
         default: '0.0.0'
+      runner:
+        description: 'Choose a runner'
+        required: true
+        default: 'self-hosted'
+        type: choice
+        options:
+          - self-hosted
+          - ubuntu-latest
 
 env:
   TITLE: Crusher
@@ -18,13 +26,14 @@ env:
 
 jobs:
   build-upload:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.inputs.runner || 'self-hosted' }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
       - name: Update to the Latest Version of Rust
+        if: ${{ github.event.inputs.runner == 'ubuntu-latest' }}
         run: rustup update
       - name: Build Binary
         run: |
