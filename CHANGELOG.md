@@ -11,7 +11,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Changed the format of the `--ca-certs` CLI argument for multiple values from
   `--ca-certs <PATH1> --ca-certs <PATH2>` to `--ca-certs <PATH1>[,<PATH2>,...]`.
-- Renamed the log file from crusher.log to time-series-generator.log.
+- Renamed the log file from crusher.log to time_series_generator.log.
 
 ## [0.6.0] - 2025-02-20
 
