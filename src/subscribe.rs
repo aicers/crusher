@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests;
 
+use std::path::Path;
 use std::sync::LazyLock;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, process::exit, sync::Arc};
 
@@ -156,9 +157,9 @@ impl Client {
                 ingest_connection_control(
                     receiver,
                     self.ingest_addr,
-                    self.server_name.clone(),
-                    self.endpoint.clone(),
-                    self.last_series_time_path.clone(),
+                    &self.server_name,
+                    &self.endpoint,
+                    &self.last_series_time_path,
                     REQUIRED_GIGANTO_VERSION,
                 ),
                 publish_connection_control(
@@ -170,7 +171,7 @@ impl Client {
                     &self.request_recv,
                     active_policy_list,
                     delete_policy_ids,
-                    self.last_series_time_path.clone(),
+                    &self.last_series_time_path,
                 )
             )} => {
                 self.endpoint.close(0u32.into(), &[]);
@@ -189,14 +190,14 @@ impl Client {
 async fn ingest_connection_control(
     series_recv: Receiver<TimeSeries>,
     server_addr: SocketAddr,
-    server_name: String,
-    endpoint: Endpoint,
-    last_series_time_path: PathBuf,
+    server_name: &str,
+    endpoint: &Endpoint,
+    last_series_time_path: &Path,
     version: &str,
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = Arc::new(Notify::new());
-        match ingest_connect(&endpoint, server_addr, &server_name, version).await {
+        match ingest_connect(endpoint, server_addr, server_name, version).await {
             Ok(conn) => {
                 let arc_conn = Arc::new(conn);
 
@@ -205,7 +206,7 @@ async fn ingest_connection_control(
                     LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE,
                 );
                 tokio::spawn(write_last_timestamp(
-                    last_series_time_path.clone(),
+                    last_series_time_path.to_path_buf(),
                     time_receiver,
                 ));
 
@@ -270,7 +271,7 @@ async fn publish_connection_control(
     request_recv: &Receiver<SamplingPolicy>,
     active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-    last_series_time_path: PathBuf,
+    last_series_time_path: &Path,
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = Arc::new(Notify::new());
@@ -286,7 +287,7 @@ async fn publish_connection_control(
                         connection_notify.clone(),
                         active_policy_list.clone(),
                         delete_policy_ids.clone(),
-                        last_series_time_path.clone(),
+                        last_series_time_path.to_path_buf(),
                     )
                     .await
                     {
@@ -332,7 +333,7 @@ async fn publish_connection_control(
                                 connection_notify.clone(),
                                 active_policy_list.clone(),
                                 delete_policy_ids.clone(),
-                                last_series_time_path.clone(),
+                                last_series_time_path.to_path_buf(),
                             ).await
                             {
                                 for cause in e.chain() {
