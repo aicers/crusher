@@ -43,7 +43,7 @@ const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 
 // A hashmap for data transfer to an already created asynchronous task
-pub static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
+pub(crate) static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 trait FromExt<T> {
@@ -114,7 +114,7 @@ impl ColumnValue for Rdp {}
 
 impl ColumnValue for Http {}
 
-pub struct Client {
+pub(crate) struct Client {
     ingest_addr: SocketAddr,
     publish_addr: SocketAddr,
     server_name: String,
@@ -125,7 +125,7 @@ pub struct Client {
 
 #[allow(clippy::too_many_arguments)]
 impl Client {
-    pub fn new(
+    pub(crate) fn new(
         ingest_addr: SocketAddr,
         publish_addr: SocketAddr,
         server_name: String,
@@ -145,7 +145,7 @@ impl Client {
         }
     }
 
-    pub async fn run(
+    pub(crate) async fn run(
         self,
         active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,

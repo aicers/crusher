@@ -25,7 +25,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 
 #[derive(Debug, Clone)]
-pub struct ManagerServer {
+struct ManagerServer {
     name: String,
     rpc_srv_addr: SocketAddr,
 }
@@ -48,18 +48,18 @@ impl FromStr for ManagerServer {
 
 #[derive(Parser, Debug, Clone)]
 #[command(version)]
-pub struct CmdLineArgs {
+struct CmdLineArgs {
     /// Path to the local configuration TOML file.
     #[arg(short, value_name = "CONFIG_PATH")]
-    pub config: Option<String>,
+    config: Option<String>,
 
     /// Path to the certificate file.
     #[arg(long, value_name = "CERT_PATH")]
-    pub cert: String,
+    cert: String,
 
     /// Path to the key file.
     #[arg(long, value_name = "KEY_PATH")]
-    pub key: String,
+    key: String,
 
     /// Path to the CA certificate files. Multiple paths can be provided as a comma-separated list.
     #[arg(
@@ -68,16 +68,16 @@ pub struct CmdLineArgs {
         required = true,
         value_delimiter = ','
     )]
-    pub ca_certs: Vec<String>,
+    ca_certs: Vec<String>,
 
     /// Address of the Manager server formatted as `<server_name>@<server_ip>:<server_port>`.
     #[arg(value_parser=clap::builder::ValueParser::new(ManagerServer::from_str))]
-    pub manager_server: ManagerServer,
+    manager_server: ManagerServer,
 }
 
 impl CmdLineArgs {
     #[must_use]
-    pub fn is_remote_mode(&self) -> bool {
+    fn is_remote_mode(&self) -> bool {
         self.config.is_none()
     }
 }
