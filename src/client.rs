@@ -82,3 +82,24 @@ pub(crate) fn config(certs: &Certs) -> Result<Endpoint> {
 
     Ok(endpoint)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CERT_PATH: &str = "tests/cert.pem";
+    const KEY_PATH: &str = "tests/key.pem";
+    const CA_CERT_PATH: &str = "tests/ca_cert.pem";
+
+    #[test]
+    fn test_try_new_success() {
+        let cert_pem = std::fs::read(CERT_PATH).unwrap();
+        let key_pem = std::fs::read(KEY_PATH).unwrap();
+        let ca_pem = std::fs::read(CA_CERT_PATH).unwrap();
+        let ca_certs_pem = &[ca_pem.as_slice()];
+
+        let certs = Certs::try_new(&cert_pem, &key_pem, ca_certs_pem)
+            .expect("Certs::try_new should succeed");
+        assert!(!certs.certs.is_empty());
+    }
+}
