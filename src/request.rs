@@ -22,6 +22,7 @@ const MAX_RETRIES: u8 = 3;
 pub struct Client {
     server_address: SocketAddr,
     server_name: String,
+    connection: Option<Connection>,
     request_send: Sender<SamplingPolicy>,
     cert: Vec<u8>,
     key: Vec<u8>,
@@ -46,6 +47,7 @@ impl Client {
         Client {
             server_address,
             server_name,
+            connection: None,
             request_send,
             cert,
             key,
@@ -80,6 +82,8 @@ impl Client {
                     }
                     Err(e) => {
                         error!("Failed to accept bidirectional stream: {:?}", e);
+                        sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                        continue;
                     }
                 },
                 Err(e) => {
@@ -108,7 +112,11 @@ impl Client {
         }
     }
 
-    async fn connect(&mut self) -> Result<Connection> {
+    async fn connect(&mut self) -> Result<&Connection> {
+        if let Some(ref conn) = self.connection {
+            return Ok(conn);
+        }
+
         let mut conn_builder = ConnectionBuilder::new(
             &self.server_name,
             self.server_address,
@@ -120,15 +128,14 @@ impl Client {
             &self.key,
         )?;
         conn_builder.root_certs(&self.ca_certs)?;
-        let connection = conn_builder
-            .connect()
-            .await
-            .with_context(|| "Failed to connect to the Manager server")?;
+        self.connection = Some(conn_builder.connect().await?);
         info!(
-            "Connection established to the Manager server {}",
+            "Connection established to the manager server {}",
             self.server_address
         );
-        Ok(connection)
+        self.connection
+            .as_ref()
+            .context("Failed to access to the connection")
     }
 
     pub async fn get_config(&mut self) -> Result<String> {
