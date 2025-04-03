@@ -8,7 +8,7 @@ use rustls::{
 };
 use tokio::time::Duration;
 
-pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(5_000);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(5_000);
 pub const SERVER_RETRY_INTERVAL: u64 = 3;
 
 #[allow(clippy::struct_field_names)]

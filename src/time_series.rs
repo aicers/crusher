@@ -20,7 +20,7 @@ use super::subscribe::{Event, INGEST_CHANNEL};
 const SECOND_TO_NANO: i64 = 1_000_000_000;
 
 // A hashmap for last series timestamp
-pub static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
+static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[async_trait]

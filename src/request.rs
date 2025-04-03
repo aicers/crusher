@@ -288,7 +288,7 @@ impl review_protocol::request::Handler for Client {
     }
 }
 
-pub struct IdleModeHandler {
+struct IdleModeHandler {
     config_reload: Arc<Notify>,
 }
 
