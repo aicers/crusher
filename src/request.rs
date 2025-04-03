@@ -19,7 +19,7 @@ const REQUIRED_MANAGER_VERSION: &str = "0.42.0";
 const MAX_RETRIES: u8 = 3;
 
 #[derive(Clone)]
-pub struct Client {
+pub(crate) struct Client {
     server_address: SocketAddr,
     server_name: String,
     request_send: Sender<SamplingPolicy>,
@@ -28,13 +28,13 @@ pub struct Client {
     ca_certs: Vec<Vec<u8>>,
     config_reload: Arc<Notify>,
     status: Status,
-    pub active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
-    pub delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    pub(crate) active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
+    pub(crate) delete_policy_ids: Arc<RwLock<Vec<u32>>>,
 }
 
 impl Client {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         server_address: SocketAddr,
         server_name: String,
         request_send: Sender<SamplingPolicy>,
@@ -57,7 +57,7 @@ impl Client {
         }
     }
 
-    pub async fn run(&mut self, shutdown: Arc<Notify>) -> Result<()> {
+    pub(crate) async fn run(&mut self, shutdown: Arc<Notify>) -> Result<()> {
         self.active_policy_list.write().await.clear();
         self.delete_policy_ids.write().await.clear();
         tokio::select! {
@@ -131,7 +131,7 @@ impl Client {
         Ok(connection)
     }
 
-    pub async fn get_config(&mut self) -> Result<String> {
+    pub(crate) async fn get_config(&mut self) -> Result<String> {
         info!("Fetching a configuration");
         self.connect()
             .await?
@@ -147,7 +147,7 @@ impl Client {
     /// For instance, if Crusher starts in remote mode before the Manager server is available,
     /// it should not wait for an `update_config` request. Instead, it can simply check the connection
     /// and retry as needed.
-    pub async fn enter_idle_mode(&mut self, health_check: bool) {
+    pub(crate) async fn enter_idle_mode(&mut self, health_check: bool) {
         println!("Entering idle mode");
         self.status = Status::Idle;
         let config_reload = self.config_reload.clone();
