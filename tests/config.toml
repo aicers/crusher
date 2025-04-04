@@ -1,5 +1,0 @@
-giganto_name = "localhost"
-giganto_ingest_srv_addr = "127.0.0.1:38370"
-giganto_publish_srv_addr = "127.0.0.1:38371"
-last_timestamp_data = "tests/time_data.json"
-log_dir = "tests/logs/apps"

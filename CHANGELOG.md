@@ -16,6 +16,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   status. If Crusher disconnects after handling the first request, the
   subsequent request (ping, in this case) is not processed properly.
 
+### Changed
+
+- Replaced the `log_dir` configuration option with `log_path`. The `log_path`
+  option requires a full file path, including the filename. In addition, the
+  `LOG_FILENAME` environment variable has been removed.
+
 ## [0.6.1] - 2025-03-14
 
 ### Changed
