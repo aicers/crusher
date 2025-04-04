@@ -159,7 +159,7 @@ async fn run(
         Settings::from_str(&request_client.get_config().await?)?
     };
     if guards.is_empty() {
-        guards.extend(init_tracing(settings.log_dir.as_deref())?);
+        guards.extend(init_tracing(settings.log_path.as_deref())?);
     }
     read_last_timestamp(&settings.last_timestamp_data).await?;
 
