@@ -5,6 +5,14 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Replaced the `log_dir` configuration option with `log_path`. The `log_path`
+  option requires a full file path, including the filename. In addition, the
+  `LOG_FILENAME` environment variable has been removed.
+
 ## [0.6.2] - 2025-04-08
 
 ### Fixed
@@ -171,6 +179,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.6.2...main
 [0.6.2]: https://github.com/aicers/crusher/compare/0.6.1...0.6.2
 [0.6.1]: https://github.com/aicers/crusher/compare/0.6.0...0.6.1
 [0.6.0]: https://github.com/aicers/crusher/compare/0.5.0...0.6.0
