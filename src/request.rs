@@ -83,7 +83,6 @@ impl Client {
                     Err(e) => {
                         error!("Failed to accept bidirectional stream: {:?}", e);
                         sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
-                        continue;
                     }
                 },
                 Err(e) => {
