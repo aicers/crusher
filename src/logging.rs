@@ -12,7 +12,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 ///
 /// If the runtime is in debug mode, logs will be printed to stdout in addition to the specified
 /// `log_dir`.
-pub(crate) fn init_tracing(log_dir: Option<&Path>) -> anyhow::Result<Vec<WorkerGuard>> {
+pub(super) fn init_tracing(log_dir: Option<&Path>) -> anyhow::Result<Vec<WorkerGuard>> {
     let mut guards = vec![];
 
     let file_layer = if let Some(log_dir) = log_dir {
