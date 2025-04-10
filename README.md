@@ -81,13 +81,12 @@ In the configuration file, you can specify the following options:
 | `giganto_ingest_srv_addr`  | Giganto's ingest IP address and port number                                     | Yes      | [::]:38370 |
 | `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                    | Yes      | [::]:38371 |
 | `last_timestamp_data`      | JSON file that stores the timestamp of the last time series per sampling policy | Yes      | -          |
-| `log_dir`                  | Directory for log files                                                         | No       | -          |
+| `log_path`                 | Log file path                                                                   | No       | -          |
 
 <!-- markdownlint-enable -->
 
 - `giganto_name`: This must match with the DNS name in the certificate.
-- `log_dir`: The log file, named time_series_generator.log, is generated in the
-  specified directory. If not provided, logs are printed to stdout/stderr.
+- `log_path`: If not provided, logs are printed to stdout.
 
 ## Configuration Example
 
@@ -95,8 +94,8 @@ In the configuration file, you can specify the following options:
 giganto_name = "localhost"
 giganto_ingest_srv_addr = "127.0.0.1:38370"
 giganto_publish_srv_addr = "127.0.0.1:38371"
-last_timestamp_data = "tests/time_data.json"
-log_dir = "/data/logs/apps"
+last_timestamp_data = "path/to/time_data.json"
+log_path = "path/to/time_series_generator.log"
 ```
 
 ## Copyright

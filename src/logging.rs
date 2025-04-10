@@ -8,20 +8,19 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 /// Initializes the tracing subscriber and returns a vector of `WorkerGuard` that flushes the log
 /// when dropped.
 ///
-/// If `log_dir` is `None`, logs will be printed to stdout.
+/// If `log_path` is `None`, logs will be printed to stdout.
 ///
 /// If the runtime is in debug mode, logs will be printed to stdout in addition to the specified
-/// `log_dir`.
-pub(super) fn init_tracing(log_dir: Option<&Path>) -> anyhow::Result<Vec<WorkerGuard>> {
+/// `log_path`.
+pub(super) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<Vec<WorkerGuard>> {
     let mut guards = vec![];
 
-    let file_layer = if let Some(log_dir) = log_dir {
-        let file_path = log_dir.join(env!("LOG_FILENAME"));
+    let file_layer = if let Some(log_path) = log_path {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&file_path)
-            .with_context(|| format!("Failed to open the log file: {}", file_path.display()))?;
+            .open(log_path)
+            .with_context(|| format!("Failed to open the log file: {}", log_path.display()))?;
         let (non_blocking, file_guard) = tracing_appender::non_blocking(file);
         guards.push(file_guard);
         Some(

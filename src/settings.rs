@@ -18,7 +18,7 @@ pub(super) struct Settings {
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub(super) giganto_publish_srv_addr: SocketAddr, // IP address & port to giganto
     pub(super) last_timestamp_data: PathBuf, // Path to the last series timestamp data file
-    pub(super) log_dir: Option<PathBuf>,
+    pub(super) log_path: Option<PathBuf>,
 }
 
 impl Settings {
