@@ -20,11 +20,11 @@ use super::subscribe::{Event, INGEST_CHANNEL};
 const SECOND_TO_NANO: i64 = 1_000_000_000;
 
 // A hashmap for last series timestamp
-pub static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
+static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[async_trait]
-pub trait SamplingPolicyExt {
+pub(super) trait SamplingPolicyExt {
     async fn start_timestamp(&self) -> Result<i64>;
 }
 
@@ -46,15 +46,15 @@ impl SamplingPolicyExt for SamplingPolicy {
 }
 
 #[derive(Default, Clone, Debug, Serialize)]
-pub struct TimeSeries {
-    pub(crate) sampling_policy_id: String,
+pub(super) struct TimeSeries {
+    pub(super) sampling_policy_id: String,
     #[serde(skip)]
-    pub(crate) start: DateTime<Utc>,
-    pub(crate) series: Vec<f64>,
+    pub(super) start: DateTime<Utc>,
+    pub(super) series: Vec<f64>,
 }
 
 impl TimeSeries {
-    pub async fn try_new(policy: &SamplingPolicy) -> Result<Self> {
+    pub(super) async fn try_new(policy: &SamplingPolicy) -> Result<Self> {
         let start = Utc.timestamp_nanos(policy.start_timestamp().await?);
         let len = usize::try_from(policy.period.as_secs() / policy.interval.as_secs())?;
         let series = vec![0_f64; len];
@@ -64,7 +64,7 @@ impl TimeSeries {
             series,
         })
     }
-    pub(crate) async fn fill(
+    pub(super) async fn fill(
         &mut self,
         policy: &SamplingPolicy,
         time: DateTime<Utc>,
@@ -136,7 +136,7 @@ fn start_time(policy: &SamplingPolicy, time: DateTime<Utc>) -> Result<DateTime<U
     Ok(datetime)
 }
 
-pub async fn write_last_timestamp(
+pub(super) async fn write_last_timestamp(
     last_series_time_path: PathBuf,
     time_receiver: Receiver<(String, i64)>,
 ) -> Result<()> {
@@ -154,7 +154,7 @@ pub async fn write_last_timestamp(
     Ok(())
 }
 
-pub async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
+pub(super) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
     if last_series_time_path.exists() {
         let file = File::open(last_series_time_path)
             .context("Failed to open last time series timestamp file")?;
@@ -175,7 +175,7 @@ pub async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Result<()> {
+pub(super) fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Result<()> {
     let file = File::open(last_series_time_path)?;
     let id = format!("{id}");
     let mut json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;

@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use super::{Client, Conn};
 use crate::{client::Certs, time_series::TimeSeries};
 
-pub(crate) static TOKEN: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
+static TOKEN: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
 
 const CERT_PATH: &str = "tests/cert.pem";
 const KEY_PATH: &str = "tests/key.pem";

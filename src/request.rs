@@ -19,7 +19,7 @@ const REQUIRED_MANAGER_VERSION: &str = "0.42.0";
 const MAX_RETRIES: u8 = 3;
 
 #[derive(Clone)]
-pub struct Client {
+pub(super) struct Client {
     server_address: SocketAddr,
     server_name: String,
     connection: Option<Connection>,
@@ -29,13 +29,13 @@ pub struct Client {
     ca_certs: Vec<Vec<u8>>,
     config_reload: Arc<Notify>,
     status: Status,
-    pub active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
-    pub delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    pub(super) active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
+    pub(super) delete_policy_ids: Arc<RwLock<Vec<u32>>>,
 }
 
 impl Client {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(super) fn new(
         server_address: SocketAddr,
         server_name: String,
         request_send: Sender<SamplingPolicy>,
@@ -59,7 +59,7 @@ impl Client {
         }
     }
 
-    pub async fn run(&mut self, shutdown: Arc<Notify>) -> Result<()> {
+    pub(super) async fn run(&mut self, shutdown: Arc<Notify>) -> Result<()> {
         self.active_policy_list.write().await.clear();
         self.delete_policy_ids.write().await.clear();
         tokio::select! {
@@ -137,7 +137,7 @@ impl Client {
             .context("Failed to access to the connection")
     }
 
-    pub async fn get_config(&mut self) -> Result<String> {
+    pub(super) async fn get_config(&mut self) -> Result<String> {
         info!("Fetching a configuration");
         self.connect()
             .await?
@@ -153,7 +153,7 @@ impl Client {
     /// For instance, if Crusher starts in remote mode before the Manager server is available,
     /// it should not wait for an `update_config` request. Instead, it can simply check the connection
     /// and retry as needed.
-    pub async fn enter_idle_mode(&mut self, health_check: bool) {
+    pub(super) async fn enter_idle_mode(&mut self, health_check: bool) {
         println!("Entering idle mode");
         self.status = Status::Idle;
         let config_reload = self.config_reload.clone();
@@ -294,7 +294,7 @@ impl review_protocol::request::Handler for Client {
     }
 }
 
-pub struct IdleModeHandler {
+struct IdleModeHandler {
     config_reload: Arc<Notify>,
 }
 

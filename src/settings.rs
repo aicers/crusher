@@ -11,20 +11,20 @@ const DEFAULT_GIGANTO_PUBLISH_SRV_ADDR: &str = "[::]:38371";
 
 /// The application settings.
 #[derive(Clone, Debug, Deserialize)]
-pub struct Settings {
-    pub giganto_name: String, // hostname of Giganto
+pub(super) struct Settings {
+    pub(super) giganto_name: String, // hostname of Giganto
     #[serde(deserialize_with = "deserialize_socket_addr")]
-    pub giganto_ingest_srv_addr: SocketAddr, // IP address & port to giganto
+    pub(super) giganto_ingest_srv_addr: SocketAddr, // IP address & port to giganto
     #[serde(deserialize_with = "deserialize_socket_addr")]
-    pub giganto_publish_srv_addr: SocketAddr, // IP address & port to giganto
-    pub last_timestamp_data: PathBuf, // Path to the last series timestamp data file
-    pub log_dir: Option<PathBuf>,
+    pub(super) giganto_publish_srv_addr: SocketAddr, // IP address & port to giganto
+    pub(super) last_timestamp_data: PathBuf, // Path to the last series timestamp data file
+    pub(super) log_dir: Option<PathBuf>,
 }
 
 impl Settings {
     /// Creates a new `Settings` instance, populated from the given
     /// configuration file.
-    pub fn from_file(cfg_path: &str) -> Result<Self, ConfigError> {
+    pub(super) fn from_file(cfg_path: &str) -> Result<Self, ConfigError> {
         let s = default_config_builder()
             .add_source(File::with_name(cfg_path))
             .build()?;
