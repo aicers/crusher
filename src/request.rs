@@ -13,7 +13,7 @@ use tokio::{
 };
 use tracing::{error, info, trace};
 
-use crate::client::SERVER_RETRY_INTERVAL;
+use crate::{client::SERVER_RETRY_INTERVAL, error_or_eprint, info_or_print};
 
 const REQUIRED_MANAGER_VERSION: &str = "0.42.0";
 const MAX_RETRIES: u8 = 3;
@@ -138,7 +138,7 @@ impl Client {
     }
 
     pub(super) async fn get_config(&mut self) -> Result<String> {
-        info!("Fetching a configuration");
+        info_or_print!("Fetching a configuration");
         self.connect()
             .await?
             .get_config()
@@ -154,7 +154,7 @@ impl Client {
     /// it should not wait for an `update_config` request. Instead, it can simply check the connection
     /// and retry as needed.
     pub(super) async fn enter_idle_mode(&mut self, health_check: bool) {
-        println!("Entering idle mode");
+        info_or_print!("Entering idle mode");
         self.status = Status::Idle;
         let config_reload = self.config_reload.clone();
         tokio::select! {
@@ -162,12 +162,12 @@ impl Client {
                 loop {
                     match self.try_connect(health_check).await {
                         Ok(()) => {
-                            println!("The Manager server is now online");
+                            info_or_print!("The Manager server is now online");
                             self.status = Status::Ready;
                             return
                         },
                         Err(e) => {
-                            eprintln!("{e}");
+                            error_or_eprint!("{e}");
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                         },
                     };

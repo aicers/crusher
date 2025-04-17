@@ -19,7 +19,7 @@ use review_protocol::types::SamplingPolicy;
 use settings::Settings;
 use time_series::read_last_timestamp;
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
         ca_certs_pem,
         config_reload.clone(),
     );
-    let mut guards = Vec::<WorkerGuard>::new();
+    let mut guard = None;
 
     loop {
         if let Err(e) = run(
@@ -121,16 +121,12 @@ async fn main() -> Result<()> {
             request_client.clone(),
             request_recv.clone(),
             config_reload.clone(),
-            &mut guards,
+            &mut guard,
         )
         .await
         {
             assert!(args.is_remote_mode(), "{e}");
-            if guards.is_empty() {
-                eprintln!("{e}");
-            } else {
-                error!("{e}");
-            }
+            error_or_eprint!("{e}");
             let health_check = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
                 matches!(
                     e.kind(),
@@ -148,18 +144,15 @@ async fn run(
     mut request_client: request::Client,
     request_recv: async_channel::Receiver<SamplingPolicy>,
     config_reload: Arc<Notify>,
-    guards: &mut Vec<WorkerGuard>,
+    guard: &mut Option<WorkerGuard>,
 ) -> Result<()> {
     let settings = if let Some(local_config) = args.config.as_deref() {
         Settings::from_file(local_config)?
     } else {
-        if guards.is_empty() {
-            println!("Fetching a configuration");
-        }
         Settings::from_str(&request_client.get_config().await?)?
     };
-    if guards.is_empty() {
-        guards.extend(init_tracing(settings.log_path.as_deref())?);
+    if guard.is_none() {
+        *guard = Some(init_tracing(settings.log_path.as_deref())?);
     }
     read_last_timestamp(&settings.last_timestamp_data).await?;
 
