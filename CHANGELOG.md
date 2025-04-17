@@ -7,6 +7,11 @@ this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed an issue where the connection to the manager was not re-established
+  after the manager restarted.
+
 ### Changed
 
 - Replaced the `log_dir` configuration option with `log_path`. The `log_path`

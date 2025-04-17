@@ -112,29 +112,33 @@ impl Client {
     }
 
     async fn connect(&mut self) -> Result<&Connection> {
-        if let Some(ref conn) = self.connection {
-            return Ok(conn);
+        let needs_reconnect = self
+            .connection
+            .as_ref()
+            .is_none_or(|conn| conn.close_reason().is_some());
+
+        if needs_reconnect {
+            let mut conn_builder = ConnectionBuilder::new(
+                &self.server_name,
+                self.server_address,
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                REQUIRED_MANAGER_VERSION,
+                self.status,
+                &self.cert,
+                &self.key,
+            )?;
+            conn_builder.root_certs(&self.ca_certs)?;
+            self.connection = Some(conn_builder.connect().await?);
+            info!(
+                "Connection established to the manager server {}",
+                self.server_address
+            );
         }
 
-        let mut conn_builder = ConnectionBuilder::new(
-            &self.server_name,
-            self.server_address,
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-            REQUIRED_MANAGER_VERSION,
-            self.status,
-            &self.cert,
-            &self.key,
-        )?;
-        conn_builder.root_certs(&self.ca_certs)?;
-        self.connection = Some(conn_builder.connect().await?);
-        info!(
-            "Connection established to the manager server {}",
-            self.server_address
-        );
         self.connection
             .as_ref()
-            .context("Failed to access to the connection")
+            .context("Failed to access the connection")
     }
 
     pub(crate) async fn get_config(&mut self) -> Result<String> {
