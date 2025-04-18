@@ -12,18 +12,15 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 ///
 /// If the runtime is in debug mode, logs will be printed to stdout in addition to the specified
 /// `log_path`.
-pub(super) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<Vec<WorkerGuard>> {
-    let mut guards = vec![];
-
-    let file_layer = if let Some(log_path) = log_path {
+pub(super) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<WorkerGuard> {
+    let (layer, guard) = if let Some(log_path) = log_path {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(log_path)
             .with_context(|| format!("Failed to open the log file: {}", log_path.display()))?;
         let (non_blocking, file_guard) = tracing_appender::non_blocking(file);
-        guards.push(file_guard);
-        Some(
+        (
             fmt::Layer::default()
                 .with_ansi(false)
                 .with_target(false)
@@ -33,28 +30,42 @@ pub(super) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<Vec<Worker
                         .with_default_directive(LevelFilter::INFO.into())
                         .from_env_lossy(),
                 ),
+            file_guard,
         )
     } else {
-        None
-    };
-
-    let stdout_layer = if file_layer.is_none() || cfg!(debug_assertions) {
         let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
-        guards.push(stdout_guard);
-        Some(
+        (
             fmt::Layer::default()
                 .with_ansi(true)
                 .with_writer(stdout_writer)
                 .with_filter(EnvFilter::from_default_env()),
+            stdout_guard,
         )
-    } else {
-        None
     };
 
-    tracing_subscriber::Registry::default()
-        .with(stdout_layer)
-        .with(file_layer)
-        .init();
+    tracing_subscriber::Registry::default().with(layer).init();
     info!("Initialized tracing logger");
-    Ok(guards)
+    Ok(guard)
+}
+
+#[macro_export]
+macro_rules! error_or_eprint {
+    ($($args:tt),*) => {
+        if tracing::dispatcher::has_been_set() {
+            tracing::error!($($args),*);
+        } else {
+            eprintln!($($args),*);
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! info_or_print {
+    ($($args:tt),*) => {
+        if tracing::dispatcher::has_been_set() {
+            tracing::info!($($args),*);
+        } else {
+            println!($($args),*);
+        }
+    }
 }
