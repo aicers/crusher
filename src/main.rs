@@ -3,7 +3,6 @@ mod logging;
 mod request;
 mod settings;
 mod subscribe;
-mod time_series;
 
 use std::fs;
 use std::io::ErrorKind;
@@ -17,7 +16,7 @@ use client::Certs;
 use logging::init_tracing;
 use review_protocol::types::SamplingPolicy;
 use settings::Settings;
-use time_series::read_last_timestamp;
+use subscribe::read_last_timestamp;
 use tokio::sync::Notify;
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;

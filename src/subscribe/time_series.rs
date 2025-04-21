@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use super::subscribe::{Event, INGEST_CHANNEL};
+use super::{Event, INGEST_CHANNEL};
 
 const SECOND_TO_NANO: i64 = 1_000_000_000;
 

@@ -14,8 +14,8 @@ use quinn::{crypto::rustls::QuicServerConfig, Connection, Endpoint, ServerConfig
 use review_protocol::types::{SamplingKind, SamplingPolicy};
 use tokio::sync::{Mutex, Notify, RwLock};
 
-use super::{Client, Conn};
-use crate::{client::Certs, time_series::TimeSeries};
+use super::{Client, Conn, TimeSeries};
+use crate::client::Certs;
 
 static TOKEN: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
 

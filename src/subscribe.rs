@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests;
+mod time_series;
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -25,6 +26,7 @@ use giganto_client::{
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
 use review_protocol::types::{SamplingKind, SamplingPolicy};
+use time_series::{delete_last_timestamp, write_last_timestamp, SamplingPolicyExt, TimeSeries};
 use tokio::{
     sync::{Mutex, Notify, RwLock},
     task,
@@ -32,18 +34,14 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-use crate::time_series::{delete_last_timestamp, write_last_timestamp, SamplingPolicyExt};
-use crate::{
-    client::{self, Certs, SERVER_RETRY_INTERVAL},
-    time_series::TimeSeries,
-};
+use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
 
 const REQUIRED_GIGANTO_VERSION: &str = "0.23.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 
 // A hashmap for data transfer to an already created asynchronous task
-pub(super) static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
+static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 trait FromExt<T> {
@@ -504,6 +502,10 @@ async fn receiver(
         }
     }
     Ok(())
+}
+
+pub(crate) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
+    time_series::read_last_timestamp(last_series_time_path).await
 }
 
 async fn send_time_series(
