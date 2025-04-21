@@ -60,7 +60,7 @@ impl FromExt<SamplingKind> for RequestStreamRecord {
 }
 
 #[allow(clippy::large_enum_variant)]
-pub(super) enum Event {
+enum Event {
     Conn(Conn),
     Dns(Dns),
     Http(Http),
@@ -68,7 +68,7 @@ pub(super) enum Event {
 }
 
 impl Event {
-    pub(super) fn column_value(&self, column: u32) -> f64 {
+    fn column_value(&self, column: u32) -> f64 {
         match self {
             Self::Conn(evt) => evt.column_value(column),
             Self::Dns(evt) => evt.column_value(column),
@@ -112,7 +112,7 @@ impl ColumnValue for Rdp {}
 
 impl ColumnValue for Http {}
 
-pub(super) struct Client {
+pub(crate) struct Client {
     ingest_addr: SocketAddr,
     publish_addr: SocketAddr,
     server_name: String,
@@ -123,7 +123,7 @@ pub(super) struct Client {
 
 #[allow(clippy::too_many_arguments)]
 impl Client {
-    pub(super) fn new(
+    pub(crate) fn new(
         ingest_addr: SocketAddr,
         publish_addr: SocketAddr,
         server_name: String,
@@ -143,7 +143,7 @@ impl Client {
         }
     }
 
-    pub(super) async fn run(
+    pub(crate) async fn run(
         self,
         active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,

@@ -12,7 +12,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 ///
 /// If the runtime is in debug mode, logs will be printed to stdout in addition to the specified
 /// `log_path`.
-pub(super) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<WorkerGuard> {
+pub(crate) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<WorkerGuard> {
     let (layer, guard) = if let Some(log_path) = log_path {
         let file = OpenOptions::new()
             .create(true)
