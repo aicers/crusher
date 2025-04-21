@@ -13,8 +13,8 @@ use tokio::{
 };
 use tracing::{error, info, trace};
 
+use crate::{audit_error_log, audit_info_log};
 use crate::{client::SERVER_RETRY_INTERVAL, error_or_eprint, info_or_print};
-
 const REQUIRED_MANAGER_VERSION: &str = "0.42.0";
 const MAX_RETRIES: u8 = 3;
 
@@ -67,7 +67,7 @@ impl Client {
                 bail!(e);
             }
             () = shutdown.notified() => {
-                info!("Shutting down request handler");
+                audit_info_log!("1000301", "Shutdown request received.");
             }
         };
         Ok(())
@@ -81,7 +81,12 @@ impl Client {
                         review_protocol::request::handle(self, &mut send, &mut recv).await?;
                     }
                     Err(e) => {
-                        error!("Failed to accept bidirectional stream: {:?}", e);
+                        audit_error_log!(
+                            "1000302",
+                            "Disconnected from manager server. Failed to accept bidirectional \
+                            stream: {:?}",
+                            e
+                        );
                         sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                     }
                 },
@@ -91,9 +96,12 @@ impl Client {
                             ErrorKind::ConnectionAborted
                             | ErrorKind::ConnectionReset
                             | ErrorKind::TimedOut => {
-                                error!(
-                                    "Retry connection to {} after {} seconds.",
-                                    self.server_address, SERVER_RETRY_INTERVAL,
+                                audit_error_log!(
+                                    "1000303",
+                                    "Disconnected from manager server. Retry connection to {} \
+                                    after {} seconds.",
+                                    self.server_address,
+                                    SERVER_RETRY_INTERVAL
                                 );
                                 sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                                 continue;
@@ -128,8 +136,9 @@ impl Client {
         )?;
         conn_builder.root_certs(&self.ca_certs)?;
         self.connection = Some(conn_builder.connect().await?);
-        info!(
-            "Connection established to the manager server {}",
+        audit_info_log!(
+            "1000304",
+            "Connected to manager server at {}",
             self.server_address
         );
         self.connection
@@ -195,6 +204,7 @@ impl Client {
 #[async_trait]
 impl review_protocol::request::Handler for Client {
     async fn reboot(&mut self) -> Result<(), String> {
+        audit_info_log!("1000305", "Reboot request received.");
         for attempt in 1..=MAX_RETRIES {
             if let Err(e) = roxy::reboot() {
                 if attempt == MAX_RETRIES {
@@ -209,6 +219,7 @@ impl review_protocol::request::Handler for Client {
     }
 
     async fn shutdown(&mut self) -> Result<(), String> {
+        audit_info_log!("1000306", "Shutdown request received.");
         for attempt in 1..=MAX_RETRIES {
             if let Err(e) = roxy::power_off() {
                 if attempt == MAX_RETRIES {
@@ -250,7 +261,12 @@ impl review_protocol::request::Handler for Client {
                 .write()
                 .await
                 .insert(policy.id, policy.clone());
-            trace!("Receive the Manager Server's policy: {:?}", policy);
+            audit_info_log!(
+                "1000307",
+                "Request to update time series policy list received. Receive the Manager Server's\
+                 policy: {:?}",
+                policy
+            );
             self.request_send
                 .send(policy.clone())
                 .await
@@ -263,7 +279,11 @@ impl review_protocol::request::Handler for Client {
     async fn delete_sampling_policy(&mut self, policy_ids: &[u32]) -> Result<(), String> {
         for &id in policy_ids {
             if let Some(deleted_policy) = self.active_policy_list.write().await.remove(&id) {
-                trace!("{} Deleted from runtime policy list.", deleted_policy.id);
+                audit_info_log!(
+                    "1000308",
+                    "Request to delete time series policy {} received.",
+                    deleted_policy.id
+                );
                 self.delete_policy_ids.write().await.push(id);
             }
         }
@@ -272,7 +292,7 @@ impl review_protocol::request::Handler for Client {
     }
 
     async fn update_config(&mut self) -> Result<(), String> {
-        info!("Start updating configuration");
+        audit_info_log!("1000309", "Configuration update request received");
         self.config_reload.notify_one();
         Ok(())
     }
@@ -301,7 +321,7 @@ struct IdleModeHandler {
 #[async_trait]
 impl review_protocol::request::Handler for IdleModeHandler {
     async fn update_config(&mut self) -> Result<(), String> {
-        info!("Start updating configuration");
+        audit_info_log!("1000310", "Configuration update request received.");
         self.config_reload.notify_one();
         Ok(())
     }

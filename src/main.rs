@@ -4,6 +4,7 @@ mod request;
 mod settings;
 mod subscribe;
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -15,12 +16,15 @@ use clap::Parser;
 use client::Certs;
 use logging::init_tracing;
 use review_protocol::types::SamplingPolicy;
+use rustls::pki_types::CertificateDer;
 use settings::Settings;
 use subscribe::read_last_timestamp;
 use tokio::sync::Notify;
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
+use x509_parser::parse_x509_certificate;
 
+use crate::logging::DAEMON_ID;
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 
 #[derive(Debug, Clone)]
@@ -99,6 +103,7 @@ async fn main() -> Result<()> {
         &key_pem,
         &ca_certs_pem.iter().map(Vec::as_slice).collect::<Vec<_>>(),
     )?;
+
     let (request_send, request_recv) =
         async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
     let config_reload = Arc::new(Notify::new());
@@ -112,6 +117,10 @@ async fn main() -> Result<()> {
         config_reload.clone(),
     );
     let mut guard = None;
+
+    if let Some(subject) = subject_from_cert(&certs.certs) {
+        DAEMON_ID.set(Cow::Owned(subject)).ok();
+    }
 
     loop {
         if let Err(e) = run(
@@ -187,8 +196,20 @@ async fn run(
         () = config_reload.notified(), if args.is_remote_mode() => {
             shutdown.notify_waiters();
             shutdown.notified().await;
-            info!("Reloading the configuration");
+            audit_info_log!("1000101", "Configuration update request received.");
         },
     };
     Ok(())
+}
+
+fn subject_from_cert(certs: &Vec<CertificateDer<'static>>) -> Option<String> {
+    for cert in certs {
+        let der = cert.as_ref();
+        if let Ok((_, parsed)) = parse_x509_certificate(der) {
+            if let Some(cn) = parsed.subject().iter_common_name().next() {
+                return Some(cn.as_str().expect("Failed to get subject.").to_string());
+            }
+        }
+    }
+    None
 }

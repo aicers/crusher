@@ -34,7 +34,10 @@ use tokio::{
 };
 use tracing::{error, info, trace, warn};
 
-use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
+use crate::{
+    audit_error_log, audit_info_log,
+    client::{self, Certs, SERVER_RETRY_INTERVAL},
+};
 
 const REQUIRED_GIGANTO_VERSION: &str = "0.23.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
@@ -176,7 +179,7 @@ impl Client {
                 bail!("Data store's connection error occurred: {}", e);
             }
             () = shutdown.notified() => {
-                info!("Shutting down data store's client");
+                audit_info_log!("1000201", "Shutdown request received.");
                 self.endpoint.close(0u32.into(), &[]);
                 shutdown.notify_one();
                 Ok(())
@@ -213,8 +216,9 @@ async fn ingest_connection_control(
                         () = connection_notify.notified() => {
                             drop(connection_notify);
                             INGEST_CHANNEL.write().await.clear();
-                            error!(
-                                "Stream channel closed. Retry connection to {}",
+                            audit_error_log!(
+                                "1000202",
+                                "Disconnected from data store ingest server. Retry connection to {}",
                                 server_addr,
                             );
                             continue 'connection;
@@ -239,9 +243,12 @@ async fn ingest_connection_control(
                         | ConnectionError::ApplicationClosed(_)
                         | ConnectionError::Reset
                         | ConnectionError::TimedOut => {
-                            error!(
-                                "Retry connection to {} after {} seconds.",
-                                server_addr, SERVER_RETRY_INTERVAL,
+                            audit_error_log!(
+                                "1000203",
+                                "Disconnected from data store ingest server. Retry connection to \
+                                {} after {} seconds.",
+                                server_addr,
+                                SERVER_RETRY_INTERVAL
                             );
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                             continue;
@@ -315,8 +322,10 @@ async fn publish_connection_control(
                     tokio::select! {
                         () = connection_notify.notified() => {
                             drop(connection_notify);
-                            error!(
-                                "Stream channel closed. Retry connection to {} after {} seconds.",
+                            audit_error_log!(
+                                "1000204",
+                                "Disconnected from data store publish server. Retry connection to\
+                                 {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
                             );
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
@@ -363,9 +372,12 @@ async fn publish_connection_control(
                         | ConnectionError::ApplicationClosed(_)
                         | ConnectionError::Reset
                         | ConnectionError::TimedOut => {
-                            error!(
-                                "Retry connection to {} after {} seconds.",
-                                server_addr, SERVER_RETRY_INTERVAL,
+                            audit_error_log!(
+                                "1000205",
+                                "Disconnected from data store publish server. Retry connection to\
+                                 {} after {} seconds.",
+                                server_addr,
+                                SERVER_RETRY_INTERVAL
                             );
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                             continue;
@@ -391,7 +403,11 @@ async fn ingest_connect(
 ) -> Result<Connection> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
     client_handshake(&conn, version).await?;
-    info!("Connection established to server {}", server_address);
+    audit_info_log!(
+        "1000206",
+        "Connected to data store ingest server at {}",
+        server_address
+    );
     Ok(conn)
 }
 
@@ -403,7 +419,11 @@ async fn publish_connect(
 ) -> Result<(Connection, SendStream)> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
     let (send, _) = client_handshake(&conn, version).await?;
-    info!("Connection established to server {}", server_address);
+    audit_info_log!(
+        "1000207",
+        "Connected to data store publish server at {}",
+        server_address
+    );
     Ok((conn, send))
 }
 
