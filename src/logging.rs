@@ -1,9 +1,13 @@
+use std::borrow::Cow;
+use std::sync::OnceLock;
 use std::{fs::OpenOptions, path::Path};
 
 use anyhow::Context;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+
+pub(super) static DAEMON_ID: OnceLock<Cow<'static, str>> = OnceLock::new();
 
 /// Initializes the tracing subscriber and returns a vector of `WorkerGuard` that flushes the log
 /// when dropped.
@@ -68,4 +72,180 @@ macro_rules! info_or_print {
             println!($($args),*);
         }
     }
+}
+
+#[macro_export]
+macro_rules! custom_log {
+    (
+        $level:expr,
+        $log_index:expr,
+        $account:expr,
+        $msg:literal,
+        $($arg:expr),+ $(,)?
+    ) => {{
+        use tracing::{Level, info, warn, error, debug, trace};
+
+        if tracing::enabled!($level) {
+            let daemon_id = $crate::logging::DAEMON_ID
+                .get()
+                .map(|v| v.as_ref())
+                .unwrap_or("unknown");
+
+            let formatted_message = format!($msg, $($arg),+);
+
+            let log_line = format!(
+                "| {} | {} | {} | {}",
+                daemon_id,
+                $log_index,
+                $account,
+                formatted_message
+            );
+
+            match $level {
+                Level::INFO => info!("{}", log_line),
+                Level::WARN => warn!("{}", log_line),
+                Level::ERROR => error!("{}", log_line),
+                Level::DEBUG => debug!("{}", log_line),
+                Level::TRACE => trace!("{}", log_line),
+            }
+        }
+    }};
+
+    (
+        $level:expr,
+        $log_index:expr,
+        $account:expr,
+        $msg:literal
+    ) => {{
+        $crate::custom_log!($level, $log_index, $account, "{}", $msg);
+    }};
+
+    (
+        $level:expr,
+        $log_index:expr,
+        $msg:literal,
+        $($arg:expr),+ $(,)?
+    ) => {{
+        $crate::custom_log!(
+            $level,
+            $log_index,
+            "",
+            $msg,
+            $($arg),+
+        );
+    }};
+
+    (
+        $level:expr,
+        $log_index:expr,
+        $msg:literal
+    ) => {{
+        $crate::custom_log!(
+            $level,
+            $log_index,
+            "",
+            "{}",
+            $msg
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! audit_trace_log {
+    ($log_index:expr, $account:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::TRACE,
+            $log_index,
+            $account,
+            $msg $(, $($arg)* )?
+        );
+    };
+    ($log_index:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::TRACE,
+            $log_index,
+            "",
+            $msg $(, $($arg)* )?
+        );
+    };
+}
+
+#[macro_export]
+macro_rules! audit_debug_log {
+    ($log_index:expr, $account:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::DEBUG,
+            $log_index,
+            $account,
+            $msg $(, $($arg)* )?
+        );
+    };
+    ($log_index:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::DEBUG,
+            $log_index,
+            "",
+            $msg $(, $($arg)* )?
+        );
+    };
+}
+
+#[macro_export]
+macro_rules! audit_info_log {
+    ($log_index:expr, $account:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::INFO,
+            $log_index,
+            $account,
+            $msg $(, $($arg)* )?
+        );
+    };
+    ($log_index:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::INFO,
+            $log_index,
+            "",
+            $msg $(, $($arg)* )?
+        )
+    };
+}
+
+#[macro_export]
+macro_rules! audit_warn_log {
+    ($log_index:expr, $account:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::WARN,
+            $log_index,
+            $account,
+            $msg $(, $($arg)* )?
+        );
+    };
+    ($log_index:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::WARN,
+            $log_index,
+            "",
+            $msg $(, $($arg)* )?
+        );
+    };
+}
+
+#[macro_export]
+macro_rules! audit_error_log {
+    ($log_index:expr, $account:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::ERROR,
+            $log_index,
+            $account,
+            $msg $(, $($arg)* )?
+        );
+    };
+    ($log_index:expr, $msg:literal $(, $($arg:tt)* )?) => {
+        $crate::custom_log!(
+            tracing::Level::ERROR,
+            $log_index,
+            "",
+            $msg $(, $($arg)* )?
+        );
+    };
 }
