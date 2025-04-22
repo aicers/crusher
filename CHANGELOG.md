@@ -9,8 +9,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Fixed an issue where the connection to the manager was not re-established
-  after the manager restarted.
+- Fixed bugs where the connections to the manager and data-store were not
+  re-established after either application was restarted.
 
 ### Changed
 
