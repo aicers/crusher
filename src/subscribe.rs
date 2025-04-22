@@ -150,6 +150,7 @@ impl Client {
         shutdown: Arc<Notify>,
     ) -> Result<()> {
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
+        let connection_notify = Arc::new(Notify::new());
         tokio::select! {
             Err(e) = async {tokio::try_join!(
                 ingest_connection_control(
@@ -159,6 +160,7 @@ impl Client {
                     &self.endpoint,
                     &self.last_series_time_path,
                     REQUIRED_GIGANTO_VERSION,
+                    connection_notify.clone(),
                 ),
                 publish_connection_control(
                     sender,
@@ -170,6 +172,7 @@ impl Client {
                     active_policy_list,
                     delete_policy_ids,
                     &self.last_series_time_path,
+                    connection_notify.clone(),
                 )
             )} => {
                 self.endpoint.close(0u32.into(), &[]);
@@ -192,9 +195,10 @@ async fn ingest_connection_control(
     endpoint: &Endpoint,
     last_series_time_path: &Path,
     version: &str,
+    connection_notify: Arc<Notify>,
 ) -> Result<()> {
     'connection: loop {
-        let connection_notify = Arc::new(Notify::new());
+        let connection_notify = connection_notify.clone();
         match ingest_connect(endpoint, server_addr, server_name, version).await {
             Ok(conn) => {
                 let arc_conn = Arc::new(conn);
@@ -270,9 +274,10 @@ async fn publish_connection_control(
     active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     last_series_time_path: &Path,
+    connection_notify: Arc<Notify>,
 ) -> Result<()> {
     'connection: loop {
-        let connection_notify = Arc::new(Notify::new());
+        let connection_notify = connection_notify.clone();
         match publish_connect(endpoint, server_addr, server_name, version).await {
             Ok((conn, send)) => {
                 let req_send = Arc::new(Mutex::new(send));
@@ -319,6 +324,15 @@ async fn publish_connection_control(
                                 "Stream channel closed. Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
                             );
+                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                            continue 'connection;
+                        }
+                        err = conn.closed() => {
+                            error!(
+                                "Stream channel closed: {:?}. Retry connection to {} after {} seconds.",
+                                err, server_addr, SERVER_RETRY_INTERVAL,
+                            );
+                            connection_notify.notify_waiters();
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                             continue 'connection;
                         }
@@ -458,7 +472,7 @@ async fn receiver(
 ) -> Result<()> {
     if let Ok(mut recv) = conn.accept_uni().await {
         let Ok(id) = receive_time_series_generator_stream_start_message(&mut recv).await else {
-            connection_notify.notify_one();
+            connection_notify.notify_waiters();
             warn!("Failed to receive stream id value");
             bail!("Failed to receive stream id value");
         };
@@ -496,7 +510,7 @@ async fn receiver(
                     error!("Failed to generate time series: {}", e);
                 }
             } else {
-                connection_notify.notify_one();
+                connection_notify.notify_waiters();
                 break;
             }
         }
@@ -579,7 +593,7 @@ async fn receive_time_series_timestamp(
                 break;
             }
             Err(e) => {
-                connection_notify.notify_one();
+                connection_notify.notify_waiters();
                 bail!("Last series times error: {}", e);
             }
         }
