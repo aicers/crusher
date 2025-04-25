@@ -33,10 +33,10 @@ crusher \
 ## Arguments
 
 - `<CONFIG_PATH>`: Path to the TOML configuration file (optional).
-  - If provided, Crusher runs in local mode, ignoring configuration updates
-    from the manager server.
-  - If omitted, Crusher runs in remote mode, with its configuration managed
-    by the manager server.
+  - If provided, Crusher runs in local mode, ignoring configuration updates from
+    the manager server.
+  - If omitted, Crusher runs in remote mode, with its configuration managed by
+    the manager server.
 - `<CERT_PATH>`: Path to the certificate file (**required**).
 - `<KEY_PATH>`: Path to the private key file (**required**).
 - `<CA_CERTS_PATH>`: Path to the CA certificates file (**required**). Multiple
