@@ -5,13 +5,11 @@ use tracing::{info, level_filters::LevelFilter};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-/// Initializes the tracing subscriber and returns a vector of `WorkerGuard` that flushes the log
-/// when dropped.
+/// Initializes the tracing subscriber and returns a `WorkerGuard`.
 ///
+/// Logs will be written to the file specified by `log_path` if provided.
 /// If `log_path` is `None`, logs will be printed to stdout.
 ///
-/// If the runtime is in debug mode, logs will be printed to stdout in addition to the specified
-/// `log_path`.
 pub(crate) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<WorkerGuard> {
     let (layer, guard) = if let Some(log_path) = log_path {
         let file = OpenOptions::new()
