@@ -5,7 +5,7 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.3] - 2025-05-26
 
 ### Fixed
 
@@ -186,7 +186,7 @@ this project adheres to
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
-[Unreleased]: https://github.com/aicers/crusher/compare/0.6.2...main
+[0.6.3]: https://github.com/aicers/crusher/compare/0.6.2...0.6.3
 [0.6.2]: https://github.com/aicers/crusher/compare/0.6.1...0.6.2
 [0.6.1]: https://github.com/aicers/crusher/compare/0.6.0...0.6.1
 [0.6.0]: https://github.com/aicers/crusher/compare/0.5.0...0.6.0
