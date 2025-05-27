@@ -2,8 +2,7 @@
 
 This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
-this project adheres to
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.6.3] - 2025-05-26
 
@@ -25,9 +24,9 @@ this project adheres to
 - Fixed the issue where the connection to the manager server was re-established
   for each request instead of being reused. This caused unexpected behavior
   where the node status was not updated on the manager server. The manager
-  server sends two consecutive requests (resource and ping) to check the node
-  status. If Crusher disconnects after handling the first request, the
-  subsequent request (ping, in this case) is not processed properly.
+  server sends two consecutive requests (resource and ping) to check the node status.
+  If Crusher disconnects after handling the first request, the subsequent
+  request (ping, in this case) is not processed properly.
 
 ## [0.6.1] - 2025-03-14
 
@@ -91,8 +90,7 @@ this project adheres to
 
 - Correct how to refer to other required modules in the code.
   - Changed `REVIEW_PROTOCOL_VERSION` to `REQUIRED_MANAGER_VERSION`.
-  - Used `REQUIRED_GIGANTO_VERSION` instead of names that include `INGEST` or
-    `PUBLISH`.
+  - Used `REQUIRED_GIGANTO_VERSION` instead of names that include `INGEST` or `PUBLISH`.
 - Changed `REQUIRED_MANAGER_VERSION` to 0.39.0.
 - Updated review-protocol to version 0.7.0.
   - As `get_config` was removed from `review-protocol::request::handler`,
@@ -114,8 +112,7 @@ this project adheres to
 - Modified logging behavior for debug and release builds
 - Changed logs to stdout and file
 - Changed configuration fields name.
-  - `roots` to `ca_certs`. It also introduces support for multiple CA
-    certificates.
+  - `roots` to `ca_certs`. It also introduces support for multiple CA certificates.
   - `giganto_ingest_address` to `giganto_ingest_srv_addr`.
   - `giganto_publish_address` to `giganto_publish_srv_addr`.
   - `review_address` to `review_rpc_srv_addr`.
