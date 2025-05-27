@@ -496,8 +496,8 @@ async fn receiver(
                     .retain(|&delete_id| delete_id != id);
                 break;
             }
-            match receive_time_series_generator_data(&mut recv).await
-            { Ok((raw_event, timestamp)) => {
+            if let Ok((raw_event, timestamp)) = receive_time_series_generator_data(&mut recv).await
+            {
                 let time = Utc.timestamp_nanos(timestamp);
                 let Ok(event) = Event::try_new(policy.kind, &raw_event) else {
                     error!(
@@ -509,10 +509,10 @@ async fn receiver(
                 if let Err(e) = series.fill(&policy, time, &event, &sender).await {
                     error!("Failed to generate time series: {}", e);
                 }
-            } _ => {
+            } else {
                 connection_notify.notify_waiters();
                 break;
-            }}
+            }
         }
     }
     Ok(())
