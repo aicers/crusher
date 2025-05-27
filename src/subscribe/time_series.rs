@@ -6,7 +6,7 @@ use std::{
     sync::LazyLock,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Timelike, Utc};

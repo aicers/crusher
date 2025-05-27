@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
-use quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Endpoint, TransportConfig};
+use anyhow::{Context, Result, anyhow};
+use quinn::{ClientConfig, Endpoint, TransportConfig, crypto::rustls::QuicClientConfig};
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
     RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer},
 };
 use tokio::time::Duration;
 

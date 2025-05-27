@@ -2,8 +2,8 @@
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
-use config::{builder::DefaultState, Config as cfg, ConfigBuilder, ConfigError, File};
-use serde::{de::Error, Deserialize, Deserializer};
+use config::{Config as cfg, ConfigBuilder, ConfigError, File, builder::DefaultState};
+use serde::{Deserialize, Deserializer, de::Error};
 
 const DEFAULT_GIGANTO_NAME: &str = "localhost";
 const DEFAULT_GIGANTO_INGEST_SRV_ADDR: &str = "[::]:38370";
