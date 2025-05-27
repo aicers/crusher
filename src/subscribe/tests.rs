@@ -10,7 +10,7 @@ use std::{
 };
 
 use chrono::{DateTime, NaiveDate, Utc};
-use quinn::{crypto::rustls::QuicServerConfig, Connection, Endpoint, ServerConfig};
+use quinn::{Connection, Endpoint, ServerConfig, crypto::rustls::QuicServerConfig};
 use review_protocol::types::{SamplingKind, SamplingPolicy};
 use tokio::sync::{Mutex, Notify, RwLock};
 

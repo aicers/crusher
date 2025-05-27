@@ -6,12 +6,13 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, process::exit, sync::Arc};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_channel::{Receiver, Sender};
 use chrono::{TimeZone, Utc};
 use giganto_client::{
+    RawEventKind,
     connection::client_handshake,
-    frame::{send_raw, RecvError},
+    frame::{RecvError, send_raw},
     ingest::{
         network::{Conn, Dns, Http, Rdp},
         receive_ack_timestamp, send_record_header,
@@ -21,16 +22,15 @@ use giganto_client::{
         send_stream_request,
         stream::{NodeType, RequestStreamRecord, RequestTimeSeriesGeneratorStream},
     },
-    RawEventKind,
 };
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
 use review_protocol::types::{SamplingKind, SamplingPolicy};
-use time_series::{delete_last_timestamp, write_last_timestamp, SamplingPolicyExt, TimeSeries};
+use time_series::{SamplingPolicyExt, TimeSeries, delete_last_timestamp, write_last_timestamp};
 use tokio::{
     sync::{Mutex, Notify, RwLock},
     task,
-    time::{sleep, Duration},
+    time::{Duration, sleep},
 };
 use tracing::{error, info, trace, warn};
 
