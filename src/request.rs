@@ -200,13 +200,13 @@ impl Client {
 impl review_protocol::request::Handler for Client {
     async fn reboot(&mut self) -> Result<(), String> {
         for attempt in 1..=MAX_RETRIES {
-            if let Err(e) = roxy::reboot() {
+            match roxy::reboot() { Err(e) => {
                 if attempt == MAX_RETRIES {
                     return Err(format!("cannot restart the system: {e}"));
                 }
-            } else {
+            } _ => {
                 return Ok(());
-            }
+            }}
         }
 
         Err(String::from("cannot restart the system"))
@@ -214,13 +214,13 @@ impl review_protocol::request::Handler for Client {
 
     async fn shutdown(&mut self) -> Result<(), String> {
         for attempt in 1..=MAX_RETRIES {
-            if let Err(e) = roxy::power_off() {
+            match roxy::power_off() { Err(e) => {
                 if attempt == MAX_RETRIES {
                     return Err(format!("cannot shutdown the system: {e}"));
                 }
-            } else {
+            } _ => {
                 return Ok(());
-            }
+            }}
         }
 
         Err(String::from("cannot shutdown the system"))
