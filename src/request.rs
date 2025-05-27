@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, process::exit, sync::Arc};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_channel::Sender;
 use async_trait::async_trait;
 use review_protocol::{
@@ -9,7 +9,7 @@ use review_protocol::{
 };
 use tokio::{
     sync::{Notify, RwLock},
-    time::{sleep, Duration},
+    time::{Duration, sleep},
 };
 use tracing::{error, info, trace};
 
@@ -174,7 +174,7 @@ impl Client {
                             error_or_eprint!("{e}");
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                         },
-                    };
+                    }
                 }} => {},
             () = config_reload.notified() => {
                 self.status = Status::Ready;
