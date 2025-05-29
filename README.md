@@ -73,7 +73,7 @@ crusher \
 
 In the configuration file, you can specify the following options:
 
-<!-- markdownlint-disable -->
+<!-- markdownlint-disable MD013 -->
 
 | Field                      | Description                                                                     | Required | Default    |
 | -------------------------- | ------------------------------------------------------------------------------- | -------- | ---------- |
