@@ -73,7 +73,7 @@ crusher \
 
 In the configuration file, you can specify the following options:
 
-<!-- markdownlint-disable -->
+<!-- markdownlint-disable MD013 -->
 
 | Field                      | Description                                                                     | Required | Default    |
 | -------------------------- | ------------------------------------------------------------------------------- | -------- | ---------- |
@@ -83,7 +83,7 @@ In the configuration file, you can specify the following options:
 | `last_timestamp_data`      | JSON file that stores the timestamp of the last time series per sampling policy | Yes      | -          |
 | `log_path`                 | Log file path                                                                   | No       | -          |
 
-<!-- markdownlint-enable -->
+<!-- markdownlint-enable MD013 -->
 
 - `giganto_name`: This must match with the DNS name in the certificate.
 - `log_path`: If not provided, logs are printed to stdout.
