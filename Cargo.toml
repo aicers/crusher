@@ -13,11 +13,13 @@ bincode = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", features = ["toml"], default-features = false }
-giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.23.0", version = "0.23.0" }
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.23.0" }
 num_enum = "0.7"
 num-traits = "0.2"
 quinn = { version = "0.11", features = ["ring"] }
-review-protocol = { git = "https://github.com/petabi/review-protocol.git", features = ["client"], tag = "0.11.0", version = "0.11.0" }
+review-protocol = { git = "https://github.com/petabi/review-protocol.git", features = [
+    "client",
+], tag = "0.11.0" }
 roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.3.0" }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
