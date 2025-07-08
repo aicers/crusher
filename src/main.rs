@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
         .await
         {
             assert!(args.is_remote_mode(), "{e}");
-            error_or_eprint!("{e}");
+            error_or_eprint!("Main processing encountered an error: {e}");
             let health_check = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
                 matches!(
                     e.kind(),

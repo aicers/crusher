@@ -32,7 +32,7 @@ use tokio::{
     task,
     time::{Duration, sleep},
 };
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
 
@@ -217,7 +217,7 @@ async fn ingest_connection_control(
                         () = connection_notify.notified() => {
                             drop(connection_notify);
                             INGEST_CHANNEL.write().await.clear();
-                            error!(
+                            warn!(
                                 "Stream channel closed. Retry connection to {}",
                                 server_addr,
                             );
@@ -243,7 +243,7 @@ async fn ingest_connection_control(
                         | ConnectionError::ApplicationClosed(_)
                         | ConnectionError::Reset
                         | ConnectionError::TimedOut => {
-                            error!(
+                            warn!(
                                 "Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
                             );
@@ -320,7 +320,7 @@ async fn publish_connection_control(
                     tokio::select! {
                         () = connection_notify.notified() => {
                             drop(connection_notify);
-                            error!(
+                            warn!(
                                 "Stream channel closed. Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
                             );
@@ -328,7 +328,7 @@ async fn publish_connection_control(
                             continue 'connection;
                         }
                         err = conn.closed() => {
-                            error!(
+                            warn!(
                                 "Stream channel closed: {:?}. Retry connection to {} after {} seconds.",
                                 err, server_addr, SERVER_RETRY_INTERVAL,
                             );
@@ -377,7 +377,7 @@ async fn publish_connection_control(
                         | ConnectionError::ApplicationClosed(_)
                         | ConnectionError::Reset
                         | ConnectionError::TimedOut => {
-                            error!(
+                            warn!(
                                 "Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
                             );
@@ -500,14 +500,14 @@ async fn receiver(
             {
                 let time = Utc.timestamp_nanos(timestamp);
                 let Ok(event) = Event::try_new(policy.kind, &raw_event) else {
-                    error!(
+                    warn!(
                         "Failed to deserialize raw_event for sampling kind: {:?}",
                         policy.kind
                     );
                     continue;
                 };
                 if let Err(e) = series.fill(&policy, time, &event, &sender).await {
-                    error!("Failed to generate time series: {}", e);
+                    warn!("Failed to generate time series: {}", e);
                 }
             } else {
                 connection_notify.notify_waiters();
@@ -580,7 +580,7 @@ async fn receive_time_series_timestamp(
     loop {
         match receive_ack_timestamp(&mut receiver).await {
             Ok(timestamp) => {
-                trace!(
+                debug!(
                     "The time of the timeseries last sent by {}. : {}",
                     sampling_policy_id,
                     Utc.timestamp_nanos(timestamp)
