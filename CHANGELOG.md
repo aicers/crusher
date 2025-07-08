@@ -4,6 +4,13 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] - 2025-07-16
+
+### Changed
+
+- Updated the roxy library dependency to 0.4.0 to support accurate measurement
+  of disk usage at the correct data store path.
+
 ## [0.6.3] - 2025-05-26
 
 ### Fixed
@@ -183,6 +190,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[0.6.4]: https://github.com/aicers/crusher/compare/0.6.3...0.6.4
 [0.6.3]: https://github.com/aicers/crusher/compare/0.6.2...0.6.3
 [0.6.2]: https://github.com/aicers/crusher/compare/0.6.1...0.6.2
 [0.6.1]: https://github.com/aicers/crusher/compare/0.6.0...0.6.1
