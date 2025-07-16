@@ -11,9 +11,9 @@ use tokio::{
     sync::{Notify, RwLock},
     time::{Duration, sleep},
 };
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, warn};
 
-use crate::{client::SERVER_RETRY_INTERVAL, error_or_eprint, info_or_print};
+use crate::{client::SERVER_RETRY_INTERVAL, info_or_print};
 
 const REQUIRED_MANAGER_VERSION: &str = "0.42.0";
 const MAX_RETRIES: u8 = 3;
@@ -81,7 +81,7 @@ impl Client {
                         review_protocol::request::handle(self, &mut send, &mut recv).await?;
                     }
                     Err(e) => {
-                        error!("Failed to accept bidirectional stream: {:?}", e);
+                        warn!("Failed to accept bidirectional stream: {:?}, retrying", e);
                         sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                     }
                 },
@@ -91,8 +91,8 @@ impl Client {
                             ErrorKind::ConnectionAborted
                             | ErrorKind::ConnectionReset
                             | ErrorKind::TimedOut => {
-                                error!(
-                                    "Retry connection to {} after {} seconds.",
+                                warn!(
+                                    "Retrying connection to {} in {} seconds",
                                     self.server_address, SERVER_RETRY_INTERVAL,
                                 );
                                 sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
@@ -105,7 +105,7 @@ impl Client {
                             _ => {}
                         }
                     }
-                    bail!("Fail to connect to {}: {:?}", self.server_address, e);
+                    bail!("Failed to connect to {}: {:?}", self.server_address, e);
                 }
             }
         }
@@ -171,7 +171,7 @@ impl Client {
                             return
                         },
                         Err(e) => {
-                            error_or_eprint!("{e}");
+                            info_or_print!("Connection attempt failed: {e}, retrying");
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                         },
                     }
@@ -247,14 +247,14 @@ impl review_protocol::request::Handler for Client {
                 .get(&policy.id)
                 .is_some()
             {
-                trace!("duplicated policy: {:?}", policy);
+                debug!("Duplicated policy: {:?}", policy);
                 continue;
             }
             self.active_policy_list
                 .write()
                 .await
                 .insert(policy.id, policy.clone());
-            trace!("Receive the Manager Server's policy: {:?}", policy);
+            debug!("Received the Manager Server's policy: {:?}", policy);
             self.request_send
                 .send(policy.clone())
                 .await
@@ -267,7 +267,7 @@ impl review_protocol::request::Handler for Client {
     async fn delete_sampling_policy(&mut self, policy_ids: &[u32]) -> Result<(), String> {
         for &id in policy_ids {
             if let Some(deleted_policy) = self.active_policy_list.write().await.remove(&id) {
-                trace!("{} Deleted from runtime policy list.", deleted_policy.id);
+                debug!("{} deleted from runtime policy list", deleted_policy.id);
                 self.delete_policy_ids.write().await.push(id);
             }
         }
