@@ -191,7 +191,7 @@ fn gen_conn() -> Conn {
         proto: 6,
         service: String::new(),
         conn_state: "OK".to_string(),
-        duration: tmp_dur.num_nanoseconds().unwrap(),
+        end_time: tmp_dur.num_nanoseconds().unwrap(),
         orig_bytes: 77,
         resp_bytes: 295,
         orig_pkts: 397,
