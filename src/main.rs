@@ -145,14 +145,22 @@ async fn run(
     config_reload: Arc<Notify>,
     guard: &mut Option<WorkerGuard>,
 ) -> Result<()> {
-    let settings = if let Some(local_config) = args.config.as_deref() {
-        Settings::from_file(local_config)?
+    let (settings, is_local_config) = if let Some(local_config) = args.config.as_deref() {
+        (Settings::from_file(local_config)?, true)
     } else {
-        Settings::from_str(&request_client.get_config().await?)?
+        (
+            Settings::from_str(&request_client.get_config().await?)?,
+            false,
+        )
     };
     if guard.is_none() {
         *guard = Some(init_tracing(settings.log_path.as_deref())?);
     }
+    info!(
+        "Time series generator has been configured with {} settings",
+        if is_local_config { "local" } else { "remote" }
+    );
+
     read_last_timestamp(&settings.last_timestamp_data).await?;
 
     let subscribe_client = subscribe::Client::new(
@@ -164,6 +172,7 @@ async fn run(
         request_recv,
     );
 
+    info!("Time series generate started");
     let shutdown = Arc::new(Notify::new());
     tokio::select! {
         Ok(Err(e)) = tokio::spawn(subscribe_client.run(

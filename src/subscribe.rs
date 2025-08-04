@@ -179,7 +179,7 @@ impl Client {
                 bail!("Data store's connection error occurred: {}", e);
             }
             () = shutdown.notified() => {
-                info!("Shutting down data store's client");
+                info!("Closing the connection to data store endpoint");
                 self.endpoint.close(0u32.into(), &[]);
                 shutdown.notify_one();
                 Ok(())
@@ -337,6 +337,7 @@ async fn publish_connection_control(
                             continue 'connection;
                         }
                         Ok(policy) = request_recv.recv() => {
+                            info!("Stream's policy : {:?}", policy);
                             if let Err(e) = process_network_stream(
                                 conn.clone(),
                                 series_send.clone(),
@@ -405,7 +406,10 @@ async fn ingest_connect(
 ) -> Result<Connection> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
     client_handshake(&conn, version).await?;
-    info!("Connection established to server {}", server_address);
+    info!(
+        "Connection established to data store ingest server {}",
+        server_address
+    );
     Ok(conn)
 }
 
@@ -417,7 +421,10 @@ async fn publish_connect(
 ) -> Result<(Connection, SendStream)> {
     let conn = endpoint.connect(server_address, server_name)?.await?;
     let (send, _) = client_handshake(&conn, version).await?;
-    info!("Connection established to server {}", server_address);
+    info!(
+        "Connection established to data store publish server {}",
+        server_address
+    );
     Ok((conn, send))
 }
 
@@ -482,10 +489,10 @@ async fn receiver(
         } else {
             bail!("Failed to get runtime policy data");
         };
+        info!("Raw event {:?} has been connected", policy.kind);
 
         let mut series = TimeSeries::try_new(&policy).await?;
 
-        info!("Stream's policy : {:?}", policy);
         loop {
             if delete_policy_ids.read().await.contains(&id) {
                 recv.stop(VarInt::default())?;
