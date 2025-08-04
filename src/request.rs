@@ -199,9 +199,11 @@ impl Client {
 #[async_trait]
 impl review_protocol::request::Handler for Client {
     async fn reboot(&mut self) -> Result<(), String> {
+        info!("Received request to reboot system");
         for attempt in 1..=MAX_RETRIES {
             if let Err(e) = roxy::reboot() {
                 if attempt == MAX_RETRIES {
+                    error!("Cannot reboot system: {e}");
                     return Err(format!("cannot restart the system: {e}"));
                 }
             } else {
@@ -213,9 +215,11 @@ impl review_protocol::request::Handler for Client {
     }
 
     async fn shutdown(&mut self) -> Result<(), String> {
+        info!("Received request to shutdown system");
         for attempt in 1..=MAX_RETRIES {
             if let Err(e) = roxy::power_off() {
                 if attempt == MAX_RETRIES {
+                    error!("Cannot shutdown system: {e}");
                     return Err(format!("cannot shutdown the system: {e}"));
                 }
             } else {
@@ -254,7 +258,7 @@ impl review_protocol::request::Handler for Client {
                 .write()
                 .await
                 .insert(policy.id, policy.clone());
-            debug!("Received the Manager Server's policy: {:?}", policy);
+            info!("Received request to update time series policy list");
             self.request_send
                 .send(policy.clone())
                 .await
@@ -267,7 +271,10 @@ impl review_protocol::request::Handler for Client {
     async fn delete_sampling_policy(&mut self, policy_ids: &[u32]) -> Result<(), String> {
         for &id in policy_ids {
             if let Some(deleted_policy) = self.active_policy_list.write().await.remove(&id) {
-                debug!("{} deleted from runtime policy list", deleted_policy.id);
+                info!(
+                    "Received request to delete time series policy {}",
+                    deleted_policy.id
+                );
                 self.delete_policy_ids.write().await.push(id);
             }
         }
@@ -276,7 +283,7 @@ impl review_protocol::request::Handler for Client {
     }
 
     async fn update_config(&mut self) -> Result<(), String> {
-        info!("Start updating configuration");
+        info!("Configuration update request received");
         self.config_reload.notify_one();
         Ok(())
     }
@@ -305,7 +312,7 @@ struct IdleModeHandler {
 #[async_trait]
 impl review_protocol::request::Handler for IdleModeHandler {
     async fn update_config(&mut self) -> Result<(), String> {
-        info!("Start updating configuration");
+        info!("Configuration update request received");
         self.config_reload.notify_one();
         Ok(())
     }
