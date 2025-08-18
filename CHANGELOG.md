@@ -11,6 +11,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Updated `Conn` event field from `duration` to `end_time` to ensure
   consistency with other protocol events. The field now represents the
   session's final timestamp instead of the session duration.
+- Updated `giganto-client` dependency to support type-driven stream
+  requests, replacing `NodeType`-based handling with `StreamRequestPayload`
+  enum for improved API consistency.
 
 ## [0.6.4] - 2025-07-16
 

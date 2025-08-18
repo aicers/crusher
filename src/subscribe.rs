@@ -20,7 +20,7 @@ use giganto_client::{
     publish::{
         receive_time_series_generator_data, receive_time_series_generator_stream_start_message,
         send_stream_request,
-        stream::{NodeType, RequestStreamRecord, RequestTimeSeriesGeneratorStream},
+        stream::{RequestStreamRecord, RequestTimeSeriesGeneratorStream, StreamRequestPayload},
     },
 };
 use num_traits::ToPrimitive;
@@ -447,13 +447,11 @@ async fn process_network_stream(
         dst_ip: policy.dst_ip,
         sensor: policy.node.clone(),
     };
-    send_stream_request(
-        &mut (*send.lock().await),
-        RequestStreamRecord::from_ext(policy.kind),
-        NodeType::TimeSeriesGenerator,
-        req_msg,
-    )
-    .await?;
+    let payload = StreamRequestPayload::TimeSeriesGenerator {
+        record_type: RequestStreamRecord::from_ext(policy.kind),
+        request: req_msg,
+    };
+    send_stream_request(&mut (*send.lock().await), payload).await?;
     task::spawn(async move {
         receiver(
             conn,
