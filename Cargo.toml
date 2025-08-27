@@ -9,11 +9,11 @@ edition = "2024"
 anyhow = "1"
 async-channel = "2"
 async-trait = "0.1"
-bincode = "1"
+bincode = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", features = ["toml"], default-features = false }
-giganto-client = { git = "https://github.com/aicers/giganto-client.git", rev = "8732528" }
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", rev = "47815ca" }
 num_enum = "0.7"
 num-traits = "0.2"
 quinn = { version = "0.11", features = ["ring"] }

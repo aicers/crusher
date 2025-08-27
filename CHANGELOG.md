@@ -13,7 +13,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   session's final timestamp instead of the session duration.
 - Updated `giganto-client` dependency to support type-driven stream
   requests, replacing `NodeType`-based handling with `StreamRequestPayload`
-  enum for improved API consistency.
+  enum for improved API consistency. This update also adds `start_time`
+  field to all protocol event structures.
+- Bump bincode crate to 2.0 and modified the related code.
 
 ## [0.6.4] - 2025-07-16
 
