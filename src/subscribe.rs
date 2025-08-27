@@ -79,10 +79,34 @@ impl Event {
 
     fn try_new(k: SamplingKind, raw_event: &[u8]) -> Result<Self> {
         Ok(match k {
-            SamplingKind::Conn => Self::Conn(bincode::deserialize::<Conn>(raw_event)?),
-            SamplingKind::Dns => Self::Dns(bincode::deserialize::<Dns>(raw_event)?),
-            SamplingKind::Http => Self::Http(bincode::deserialize::<Http>(raw_event)?),
-            SamplingKind::Rdp => Self::Rdp(bincode::deserialize::<Rdp>(raw_event)?),
+            SamplingKind::Conn => {
+                let (conn, _) = bincode::serde::decode_from_slice::<Conn, _>(
+                    raw_event,
+                    bincode::config::legacy(),
+                )?;
+                Self::Conn(conn)
+            }
+            SamplingKind::Dns => {
+                let (dns, _) = bincode::serde::decode_from_slice::<Dns, _>(
+                    raw_event,
+                    bincode::config::legacy(),
+                )?;
+                Self::Dns(dns)
+            }
+            SamplingKind::Http => {
+                let (http, _) = bincode::serde::decode_from_slice::<Http, _>(
+                    raw_event,
+                    bincode::config::legacy(),
+                )?;
+                Self::Http(http)
+            }
+            SamplingKind::Rdp => {
+                let (rdp, _) = bincode::serde::decode_from_slice::<Rdp, _>(
+                    raw_event,
+                    bincode::config::legacy(),
+                )?;
+                Self::Rdp(rdp)
+            }
         })
     }
 }
@@ -549,7 +573,7 @@ async fn send_time_series(
     // First data transmission (record type + series data)
     send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
 
-    let serde_series = bincode::serialize(&series)?;
+    let serde_series = bincode::serde::encode_to_vec(&series, bincode::config::legacy())?;
     let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
     send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
 
@@ -563,7 +587,7 @@ async fn send_time_series(
 
     // Data transmission after the first time (only series data)
     while let Ok(series) = recv_channel.recv().await {
-        let serde_series = bincode::serialize(&series)?;
+        let serde_series = bincode::serde::encode_to_vec(&series, bincode::config::legacy())?;
         let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
         send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
     }
@@ -571,7 +595,7 @@ async fn send_time_series(
 }
 
 async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -> Result<()> {
-    let buf = bincode::serialize(&events)?;
+    let buf = bincode::serde::encode_to_vec(events, bincode::config::legacy())?;
     send_raw(send, &buf).await?;
     Ok(())
 }

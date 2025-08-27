@@ -380,7 +380,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-trait",
- "bincode 1.3.3",
+ "bincode 2.0.1",
  "chrono",
  "clap",
  "config",
@@ -647,10 +647,10 @@ dependencies = [
 [[package]]
 name = "giganto-client"
 version = "0.23.0"
-source = "git+https://github.com/aicers/giganto-client.git?rev=8732528#8732528783c94b09b346fe78f5911313ee4eafab"
+source = "git+https://github.com/aicers/giganto-client.git?rev=47815ca#47815ca2ebdba920731f764ff413dbf7ad9a247a"
 dependencies = [
  "anyhow",
- "bincode 1.3.3",
+ "bincode 2.0.1",
  "chrono",
  "num_enum",
  "quinn",

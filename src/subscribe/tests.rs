@@ -58,7 +58,8 @@ async fn handle_connection(conn: quinn::Incoming) {
     connection_handshake(&connection).await;
 
     let conn_event = gen_conn();
-    let conn_raw_event = bincode::serialize(&conn_event).unwrap();
+    let conn_raw_event =
+        bincode::serde::encode_to_vec(&conn_event, bincode::config::legacy()).unwrap();
     let conn_len = u32::try_from(conn_raw_event.len()).unwrap().to_le_bytes();
 
     let (mut send, _) = connection.accept_bi().await.unwrap();
@@ -148,8 +149,9 @@ async fn connection_handshake(conn: &Connection) {
     let mut resp_buf = vec![0; len.try_into().expect("Failed to convert data type")];
     recv.read_exact(resp_buf.as_mut_slice()).await.unwrap();
 
-    bincode::deserialize::<Option<&str>>(&resp_buf)
+    bincode::serde::decode_from_slice::<Option<String>, _>(&resp_buf, bincode::config::legacy())
         .expect("Failed to deserialize recv data")
+        .0
         .expect("Incompatible version");
 }
 
@@ -191,6 +193,7 @@ fn gen_conn() -> Conn {
         proto: 6,
         service: String::new(),
         conn_state: "OK".to_string(),
+        start_time: 500,
         end_time: tmp_dur.num_nanoseconds().unwrap(),
         orig_bytes: 77,
         resp_bytes: 295,
