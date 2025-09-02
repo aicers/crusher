@@ -13,7 +13,7 @@ jobs:
         uses: hecrj/setup-rust-action@v1
         with:
           rust-version: stable
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
       - name: Check formatting
         run: cargo fmt -- --check --config group_imports=StdExternalCrate
       - name: Clippy
@@ -33,7 +33,7 @@ jobs:
         uses: hecrj/setup-rust-action@v1
         with:
           rust-version: stable
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
       - name: Build
         run: cargo build --verbose
       - name: Run tests
@@ -46,7 +46,7 @@ jobs:
         uses: hecrj/setup-rust-action@v1
         with:
           rust-version: stable
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
       - name: Install Tarpaulin
         run: cargo install cargo-tarpaulin
       - name: Generate coverage report

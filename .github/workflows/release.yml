@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'tag name'
+        description: "tag name"
         required: true
-        default: '0.0.0'
+        default: "0.0.0"
 
 env:
   TITLE: Crusher
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
       - name: Update to the Latest Version of Rust
