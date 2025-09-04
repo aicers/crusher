@@ -19,8 +19,8 @@ num-traits = "0.2"
 quinn = { version = "0.11", features = ["ring"] }
 review-protocol = { git = "https://github.com/petabi/review-protocol.git", features = [
     "client",
-], tag = "0.11.0" }
-roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.4.0" }
+], tag = "0.12.0" }
+roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.5.0" }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
