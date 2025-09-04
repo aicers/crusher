@@ -236,8 +236,8 @@ impl review_protocol::request::Handler for Client {
             cpu_usage: usg.cpu_usage,
             total_memory: usg.total_memory,
             used_memory: usg.used_memory,
-            total_disk_space: usg.total_disk_space,
-            used_disk_space: usg.used_disk_space,
+            disk_used_bytes: usg.disk_used_bytes,
+            disk_available_bytes: usg.disk_available_bytes,
         };
         Ok((roxy::hostname(), usg))
     }
