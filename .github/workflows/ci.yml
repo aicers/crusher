@@ -16,9 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install Rust
-        uses: hecrj/setup-rust-action@v1
-        with:
-          rust-version: stable
+        uses: dtolnay/rust-toolchain@stable
       - uses: actions/checkout@v5
       - name: Check formatting
         run: cargo fmt -- --check --config group_imports=StdExternalCrate
@@ -36,9 +34,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - name: Install Rust
-        uses: hecrj/setup-rust-action@v1
-        with:
-          rust-version: stable
+        uses: dtolnay/rust-toolchain@stable
       - uses: actions/checkout@v5
       - name: Build
         run: cargo build --verbose
@@ -49,9 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install Rust
-        uses: hecrj/setup-rust-action@v1
-        with:
-          rust-version: stable
+        uses: dtolnay/rust-toolchain@stable
       - uses: actions/checkout@v5
       - name: Install Tarpaulin
         run: cargo install cargo-tarpaulin
