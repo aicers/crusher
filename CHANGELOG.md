@@ -15,7 +15,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   requests, replacing `NodeType`-based handling with `StreamRequestPayload`
   enum for improved API consistency. This update also adds `start_time`
   field to all protocol event structures.
-- Bump bincode crate to 2.0 and modified the related code.
+- Bumped bincode crate to 2.0 and modified the related code.
+- Updated `roxy` dependency to version 0.5.0 with new `ResourceUsage` struct
+  fields: `disk_used_bytes` and `disk_available_bytes`.
+- Updated `review-protocol` dependency to version 0.12.0.
 
 ## [0.6.4] - 2025-07-16
 
