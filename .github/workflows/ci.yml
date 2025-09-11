@@ -52,4 +52,9 @@ jobs:
       - name: Generate coverage report
         run: cargo tarpaulin --out xml
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v5
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
