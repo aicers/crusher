@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: actions/checkout@v5
       - name: Check formatting
         run: cargo fmt -- --check --config group_imports=StdExternalCrate
@@ -35,6 +37,8 @@ jobs:
     steps:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: actions/checkout@v5
       - name: Build
         run: cargo build --verbose
@@ -46,6 +50,8 @@ jobs:
     steps:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: actions/checkout@v5
       - name: Install Tarpaulin
         run: cargo install cargo-tarpaulin
