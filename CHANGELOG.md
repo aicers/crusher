@@ -13,9 +13,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   session's final timestamp instead of the session duration.
 - Updated `giganto-client` dependency to support type-driven stream
   requests, replacing `NodeType`-based handling with `StreamRequestPayload`
-  enum for improved API consistency. This update also adds `start_time`
-  field to all protocol event structures.
-- Bumped bincode crate to 2.0 and modified the related code.
+  enum for improved API consistency.
+- Reverted `bincode` from v2 back to v1 to align with broader migration
+  strategy. The v2 upgrade will be reapplied in the future when
+  dependencies and migration strategies are fully confirmed.
 - Updated `roxy` dependency to version 0.5.0 with new `ResourceUsage` struct
   fields: `disk_used_bytes` and `disk_available_bytes`.
 - Updated `review-protocol` dependency to version 0.12.0.
