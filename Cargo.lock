@@ -157,26 +157,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bincode"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
-dependencies = [
- "bincode_derive",
- "serde",
- "unty",
-]
-
-[[package]]
-name = "bincode_derive"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
-dependencies = [
- "virtue",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -375,7 +355,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-trait",
- "bincode 2.0.1",
+ "bincode",
  "chrono",
  "clap",
  "config",
@@ -647,12 +627,12 @@ dependencies = [
 
 [[package]]
 name = "giganto-client"
-version = "0.23.0"
-source = "git+https://github.com/aicers/giganto-client.git?rev=47815ca#47815ca2ebdba920731f764ff413dbf7ad9a247a"
+version = "0.24.0"
+source = "git+https://github.com/aicers/giganto-client.git?rev=ec22502#ec22502d7c2eaf0d9aa28e40c69490034190c2df"
 dependencies = [
  "anyhow",
- "bincode 2.0.1",
- "chrono",
+ "bincode",
+ "jiff",
  "num_enum",
  "quinn",
  "semver",
@@ -811,6 +791,47 @@ name = "itoa"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
+
+[[package]]
+name = "jiff"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be1f93b8b1eb69c77f24bbb0afdf66f54b632ee39af40ca21c4365a1d7347e49"
+dependencies = [
+ "jiff-static",
+ "jiff-tzdb-platform",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03343451ff899767262ec32146f6d559dd759fdadf42ff0e227c7c48f72594b4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1283705eb0a21404d2bfd6eef2a7593d240bc42a0bdb39db0ad6fa2ec026524"
+
+[[package]]
+name = "jiff-tzdb-platform"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
+dependencies = [
+ "jiff-tzdb",
+]
 
 [[package]]
 name = "jni"
@@ -1021,7 +1042,7 @@ name = "oinq"
 version = "0.13.0"
 source = "git+https://github.com/petabi/oinq.git?tag=0.13.0#c48b3dbafedb7df3bc595ddea15a5c96bae00b2e"
 dependencies = [
- "bincode 1.3.3",
+ "bincode",
  "futures",
  "num_enum",
  "quinn",
@@ -1161,6 +1182,21 @@ dependencies = [
  "pnet_base",
  "pnet_packet",
  "pnet_sys",
+]
+
+[[package]]
+name = "portable-atomic"
+version = "1.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8a2f0d8d040d7848a709caf78912debcc3f33ee4b3cac47d73d1e1069e83507"
+dependencies = [
+ "portable-atomic",
 ]
 
 [[package]]
@@ -1352,7 +1388,7 @@ version = "0.12.0"
 source = "git+https://github.com/petabi/review-protocol.git?tag=0.12.0#453fffe25b42d7632786b8c5b9e0929f18f85740"
 dependencies = [
  "async-trait",
- "bincode 1.3.3",
+ "bincode",
  "ipnet",
  "num_enum",
  "oinq",
@@ -1382,10 +1418,10 @@ dependencies = [
 [[package]]
 name = "roxy"
 version = "0.5.0"
-source = "git+https://github.com/aicers/roxy.git?tag=0.5.0#77ee3f2a44ca6d92732457d210ec9420deb8aaf7"
+source = "git+https://github.com/aicers/roxy.git?rev=567a27e#567a27ed0e6327b4690aa6f43ce0c9503d90f6eb"
 dependencies = [
  "anyhow",
- "bincode 2.0.1",
+ "bincode",
  "chrono",
  "data-encoding",
  "gethostname",
@@ -2089,12 +2125,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
-name = "unty"
-version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
-
-[[package]]
 name = "uptime_lib"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2116,12 +2146,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "virtue"
-version = "0.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "walkdir"

@@ -9,18 +9,18 @@ edition = "2024"
 anyhow = "1"
 async-channel = "2"
 async-trait = "0.1"
-bincode = { version = "2", features = ["serde"] }
+bincode = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", features = ["toml"], default-features = false }
-giganto-client = { git = "https://github.com/aicers/giganto-client.git", rev = "47815ca" }
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", rev = "ec22502" }
 num_enum = "0.7"
 num-traits = "0.2"
 quinn = { version = "0.11", features = ["ring"] }
 review-protocol = { git = "https://github.com/petabi/review-protocol.git", features = [
     "client",
 ], tag = "0.12.0" }
-roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.5.0" }
+roxy = { git = "https://github.com/aicers/roxy.git", rev = "567a27e" }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
