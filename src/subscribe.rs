@@ -120,7 +120,7 @@ trait ColumnValue {
 impl ColumnValue for Conn {
     fn column_value(&self, column: u32) -> f64 {
         match column {
-            5 => self.end_time.to_f64().unwrap_or_default(),
+            5 => self.duration.to_f64().unwrap_or_default(),
             7 => self.orig_bytes.to_f64().unwrap_or_default(),
             8 => self.resp_bytes.to_f64().unwrap_or_default(),
             9 => self.orig_pkts.to_f64().unwrap_or_default(),
