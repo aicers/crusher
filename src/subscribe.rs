@@ -176,7 +176,7 @@ impl Client {
                 )
             )} => {
                 self.endpoint.close(0u32.into(), &[]);
-                bail!("Data store's connection error occurred: {}", e);
+                bail!("Data store's connection error occurred: {e}");
             }
             () = shutdown.notified() => {
                 info!("Closing the connection to data store endpoint");
@@ -257,7 +257,7 @@ async fn ingest_connection_control(
                         _ => {}
                     }
                 }
-                bail!("Fail to connect to {}: {:?}", server_addr, e);
+                bail!("Fail to connect to {server_addr}: {e:?}");
             }
         }
     }
@@ -313,7 +313,7 @@ async fn publish_connection_control(
                                 continue 'connection;
                             }
                         }
-                        bail!("Cannot recover from open stream error: {}", e);
+                        bail!("Cannot recover from open stream error: {e}");
                     }
                 }
                 loop {
@@ -365,7 +365,7 @@ async fn publish_connection_control(
                                         continue 'connection;
                                     }
                                 }
-                                bail!("Cannot recover from open stream error: {}", e);
+                                bail!("Cannot recover from open stream error: {e}");
                             }
                         }
                     }
@@ -392,7 +392,7 @@ async fn publish_connection_control(
                         _ => {}
                     }
                 }
-                bail!("Fail to connect to {}: {:?}", server_addr, e);
+                bail!("Fail to connect to {server_addr}: {e:?}");
             }
         }
     }
@@ -599,7 +599,7 @@ async fn receive_time_series_timestamp(
             }
             Err(e) => {
                 connection_notify.notify_waiters();
-                bail!("Last series times error: {}", e);
+                bail!("Last series times error: {e}");
             }
         }
     }
