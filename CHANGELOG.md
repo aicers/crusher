@@ -4,17 +4,19 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2025-12-04
 
 ### Changed
 
-- Updated `giganto-client` dependency to support type-driven stream
-  requests, replacing `NodeType`-based handling with `StreamRequestPayload`
-  enum for improved API consistency. This update also adds `start_time`
-  field to all protocol event structures.
-- Updated `roxy` dependency to version 0.5.0 with new `ResourceUsage` struct
+- Updated `giganto-client` dependency to version `0.25.0`, adding support for
+  type‑driven stream requests. Replaced `NodeType`‑based handling with the
+  `StreamRequestPayload` enum for improved API consistency. This update also
+  introduces a `start_time` field across all protocol event structures.
+- Updated `roxy` dependency to version 0.5.1 with new `ResourceUsage` struct
   fields: `disk_used_bytes` and `disk_available_bytes`.
-- Updated `review-protocol` dependency to version 0.12.0.
+- Updated `review-protocol` dependency to version 0.15.0.
+- Changed `REQUIRED_GIGANTO_VERSION` to 0.26.0.
+- Changed `REQUIRED_MANAGER_VERSION` to 0.46.0.
 
 ## [0.6.4] - 2025-07-16
 
@@ -202,7 +204,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
-[Unreleased]: https://github.com/aicers/crusher/compare/0.6.4...main
+[0.7.0]: https://github.com/aicers/crusher/compare/0.6.4...0.7.0
 [0.6.4]: https://github.com/aicers/crusher/compare/0.6.3...0.6.4
 [0.6.3]: https://github.com/aicers/crusher/compare/0.6.2...0.6.3
 [0.6.2]: https://github.com/aicers/crusher/compare/0.6.1...0.6.2
