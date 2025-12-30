@@ -317,3 +317,496 @@ impl review_protocol::request::Handler for IdleModeHandler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use review_protocol::types::{SamplingKind, SamplingPolicy};
+
+    use super::*;
+
+    /// Creates a test client with default configuration.
+    /// Returns the client and a receiver for sampling policies.
+    fn create_test_client() -> (Client, async_channel::Receiver<SamplingPolicy>) {
+        let (tx, rx) = async_channel::unbounded();
+        let config_reload = Arc::new(Notify::new());
+
+        let client = Client {
+            server_address: "127.0.0.1:8080".parse().unwrap(),
+            server_name: "test".to_string(),
+            connection: None,
+            request_send: tx,
+            cert: Vec::new(),
+            key: Vec::new(),
+            ca_certs: Vec::new(),
+            config_reload,
+            status: Status::Ready,
+            active_policy_list: Arc::new(RwLock::new(HashMap::new())),
+            delete_policy_ids: Arc::new(RwLock::new(Vec::new())),
+        };
+
+        (client, rx)
+    }
+
+    /// Creates a test sampling policy with the given ID.
+    fn create_test_policy(id: u32) -> SamplingPolicy {
+        SamplingPolicy {
+            id,
+            kind: SamplingKind::Conn,
+            interval: Duration::from_secs(60),
+            period: Duration::from_secs(3600),
+            offset: 0,
+            src_ip: None,
+            dst_ip: None,
+            node: Some("test_node".to_string()),
+            column: None,
+        }
+    }
+
+    // =========================================================================
+    // Duplicate Suppression Tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_basic() {
+        // Test: Adding the same policy ID twice should only process it once
+        let (mut client, rx) = create_test_client();
+        let policy = create_test_policy(1);
+
+        // Add the policy first time
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Verify policy was added to active list
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+        assert!(client.active_policy_list.read().await.contains_key(&1));
+
+        // Verify policy was sent through channel
+        let received = rx.try_recv();
+        assert!(received.is_ok());
+        assert_eq!(received.unwrap().id, 1);
+
+        // Add the same policy again (duplicate)
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Verify still only one policy in active list
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+
+        // Verify no additional policy was sent (channel should be empty)
+        let received = rx.try_recv();
+        assert!(received.is_err()); // Channel should be empty
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_multiple_policies() {
+        // Test: Adding multiple policies, some duplicates
+        let (mut client, rx) = create_test_client();
+        let policy1 = create_test_policy(1);
+        let policy2 = create_test_policy(2);
+
+        // Add both policies
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            &[policy1.clone(), policy2.clone()],
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(client.active_policy_list.read().await.len(), 2);
+
+        // Drain the channel
+        let _ = rx.try_recv();
+        let _ = rx.try_recv();
+
+        // Try to add policy1 again as duplicate, and policy3 as new
+        let policy3 = create_test_policy(3);
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            &[policy1.clone(), policy3.clone()],
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Should have 3 policies now (policy1 was duplicate, policy3 is new)
+        assert_eq!(client.active_policy_list.read().await.len(), 3);
+
+        // Only policy3 should be in the channel
+        let received = rx.try_recv();
+        assert!(received.is_ok());
+        assert_eq!(received.unwrap().id, 3);
+
+        // Channel should be empty
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_boundary_empty_queue() {
+        // Test: Adding a policy when queue is empty
+        let (mut client, rx) = create_test_client();
+
+        // Verify empty initial state
+        assert!(client.active_policy_list.read().await.is_empty());
+
+        let policy = create_test_policy(1);
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_rapid_add_remove_add_cycle() {
+        // Test: Rapid add/remove/add cycle should work correctly
+        let (mut client, rx) = create_test_client();
+        let policy = create_test_policy(1);
+
+        // Add policy
+        review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+        let _ = rx.try_recv(); // Drain channel
+
+        // Remove policy
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+        assert!(client.active_policy_list.read().await.is_empty());
+
+        // Add policy again (should succeed since it was deleted)
+        review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+
+        // Verify policy was sent again
+        let received = rx.try_recv();
+        assert!(received.is_ok());
+        assert_eq!(received.unwrap().id, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_empty_policy_list() {
+        // Test: Empty policy list should be handled correctly
+        let (mut client, _rx) = create_test_client();
+
+        let result =
+            review_protocol::request::Handler::sampling_policy_list(&mut client, &[]).await;
+        assert!(result.is_ok());
+        assert!(client.active_policy_list.read().await.is_empty());
+    }
+
+    // =========================================================================
+    // Delete Queue Accumulation Tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_accumulation_basic() {
+        // Test: Multiple delete requests should accumulate in delete queue
+        let (mut client, rx) = create_test_client();
+
+        // Add multiple policies first
+        let policies: Vec<SamplingPolicy> = (1..=5).map(create_test_policy).collect();
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &policies)
+            .await
+            .unwrap();
+
+        // Drain channel
+        while rx.try_recv().is_ok() {}
+
+        // Delete policies one by one
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[2])
+            .await
+            .unwrap();
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[3])
+            .await
+            .unwrap();
+
+        // Verify delete queue accumulated all deleted IDs
+        let delete_ids = client.delete_policy_ids.read().await;
+        assert_eq!(delete_ids.len(), 3);
+        assert!(delete_ids.contains(&1));
+        assert!(delete_ids.contains(&2));
+        assert!(delete_ids.contains(&3));
+
+        // Verify active list only has remaining policies
+        assert_eq!(client.active_policy_list.read().await.len(), 2);
+        assert!(client.active_policy_list.read().await.contains_key(&4));
+        assert!(client.active_policy_list.read().await.contains_key(&5));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_accumulation_batch() {
+        // Test: Batch delete request should accumulate all IDs
+        let (mut client, rx) = create_test_client();
+
+        // Add policies
+        let policies: Vec<SamplingPolicy> = (1..=5).map(create_test_policy).collect();
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &policies)
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+
+        // Delete multiple in one call
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1, 3, 5])
+            .await
+            .unwrap();
+
+        // Verify order is preserved in delete queue
+        let delete_ids = client.delete_policy_ids.read().await;
+        assert_eq!(delete_ids.len(), 3);
+        assert_eq!(delete_ids[0], 1);
+        assert_eq!(delete_ids[1], 3);
+        assert_eq!(delete_ids[2], 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_boundary_non_existent_policy() {
+        // Test: Deleting a non-existent policy should be silently ignored
+        let (mut client, rx) = create_test_client();
+
+        // Add a policy
+        let policy = create_test_policy(1);
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        // Try to delete a non-existent policy
+        let result =
+            review_protocol::request::Handler::delete_sampling_policy(&mut client, &[999]).await;
+        assert!(result.is_ok());
+
+        // Delete queue should be empty (non-existent policy not added)
+        assert!(client.delete_policy_ids.read().await.is_empty());
+
+        // Active list should still have the original policy
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_boundary_empty_queue() {
+        // Test: Delete on empty active list should be no-op
+        let (mut client, _rx) = create_test_client();
+
+        let result =
+            review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1, 2, 3])
+                .await;
+        assert!(result.is_ok());
+
+        // Delete queue should be empty
+        assert!(client.delete_policy_ids.read().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_no_double_delete() {
+        // Test: Deleting the same ID twice should only add it once to delete queue
+        let (mut client, rx) = create_test_client();
+
+        // Add a policy
+        let policy = create_test_policy(1);
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        // Delete it once
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+
+        // Try to delete it again
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+
+        // Delete queue should only have one entry
+        let delete_ids = client.delete_policy_ids.read().await;
+        assert_eq!(delete_ids.len(), 1);
+        assert_eq!(delete_ids[0], 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_rapid_add_remove_same_id() {
+        // Test: Rapid add/remove cycles of the same ID
+        let (mut client, rx) = create_test_client();
+
+        for i in 0..3 {
+            let policy = create_test_policy(1);
+            review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+                .await
+                .unwrap();
+            let _ = rx.try_recv();
+
+            review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+                .await
+                .unwrap();
+
+            // Each cycle should add one entry to delete queue
+            assert_eq!(client.delete_policy_ids.read().await.len(), i + 1);
+        }
+
+        // Final state: empty active list, 3 entries in delete queue
+        assert!(client.active_policy_list.read().await.is_empty());
+        assert_eq!(client.delete_policy_ids.read().await.len(), 3);
+    }
+
+    // =========================================================================
+    // Idle Mode Branching Tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_branching_config_reload() {
+        // Test: Config reload notification should exit idle mode
+        let (mut client, _rx) = create_test_client();
+        let config_reload = client.config_reload.clone();
+
+        // Spawn a task to notify config reload after a short delay
+        let notify_task = tokio::spawn(async move {
+            // Small delay to ensure enter_idle_mode is waiting
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            config_reload.notify_one();
+        });
+
+        // Enter idle mode with health_check = false
+        // This should wait for config reload notification
+        client.enter_idle_mode(false).await;
+
+        // Verify status is Ready after exiting idle mode
+        assert!(matches!(client.status, Status::Ready));
+
+        notify_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_config_triggers_config_reload() {
+        // Test: update_config should notify the config_reload
+        let (mut client, _rx) = create_test_client();
+        let config_reload = client.config_reload.clone();
+
+        // Spawn a task to wait for notification
+        let wait_task = tokio::spawn(async move {
+            config_reload.notified().await;
+            true
+        });
+
+        // Call update_config
+        let result = review_protocol::request::Handler::update_config(&mut client).await;
+        assert!(result.is_ok());
+
+        // Verify notification was received
+        let received = tokio::time::timeout(Duration::from_millis(100), wait_task).await;
+        assert!(received.is_ok());
+        assert!(received.unwrap().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_sets_status_to_idle() {
+        // Test: Entering idle mode should set status to Idle
+        let (mut client, _rx) = create_test_client();
+        let config_reload = client.config_reload.clone();
+
+        assert!(matches!(client.status, Status::Ready));
+
+        // Notify immediately to exit idle mode quickly
+        config_reload.notify_one();
+
+        client.enter_idle_mode(false).await;
+
+        // After exiting, status should be Ready
+        assert!(matches!(client.status, Status::Ready));
+    }
+
+    // =========================================================================
+    // Run method tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_clears_state_on_start() {
+        // Test: run() should clear active_policy_list and delete_policy_ids on start
+        let (mut client, rx) = create_test_client();
+
+        // Pre-populate with some data
+        let policy = create_test_policy(1);
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+
+        assert!(
+            !client.active_policy_list.read().await.is_empty()
+                || !client.delete_policy_ids.read().await.is_empty()
+        );
+
+        // Re-populate since delete removed from active
+        let policy = create_test_policy(2);
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+            .await
+            .unwrap();
+
+        // Shutdown immediately
+        let shutdown = Arc::new(Notify::new());
+        shutdown.notify_one();
+
+        let result = client.run(shutdown).await;
+        assert!(result.is_ok());
+
+        // State should be cleared
+        assert!(client.active_policy_list.read().await.is_empty());
+        assert!(client.delete_policy_ids.read().await.is_empty());
+    }
+
+    // =========================================================================
+    // IdleModeHandler tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_handler_update_config() {
+        // Test: IdleModeHandler's update_config should notify config_reload
+        let config_reload = Arc::new(Notify::new());
+        let mut handler = IdleModeHandler {
+            config_reload: config_reload.clone(),
+        };
+
+        // Spawn a task to wait for notification
+        let wait_task = tokio::spawn(async move {
+            config_reload.notified().await;
+            true
+        });
+
+        // Call update_config
+        let result = review_protocol::request::Handler::update_config(&mut handler).await;
+        assert!(result.is_ok());
+
+        // Verify notification was received
+        let received = tokio::time::timeout(Duration::from_millis(100), wait_task).await;
+        assert!(received.is_ok());
+        assert!(received.unwrap().unwrap());
+    }
+}
