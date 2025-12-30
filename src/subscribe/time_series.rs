@@ -187,3 +187,997 @@ pub(super) fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Re
 
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+mod tests {
+    use std::io::Write;
+    use std::time::Duration;
+
+    use review_protocol::types::{SamplingKind, SamplingPolicy};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    // Constants for deterministic timestamps
+    // Use a fixed timestamp: 2024-01-15 12:00:00 UTC = 1705320000
+    const BASE_TIMESTAMP: i64 = 1_705_320_000;
+    const SECS_PER_MINUTE: u64 = 60;
+    const SECS_PER_HOUR: u64 = 3600;
+    const SECS_PER_DAY: u64 = 86_400;
+
+    /// Helper to create a `SamplingPolicy` with specified parameters
+    fn create_policy(
+        id: u32,
+        period_secs: u64,
+        interval_secs: u64,
+        offset: i32,
+        column: Option<u32>,
+    ) -> SamplingPolicy {
+        SamplingPolicy {
+            id,
+            kind: SamplingKind::Conn,
+            interval: Duration::from_secs(interval_secs),
+            period: Duration::from_secs(period_secs),
+            offset,
+            src_ip: None,
+            dst_ip: None,
+            node: Some("test_node".to_string()),
+            column,
+        }
+    }
+
+    /// Helper to create `DateTime`<Utc> from unix timestamp
+    fn datetime_from_timestamp(timestamp: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(timestamp, 0).expect("valid timestamp")
+    }
+
+    // =========================================================================
+    // Tests for time_slot function - boundary conditions for period/interval/offset
+    // =========================================================================
+
+    #[test]
+    fn test_time_slot_basic_day_period_15min_interval() {
+        // Period: 1 day (86400s), Interval: 15 min (900s) => 96 slots
+        // Offset: 0
+        let policy = create_policy(1, SECS_PER_DAY, 15 * SECS_PER_MINUTE, 0, None);
+
+        // Midnight UTC => slot 0
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+        assert_eq!(time_slot(&policy, midnight).unwrap(), 0);
+
+        // 00:14:59 => still slot 0
+        let just_before_slot_1 = datetime_from_timestamp(midnight.timestamp() + 14 * 60 + 59);
+        assert_eq!(time_slot(&policy, just_before_slot_1).unwrap(), 0);
+
+        // 00:15:00 => slot 1
+        let exactly_slot_1 = datetime_from_timestamp(midnight.timestamp() + 15 * 60);
+        assert_eq!(time_slot(&policy, exactly_slot_1).unwrap(), 1);
+
+        // 00:15:01 => still slot 1
+        let just_after_slot_1 = datetime_from_timestamp(midnight.timestamp() + 15 * 60 + 1);
+        assert_eq!(time_slot(&policy, just_after_slot_1).unwrap(), 1);
+
+        // 23:45:00 => slot 95 (last slot)
+        let last_slot = datetime_from_timestamp(midnight.timestamp() + 23 * 3600 + 45 * 60);
+        assert_eq!(time_slot(&policy, last_slot).unwrap(), 95);
+
+        // 23:59:59 => still slot 95
+        let end_of_day = datetime_from_timestamp(midnight.timestamp() + 23 * 3600 + 59 * 60 + 59);
+        assert_eq!(time_slot(&policy, end_of_day).unwrap(), 95);
+    }
+
+    #[test]
+    fn test_time_slot_with_positive_offset() {
+        // Period: 1 day (86400s), Interval: 1 hour (3600s) => 24 slots
+        // Offset: +9 hours (32400s) - shifts time forward
+        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
+
+        // At midnight UTC, with +9h offset, offset_time = 09:00 => slot 9
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+        assert_eq!(time_slot(&policy, midnight).unwrap(), 9);
+
+        // At 15:00 UTC, with +9h offset, offset_time = 00:00 (next day) => slot 0
+        let utc_15h = datetime_from_timestamp(midnight.timestamp() + 15 * 3600);
+        assert_eq!(time_slot(&policy, utc_15h).unwrap(), 0);
+
+        // At 14:59:59 UTC, with +9h offset, offset_time = 23:59:59 => slot 23
+        let utc_14h59 = datetime_from_timestamp(midnight.timestamp() + 14 * 3600 + 59 * 60 + 59);
+        assert_eq!(time_slot(&policy, utc_14h59).unwrap(), 23);
+    }
+
+    #[test]
+    fn test_time_slot_with_negative_offset() {
+        // Period: 1 day (86400s), Interval: 1 hour (3600s) => 24 slots
+        // Offset: -5 hours (-18000s) - shifts time backward
+        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, -18_000, None);
+
+        // At midnight UTC, with -5h offset, offset_time = 19:00 (prev day) => slot 19
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+        assert_eq!(time_slot(&policy, midnight).unwrap(), 19);
+
+        // At 05:00 UTC, with -5h offset, offset_time = 00:00 => slot 0
+        let utc_5h = datetime_from_timestamp(midnight.timestamp() + 5 * 3600);
+        assert_eq!(time_slot(&policy, utc_5h).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_time_slot_period_not_divisible_by_interval() {
+        // Period: 1 hour (3600s), Interval: 7 min (420s) => 8 slots (3600/420 = 8.57 truncated)
+        // This tests the edge case where period % interval != 0
+        let policy = create_policy(1, SECS_PER_HOUR, 7 * SECS_PER_MINUTE, 0, None);
+
+        // Midnight => slot 0
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+        assert_eq!(time_slot(&policy, midnight).unwrap(), 0);
+
+        // 00:07:00 => slot 1
+        let slot_1 = datetime_from_timestamp(midnight.timestamp() + 7 * 60);
+        assert_eq!(time_slot(&policy, slot_1).unwrap(), 1);
+
+        // 00:56:00 => slot 8 (56 / 7 = 8)
+        let slot_8 = datetime_from_timestamp(midnight.timestamp() + 56 * 60);
+        assert_eq!(time_slot(&policy, slot_8).unwrap(), 8);
+
+        // 00:59:59 => slot 8 (59 / 7 = 8.4 truncated to 8)
+        let end_of_hour = datetime_from_timestamp(midnight.timestamp() + 59 * 60 + 59);
+        assert_eq!(time_slot(&policy, end_of_hour).unwrap(), 8);
+    }
+
+    #[test]
+    fn test_time_slot_interval_equals_period() {
+        // Period: 1 hour (3600s), Interval: 1 hour (3600s) => 1 slot
+        // All times within the period should map to slot 0
+        let policy = create_policy(1, SECS_PER_HOUR, SECS_PER_HOUR, 0, None);
+
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+
+        // Any time within the hour should be slot 0
+        assert_eq!(time_slot(&policy, midnight).unwrap(), 0);
+        assert_eq!(
+            time_slot(
+                &policy,
+                datetime_from_timestamp(midnight.timestamp() + 30 * 60)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            time_slot(
+                &policy,
+                datetime_from_timestamp(midnight.timestamp() + 59 * 60 + 59)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_time_slot_interval_one_second() {
+        // Period: 1 minute (60s), Interval: 1 second (1s) => 60 slots
+        // Tests minimum interval
+        let policy = create_policy(1, SECS_PER_MINUTE, 1, 0, None);
+
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+
+        // Each second should be its own slot
+        assert_eq!(time_slot(&policy, midnight).unwrap(), 0);
+        assert_eq!(
+            time_slot(&policy, datetime_from_timestamp(midnight.timestamp() + 1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            time_slot(&policy, datetime_from_timestamp(midnight.timestamp() + 59)).unwrap(),
+            59
+        );
+    }
+
+    #[test]
+    fn test_time_slot_offset_equals_period_minus_one() {
+        // Period: 1 hour (3600s), Interval: 15 min (900s) => 4 slots
+        // Offset: period - 1 = 3599s
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 3599, None);
+
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+        // At midnight UTC, offset_time = 00:59:59 => slot 3 (59*60+59 = 3599s) / 900 = 3
+        // Actually: seconds_of_day = 3599, 3599 % 3600 = 3599, 3599 / 900 = 3
+        assert_eq!(time_slot(&policy, midnight).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_time_slot_offset_in_middle_of_period() {
+        // Period: 2 hours (7200s), Interval: 30 min (1800s) => 4 slots
+        // Offset: 1 hour (3600s) - middle of period
+        let policy = create_policy(1, 2 * SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 3600, None);
+
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+        // At midnight UTC, offset_time = 01:00:00 => seconds_of_day = 3600
+        // 3600 % 7200 = 3600, 3600 / 1800 = 2 => slot 2
+        assert_eq!(time_slot(&policy, midnight).unwrap(), 2);
+
+        // At 01:00 UTC, offset_time = 02:00:00 => seconds_of_day = 7200
+        // 7200 % 7200 = 0, 0 / 1800 = 0 => slot 0
+        let utc_1h = datetime_from_timestamp(midnight.timestamp() + 3600);
+        assert_eq!(time_slot(&policy, utc_1h).unwrap(), 0);
+    }
+
+    // =========================================================================
+    // Tests for start_time function
+    // =========================================================================
+
+    #[test]
+    fn test_start_time_aligns_to_period_boundary() {
+        // Period: 1 hour (3600s), Interval: 15 min (900s)
+        // Offset: 0
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+
+        // At 00:30:00, start_time should be 00:00:00 (period boundary)
+        let mid_hour = datetime_from_timestamp(midnight.timestamp() + 30 * 60);
+        let start = start_time(&policy, mid_hour).unwrap();
+        assert_eq!(start.timestamp(), midnight.timestamp());
+
+        // At 01:30:00, start_time should be 01:00:00
+        let mid_second_hour = datetime_from_timestamp(midnight.timestamp() + 90 * 60);
+        let start = start_time(&policy, mid_second_hour).unwrap();
+        assert_eq!(start.timestamp(), midnight.timestamp() + 3600);
+    }
+
+    #[test]
+    fn test_start_time_with_offset() {
+        // Period: 1 day (86400s), Interval: 1 hour (3600s)
+        // Offset: +9 hours (32400s)
+        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
+
+        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
+
+        // At midnight UTC with +9h offset:
+        // offset_time = 09:00:00, which is within the period [00:00, 24:00)
+        // start_of_period in offset time = 00:00:00
+        // start in UTC = 00:00:00 - 9h = -9h = previous day 15:00:00
+        let start = start_time(&policy, midnight).unwrap();
+        assert_eq!(start.timestamp(), midnight.timestamp() - 9 * 3600);
+    }
+
+    // =========================================================================
+    // Tests for JSON timestamp persistence (read/write/delete)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_write_last_timestamp_creates_file() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("timestamps.json");
+
+        let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
+
+        // Start the writer task
+        let path_clone = file_path.clone();
+        let writer_handle =
+            tokio::spawn(async move { write_last_timestamp(path_clone, receiver).await });
+
+        // Send some timestamps
+        sender
+            .send(("1".to_string(), 1_000_000_000_i64))
+            .await
+            .unwrap();
+        sender
+            .send(("2".to_string(), 2_000_000_000_i64))
+            .await
+            .unwrap();
+
+        // Give time for writes to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Close sender to end the writer task
+        drop(sender);
+        let _ = writer_handle.await;
+
+        // Verify file contents
+        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
+        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
+
+        assert!(json.is_object());
+        let map = json.as_object().unwrap();
+        assert_eq!(
+            map.get("1").and_then(serde_json::Value::as_i64),
+            Some(1_000_000_000)
+        );
+        assert_eq!(
+            map.get("2").and_then(serde_json::Value::as_i64),
+            Some(2_000_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_last_timestamp_updates_existing() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("timestamps.json");
+
+        let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
+
+        let path_clone = file_path.clone();
+        let writer_handle =
+            tokio::spawn(async move { write_last_timestamp(path_clone, receiver).await });
+
+        // Send initial timestamp
+        sender
+            .send(("1".to_string(), 1_000_000_000_i64))
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Update with new timestamp
+        sender
+            .send(("1".to_string(), 3_000_000_000_i64))
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        drop(sender);
+        let _ = writer_handle.await;
+
+        // Verify the updated value
+        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
+        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
+        let map = json.as_object().unwrap();
+        assert_eq!(
+            map.get("1").and_then(serde_json::Value::as_i64),
+            Some(3_000_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_last_timestamp_from_file() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("timestamps.json");
+
+        // Use unique keys to avoid interference with other tests
+        let key1 = format!("read_test_policy_{}", std::process::id());
+        let key2 = format!("read_test_policy2_{}", std::process::id());
+        let json_content = format!("{{\"{key1}\": 1234567890, \"{key2}\": 9876543210}}");
+
+        // Pre-write a JSON file with known content
+        let mut file = File::create(&file_path).expect("failed to create file");
+        file.write_all(json_content.as_bytes())
+            .expect("failed to write");
+        drop(file);
+
+        // Remove our keys first if they exist from a previous run
+        LAST_TRANSFER_TIME.write().await.remove(&key1);
+        LAST_TRANSFER_TIME.write().await.remove(&key2);
+
+        // Read the file
+        read_last_timestamp(&file_path)
+            .await
+            .expect("failed to read");
+
+        // Verify the in-memory state contains our keys
+        let map = LAST_TRANSFER_TIME.read().await;
+        assert_eq!(map.get(&key1), Some(&1_234_567_890_i64));
+        assert_eq!(map.get(&key2), Some(&9_876_543_210_i64));
+
+        // Cleanup
+        drop(map);
+        LAST_TRANSFER_TIME.write().await.remove(&key1);
+        LAST_TRANSFER_TIME.write().await.remove(&key2);
+    }
+
+    #[tokio::test]
+    async fn test_read_last_timestamp_nonexistent_file() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("nonexistent.json");
+
+        // Reading a nonexistent file should succeed (no-op) and not modify the map
+        // We can't assert the map is empty since tests run in parallel,
+        // but we can verify the call succeeds
+        let result = read_last_timestamp(&file_path).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_read_last_timestamp_invalid_json() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("invalid.json");
+
+        // Write invalid JSON
+        let mut file = File::create(&file_path).expect("failed to create file");
+        file.write_all(b"not valid json").expect("failed to write");
+        drop(file);
+
+        // Clear the global state
+        LAST_TRANSFER_TIME.write().await.clear();
+
+        // Reading invalid JSON should fail
+        let result = read_last_timestamp(&file_path).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_last_timestamp_wrong_format() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("wrong_format.json");
+
+        // Write JSON array instead of object
+        let mut file = File::create(&file_path).expect("failed to create file");
+        file.write_all(b"[1, 2, 3]").expect("failed to write");
+        drop(file);
+
+        // Clear the global state
+        LAST_TRANSFER_TIME.write().await.clear();
+
+        // Reading wrong format should fail
+        let result = read_last_timestamp(&file_path).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_last_timestamp_removes_entry() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("timestamps.json");
+
+        // Pre-write a JSON file with multiple entries
+        let mut file = File::create(&file_path).expect("failed to create file");
+        file.write_all(b"{\"1\": 1000, \"2\": 2000, \"3\": 3000}")
+            .expect("failed to write");
+        drop(file);
+
+        // Delete entry with id=2
+        delete_last_timestamp(&file_path, 2).expect("failed to delete");
+
+        // Verify the file contents
+        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
+        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
+        let map = json.as_object().unwrap();
+
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("1"));
+        assert!(!map.contains_key("2"));
+        assert!(map.contains_key("3"));
+    }
+
+    #[test]
+    fn test_delete_last_timestamp_nonexistent_entry() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("timestamps.json");
+
+        // Pre-write a JSON file
+        let mut file = File::create(&file_path).expect("failed to create file");
+        file.write_all(b"{\"1\": 1000, \"2\": 2000}")
+            .expect("failed to write");
+        drop(file);
+
+        // Delete entry with id=99 (doesn't exist)
+        delete_last_timestamp(&file_path, 99).expect("should succeed even if entry doesn't exist");
+
+        // Verify original entries are still there
+        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
+        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
+        let map = json.as_object().unwrap();
+
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("1"));
+        assert!(map.contains_key("2"));
+    }
+
+    #[test]
+    fn test_delete_last_timestamp_nonexistent_file() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("nonexistent.json");
+
+        // Deleting from nonexistent file should fail
+        let result = delete_last_timestamp(&file_path, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_last_timestamp_last_entry() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("timestamps.json");
+
+        // Pre-write a JSON file with single entry
+        let mut file = File::create(&file_path).expect("failed to create file");
+        file.write_all(b"{\"1\": 1000}").expect("failed to write");
+        drop(file);
+
+        // Delete the only entry
+        delete_last_timestamp(&file_path, 1).expect("failed to delete");
+
+        // Verify the file is now empty object
+        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
+        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
+        let map = json.as_object().unwrap();
+
+        assert!(map.is_empty());
+    }
+
+    // =========================================================================
+    // Tests for event_value function
+    // =========================================================================
+
+    #[test]
+    fn test_event_value_none_column_returns_1() {
+        let conn = create_test_conn();
+        let event = Event::Conn(conn);
+
+        // When column is None, should return 1.0 (count events)
+        let value = event_value(None, &event);
+        assert!((value - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_event_value_conn_columns() {
+        let conn = giganto_client::ingest::network::Conn {
+            orig_addr: "192.168.1.1".parse().unwrap(),
+            resp_addr: "192.168.1.2".parse().unwrap(),
+            orig_port: 12345,
+            resp_port: 80,
+            proto: 6,
+            conn_state: "SF".to_string(),
+            service: "http".to_string(),
+            duration: 1_500_000_000, // 1.5 seconds in nanoseconds
+            orig_bytes: 1000,
+            resp_bytes: 2000,
+            orig_pkts: 10,
+            resp_pkts: 20,
+            orig_l2_bytes: 1100,
+            resp_l2_bytes: 2100,
+            start_time: 0,
+        };
+        let event = Event::Conn(conn);
+
+        // Column 5: duration
+        assert!((event_value(Some(5), &event) - 1_500_000_000.0).abs() < f64::EPSILON);
+
+        // Column 7: orig_bytes
+        assert!((event_value(Some(7), &event) - 1000.0).abs() < f64::EPSILON);
+
+        // Column 8: resp_bytes
+        assert!((event_value(Some(8), &event) - 2000.0).abs() < f64::EPSILON);
+
+        // Column 9: orig_pkts
+        assert!((event_value(Some(9), &event) - 10.0).abs() < f64::EPSILON);
+
+        // Column 10: resp_pkts
+        assert!((event_value(Some(10), &event) - 20.0).abs() < f64::EPSILON);
+
+        // Unknown column should return 1.0
+        assert!((event_value(Some(99), &event) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_event_value_dns_returns_1() {
+        let dns = giganto_client::ingest::network::Dns {
+            orig_addr: "192.168.1.1".parse().unwrap(),
+            orig_port: 54321,
+            resp_addr: "8.8.8.8".parse().unwrap(),
+            resp_port: 53,
+            proto: 17,
+            start_time: 0,
+            duration: 50_000_000,
+            orig_pkts: 1,
+            resp_pkts: 1,
+            orig_l2_bytes: 100,
+            resp_l2_bytes: 200,
+            query: "example.com".to_string(),
+            answer: vec!["93.184.216.34".to_string()],
+            trans_id: 12345,
+            rtt: 50,
+            qclass: 1,
+            qtype: 1,
+            rcode: 0,
+            aa_flag: false,
+            tc_flag: false,
+            rd_flag: true,
+            ra_flag: true,
+            ttl: vec![300],
+        };
+        let event = Event::Dns(dns);
+
+        // DNS events always return 1.0 regardless of column
+        assert!((event_value(Some(5), &event) - 1.0).abs() < f64::EPSILON);
+        assert!((event_value(Some(7), &event) - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// Helper to create a test Conn event
+    fn create_test_conn() -> giganto_client::ingest::network::Conn {
+        giganto_client::ingest::network::Conn {
+            orig_addr: "192.168.1.1".parse().unwrap(),
+            resp_addr: "192.168.1.2".parse().unwrap(),
+            orig_port: 12345,
+            resp_port: 80,
+            proto: 6,
+            conn_state: "SF".to_string(),
+            service: "http".to_string(),
+            duration: 1_000_000_000,
+            orig_bytes: 100,
+            resp_bytes: 200,
+            orig_pkts: 5,
+            resp_pkts: 10,
+            orig_l2_bytes: 110,
+            resp_l2_bytes: 210,
+            start_time: 0,
+        }
+    }
+
+    /// Helper to create a Conn event with specific values for column aggregation tests
+    fn create_conn_with_values(
+        duration: i64,
+        orig_bytes: u64,
+        resp_bytes: u64,
+        orig_pkts: u64,
+        resp_pkts: u64,
+    ) -> giganto_client::ingest::network::Conn {
+        giganto_client::ingest::network::Conn {
+            orig_addr: "192.168.1.1".parse().unwrap(),
+            resp_addr: "192.168.1.2".parse().unwrap(),
+            orig_port: 12345,
+            resp_port: 80,
+            proto: 6,
+            conn_state: "SF".to_string(),
+            service: "http".to_string(),
+            duration,
+            orig_bytes,
+            resp_bytes,
+            orig_pkts,
+            resp_pkts,
+            orig_l2_bytes: 0,
+            resp_l2_bytes: 0,
+            start_time: 0,
+        }
+    }
+
+    /// Helper to create a `TimeSeries` for testing fill behavior
+    fn create_test_series(policy_id: &str, num_slots: usize, start_timestamp: i64) -> TimeSeries {
+        TimeSeries {
+            sampling_policy_id: policy_id.to_string(),
+            start: datetime_from_timestamp(start_timestamp),
+            series: vec![0_f64; num_slots],
+        }
+    }
+
+    // =========================================================================
+    // Tests for TimeSeries::fill and column aggregation
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_fill_single_event_counts_as_one() {
+        // Period: 1 hour, Interval: 15 min => 4 slots
+        // column: None => count events (each event adds 1.0)
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+
+        // Create a time series starting at midnight
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        let mut series = create_test_series("1", 4, midnight);
+
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Event at 00:05:00 => slot 0
+        let event_time = datetime_from_timestamp(midnight + 5 * 60);
+        let conn = create_test_conn();
+        series
+            .fill(&policy, event_time, &Event::Conn(conn), &sender)
+            .await
+            .expect("fill should succeed");
+
+        // Verify slot 0 has value 1.0
+        assert!((series.series[0] - 1.0).abs() < f64::EPSILON);
+        assert!((series.series[1] - 0.0).abs() < f64::EPSILON);
+        assert!((series.series[2] - 0.0).abs() < f64::EPSILON);
+        assert!((series.series[3] - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_fill_multiple_events_same_slot_aggregates() {
+        // Period: 1 hour, Interval: 15 min => 4 slots
+        // column: None => count events
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        let mut series = create_test_series("1", 4, midnight);
+
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Three events at different times within slot 0 (00:00 - 00:15)
+        for minutes in [1, 5, 14] {
+            let event_time = datetime_from_timestamp(midnight + minutes * 60);
+            let conn = create_test_conn();
+            series
+                .fill(&policy, event_time, &Event::Conn(conn), &sender)
+                .await
+                .expect("fill should succeed");
+        }
+
+        // Verify slot 0 has value 3.0 (three events aggregated)
+        assert!((series.series[0] - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_fill_events_in_different_slots() {
+        // Period: 1 hour, Interval: 15 min => 4 slots
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        let mut series = create_test_series("1", 4, midnight);
+
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Events in each slot
+        // Slot 0: 00:05:00 (2 events)
+        // Slot 1: 00:20:00 (1 event)
+        // Slot 2: 00:35:00 (3 events)
+        // Slot 3: 00:50:00 (1 event)
+        let event_times_per_slot = [
+            vec![5, 10],      // slot 0
+            vec![20],         // slot 1
+            vec![30, 35, 44], // slot 2
+            vec![50],         // slot 3
+        ];
+
+        for (slot, times) in event_times_per_slot.iter().enumerate() {
+            for &minutes in times {
+                let event_time = datetime_from_timestamp(midnight + minutes * 60);
+                let conn = create_test_conn();
+                series
+                    .fill(&policy, event_time, &Event::Conn(conn), &sender)
+                    .await
+                    .expect("fill should succeed");
+            }
+            assert!(
+                (series.series[slot] - times.len() as f64).abs() < f64::EPSILON,
+                "slot {} should have {} events",
+                slot,
+                times.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fill_with_column_aggregation_duration() {
+        // Period: 1 hour, Interval: 15 min => 4 slots
+        // column: Some(5) => sum duration values
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(5));
+
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        let mut series = create_test_series("1", 4, midnight);
+
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Add events with different durations to slot 0
+        let durations = [1_000_000_000_i64, 2_000_000_000, 500_000_000];
+        for (i, &duration) in durations.iter().enumerate() {
+            let event_time = datetime_from_timestamp(midnight + (i as i64 + 1) * 60);
+            let conn = create_conn_with_values(duration, 0, 0, 0, 0);
+            series
+                .fill(&policy, event_time, &Event::Conn(conn), &sender)
+                .await
+                .expect("fill should succeed");
+        }
+
+        // Verify slot 0 has sum of durations
+        let expected_sum: f64 = durations.iter().map(|&d| d as f64).sum();
+        assert!(
+            (series.series[0] - expected_sum).abs() < f64::EPSILON,
+            "expected {} but got {}",
+            expected_sum,
+            series.series[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fill_with_column_aggregation_bytes() {
+        // Period: 1 hour, Interval: 15 min => 4 slots
+        // column: Some(7) => sum orig_bytes values
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(7));
+
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        let mut series = create_test_series("1", 4, midnight);
+
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Add events with different orig_bytes to slot 1 (15-30 minutes)
+        let bytes_values = [100_u64, 200, 300, 400];
+        for (i, &bytes) in bytes_values.iter().enumerate() {
+            let event_time = datetime_from_timestamp(midnight + 15 * 60 + (i as i64 + 1) * 60);
+            let conn = create_conn_with_values(0, bytes, 0, 0, 0);
+            series
+                .fill(&policy, event_time, &Event::Conn(conn), &sender)
+                .await
+                .expect("fill should succeed");
+        }
+
+        // Verify slot 0 is empty
+        assert!((series.series[0] - 0.0).abs() < f64::EPSILON);
+
+        // Verify slot 1 has sum of orig_bytes
+        let expected_sum: f64 = bytes_values.iter().map(|&b| b as f64).sum();
+        assert!(
+            (series.series[1] - expected_sum).abs() < f64::EPSILON,
+            "expected {} but got {}",
+            expected_sum,
+            series.series[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fill_with_column_aggregation_packets() {
+        // Period: 1 hour, Interval: 30 min => 2 slots
+        // column: Some(9) => sum orig_pkts values
+        let policy = create_policy(1, SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 0, Some(9));
+
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        let mut series = create_test_series("1", 2, midnight);
+
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Add events to both slots
+        // Slot 0: packets 10, 20, 30
+        // Slot 1: packets 5, 15
+        for minutes in [5, 10, 25] {
+            let packets = ((minutes / 5) * 10) as u64;
+            let event_time = datetime_from_timestamp(midnight + minutes * 60);
+            let conn = create_conn_with_values(0, 0, 0, packets, 0);
+            series
+                .fill(&policy, event_time, &Event::Conn(conn), &sender)
+                .await
+                .expect("fill should succeed");
+        }
+
+        // Slot 1: 35 min and 45 min
+        for minutes in [35, 45] {
+            let packets = ((minutes - 30) / 2) as u64;
+            let event_time = datetime_from_timestamp(midnight + minutes * 60);
+            let conn = create_conn_with_values(0, 0, 0, packets, 0);
+            series
+                .fill(&policy, event_time, &Event::Conn(conn), &sender)
+                .await
+                .expect("fill should succeed");
+        }
+
+        // Verify slot 0: 10 + 20 + 50 = 80 (minutes 5=>10, 10=>20, 25=>50)
+        assert!(
+            (series.series[0] - 80.0).abs() < f64::EPSILON,
+            "slot 0 expected 80 but got {}",
+            series.series[0]
+        );
+
+        // Verify slot 1: 2 + 7 = 9 (minutes 35=>2, 45=>7)
+        assert!(
+            (series.series[1] - 9.0).abs() < f64::EPSILON,
+            "slot 1 expected 9 but got {}",
+            series.series[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fill_period_boundary_sends_and_resets() {
+        // Period: 1 hour, Interval: 15 min => 4 slots
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        let mut series = create_test_series("1", 4, midnight);
+
+        let (sender, receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Add an event in the first period (slot 0)
+        let event_time = datetime_from_timestamp(midnight + 5 * 60);
+        let conn = create_test_conn();
+        series
+            .fill(&policy, event_time, &Event::Conn(conn), &sender)
+            .await
+            .expect("fill should succeed");
+
+        assert!((series.series[0] - 1.0).abs() < f64::EPSILON);
+
+        // Add an event beyond the period boundary (> 1 hour later)
+        // This should trigger sending the current series and resetting
+        let event_time_next_period = datetime_from_timestamp(midnight + 61 * 60 + 5);
+        let conn = create_test_conn();
+        series
+            .fill(&policy, event_time_next_period, &Event::Conn(conn), &sender)
+            .await
+            .expect("fill should succeed");
+
+        // The series should have been reset (slot 0 now has a new event)
+        // The old series was sent to the channel
+        let sent_series = receiver.try_recv().expect("should have received a series");
+        assert!((sent_series.series[0] - 1.0).abs() < f64::EPSILON);
+
+        // The current series should have the new event
+        // The new event at 61:05 falls into slot 0 of the new period
+        assert!((series.series[0] - 1.0).abs() < f64::EPSILON);
+        assert!((series.series[1] - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_fill_with_offset_affects_slot_calculation() {
+        // Period: 1 day, Interval: 1 hour => 24 slots
+        // Offset: +9 hours (32400s) - simulates timezone adjustment
+        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
+
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        // Start time should be adjusted for the offset
+        let start_time = midnight - 9 * 3600; // 15:00 previous day in UTC
+        let mut series = create_test_series("1", 24, start_time);
+
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Event at midnight UTC with +9h offset should land in slot 9
+        // because offset_time = midnight + 9h = 09:00
+        let event_time = datetime_from_timestamp(midnight);
+        let conn = create_test_conn();
+        series
+            .fill(&policy, event_time, &Event::Conn(conn), &sender)
+            .await
+            .expect("fill should succeed");
+
+        assert!((series.series[9] - 1.0).abs() < f64::EPSILON);
+
+        // All other slots should be empty
+        for (i, &value) in series.series.iter().enumerate() {
+            if i != 9 {
+                assert!(
+                    (value - 0.0).abs() < f64::EPSILON,
+                    "slot {i} should be 0 but is {value}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fill_missing_slots_remain_zero() {
+        // Period: 1 hour, Interval: 10 min => 6 slots
+        let policy = create_policy(1, SECS_PER_HOUR, 10 * SECS_PER_MINUTE, 0, None);
+
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        let mut series = create_test_series("1", 6, midnight);
+
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Only add events to slots 0, 2, and 5 (skip 1, 3, 4)
+        for minutes in [5, 25, 55] {
+            let event_time = datetime_from_timestamp(midnight + minutes * 60);
+            let conn = create_test_conn();
+            series
+                .fill(&policy, event_time, &Event::Conn(conn), &sender)
+                .await
+                .expect("fill should succeed");
+        }
+
+        // Verify only specific slots have values
+        assert!((series.series[0] - 1.0).abs() < f64::EPSILON);
+        assert!((series.series[1] - 0.0).abs() < f64::EPSILON); // missing
+        assert!((series.series[2] - 1.0).abs() < f64::EPSILON);
+        assert!((series.series[3] - 0.0).abs() < f64::EPSILON); // missing
+        assert!((series.series[4] - 0.0).abs() < f64::EPSILON); // missing
+        assert!((series.series[5] - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_fill_duplicate_timestamps_aggregate() {
+        // Period: 1 hour, Interval: 15 min => 4 slots
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+
+        let midnight = BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400);
+        let mut series = create_test_series("1", 4, midnight);
+
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+
+        // Add multiple events with exactly the same timestamp
+        let event_time = datetime_from_timestamp(midnight + 5 * 60);
+        for _ in 0..5 {
+            let conn = create_test_conn();
+            series
+                .fill(&policy, event_time, &Event::Conn(conn), &sender)
+                .await
+                .expect("fill should succeed");
+        }
+
+        // All 5 events should aggregate into slot 0
+        assert!((series.series[0] - 5.0).abs() < f64::EPSILON);
+    }
+}
