@@ -36,3 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [lints.clippy]
 pedantic = "warn"
 unwrap_used = "warn"
+
+[dev-dependencies]
+rcgen = "0.14.6"
+tempfile = "3.24.0"
