@@ -12,13 +12,14 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(5_000);
 pub(crate) const SERVER_RETRY_INTERVAL: u64 = 3;
 
 #[allow(clippy::struct_field_names)]
-pub(crate) struct Certs {
-    pub(crate) certs: Vec<CertificateDer<'static>>,
-    pub(crate) key: PrivateKeyDer<'static>,
-    pub(crate) ca_certs: RootCertStore,
+pub struct Certs {
+    pub certs: Vec<CertificateDer<'static>>,
+    pub key: PrivateKeyDer<'static>,
+    pub ca_certs: RootCertStore,
 }
 
 impl Certs {
+    #[allow(dead_code)] // Used by main.rs binary, not in lib
     pub(crate) fn try_new(cert_pem: &[u8], key_pem: &[u8], ca_certs_pem: &[&[u8]]) -> Result<Self> {
         let certs = Self::to_cert_chain(cert_pem).context("cannot read certificate chain")?;
         assert!(!certs.is_empty());
@@ -31,14 +32,27 @@ impl Certs {
         })
     }
 
-    pub(crate) fn to_cert_chain(raw: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
+    /// Parses a PEM-encoded certificate chain into DER format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PEM data cannot be parsed as a certificate chain.
+    pub fn to_cert_chain(raw: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
         let certs = rustls_pemfile::certs(&mut &*raw)
             .collect::<Result<_, _>>()
             .context("cannot parse certificate chain")?;
         Ok(certs)
     }
 
-    pub(crate) fn to_private_key(raw: &[u8]) -> Result<PrivateKeyDer<'static>> {
+    /// Parses a PEM-encoded private key into DER format.
+    ///
+    /// Supports PKCS#1 and PKCS#8 key formats.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PEM data cannot be parsed as a private key
+    /// or if the key format is not PKCS#1 or PKCS#8.
+    pub fn to_private_key(raw: &[u8]) -> Result<PrivateKeyDer<'static>> {
         match rustls_pemfile::read_one(&mut &*raw)
             .context("cannot parse private key")?
             .ok_or_else(|| anyhow!("empty private key"))?
@@ -49,7 +63,13 @@ impl Certs {
         }
     }
 
-    pub(crate) fn to_ca_certs(ca_certs_pem: &[&[u8]]) -> Result<rustls::RootCertStore> {
+    /// Parses PEM-encoded CA certificates into a root certificate store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the PEM data cannot be parsed as a certificate
+    /// or if a certificate cannot be added to the root store.
+    pub fn to_ca_certs(ca_certs_pem: &[&[u8]]) -> Result<rustls::RootCertStore> {
         let mut root_cert = rustls::RootCertStore::empty();
         for &ca_cert_pem in ca_certs_pem {
             let root_certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut &*ca_cert_pem)
