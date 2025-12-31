@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::future::Future;
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, process::exit, sync::Arc};
 
 use anyhow::{Context, Result, bail};
@@ -182,6 +184,39 @@ impl Client {
         }
     }
 
+    #[cfg(test)]
+    async fn enter_idle_mode_with_try_connect<F, Fut>(
+        &mut self,
+        health_check: bool,
+        mut try_connect: F,
+    ) where
+        F: for<'a> FnMut(&'a mut Client, bool) -> Fut,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        info_or_print!("Entering idle mode");
+        self.status = Status::Idle;
+        let config_reload = self.config_reload.clone();
+        tokio::select! {
+            () = async {
+                loop {
+                    match try_connect(self, health_check).await {
+                        Ok(()) => {
+                            info_or_print!("The Manager server is now online");
+                            self.status = Status::Ready;
+                            return
+                        },
+                        Err(e) => {
+                            info_or_print!("Connection attempt failed: {e}, retrying");
+                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                        },
+                    }
+                }} => {},
+            () = config_reload.notified() => {
+                self.status = Status::Ready;
+            }
+        }
+    }
+
     async fn try_connect(&mut self, health_check: bool) -> Result<()> {
         let connection = self.connect().await?;
         if health_check {
@@ -320,6 +355,10 @@ impl review_protocol::request::Handler for IdleModeHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
 
     use review_protocol::types::{SamplingKind, SamplingPolicy};
@@ -516,6 +555,37 @@ mod tests {
         assert!(client.active_policy_list.read().await.is_empty());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_does_not_update_existing_policy() {
+        // Test: Duplicate ID should not update existing policy data
+        let (mut client, rx) = create_test_client();
+        let policy = create_test_policy(1);
+
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        let mut updated_policy = create_test_policy(1);
+        updated_policy.interval = Duration::from_secs(30);
+        updated_policy.node = Some("updated_node".to_string());
+
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[updated_policy])
+            .await
+            .unwrap();
+
+        let stored = client
+            .active_policy_list
+            .read()
+            .await
+            .get(&1)
+            .cloned()
+            .unwrap();
+        assert_eq!(stored.interval, Duration::from_secs(60));
+        assert_eq!(stored.node.as_deref(), Some("test_node"));
+        assert!(rx.try_recv().is_err());
+    }
+
     // =========================================================================
     // Delete Queue Accumulation Tests
     // =========================================================================
@@ -693,12 +763,52 @@ mod tests {
 
         // Enter idle mode with health_check = false
         // This should wait for config reload notification
-        client.enter_idle_mode(false).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.enter_idle_mode_with_try_connect(false, |_client, _| async {
+                Err(anyhow::anyhow!("forced failure"))
+            }),
+        )
+        .await;
+        assert!(result.is_ok());
 
         // Verify status is Ready after exiting idle mode
         assert!(matches!(client.status, Status::Ready));
 
         notify_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_health_check_returns_immediately() {
+        // Test: health_check=true returns without waiting for config_reload
+        let (mut client, _rx) = create_test_client();
+        let config_reload = client.config_reload.clone();
+        let called = Arc::new(AtomicUsize::new(0));
+        let called_ref = called.clone();
+
+        let wait_task = tokio::spawn(async move {
+            config_reload.notified().await;
+            true
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.enter_idle_mode_with_try_connect(true, move |_client, _| {
+                let called_ref = called_ref.clone();
+                async move {
+                    called_ref.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        assert!(matches!(client.status, Status::Ready));
+
+        let wait_result = tokio::time::timeout(Duration::from_millis(20), wait_task).await;
+        assert!(wait_result.is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -734,7 +844,14 @@ mod tests {
         // Notify immediately to exit idle mode quickly
         config_reload.notify_one();
 
-        client.enter_idle_mode(false).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.enter_idle_mode_with_try_connect(false, |_client, _| async {
+                Err(anyhow::anyhow!("forced failure"))
+            }),
+        )
+        .await;
+        assert!(result.is_ok());
 
         // After exiting, status should be Ready
         assert!(matches!(client.status, Status::Ready));
