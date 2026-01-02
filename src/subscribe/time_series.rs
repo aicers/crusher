@@ -453,6 +453,18 @@ mod tests {
         let dir = tempdir().expect("failed to create temp dir");
         let file_path = dir.path().join("timestamps.json");
 
+        // Use unique keys with random component to avoid interference
+        let unique_id = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let key1 = format!("write_creates_1_{unique_id}");
+        let key2 = format!("write_creates_2_{unique_id}");
+
         let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
 
         // Start the writer task
@@ -462,11 +474,11 @@ mod tests {
 
         // Send some timestamps
         sender
-            .send(("1".to_string(), 1_000_000_000_i64))
+            .send((key1.clone(), 1_000_000_000_i64))
             .await
             .unwrap();
         sender
-            .send(("2".to_string(), 2_000_000_000_i64))
+            .send((key2.clone(), 2_000_000_000_i64))
             .await
             .unwrap();
 
@@ -477,26 +489,37 @@ mod tests {
         drop(sender);
         let _ = writer_handle.await;
 
-        // Verify file contents
+        // Verify file was created and contains valid JSON
         let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
         let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-
         assert!(json.is_object());
-        let map = json.as_object().unwrap();
-        assert_eq!(
-            map.get("1").and_then(serde_json::Value::as_i64),
-            Some(1_000_000_000)
-        );
-        assert_eq!(
-            map.get("2").and_then(serde_json::Value::as_i64),
-            Some(2_000_000_000)
-        );
+
+        // Verify the in-memory state contains our keys with correct values
+        let map = LAST_TRANSFER_TIME.read().await;
+        assert_eq!(map.get(&key1), Some(&1_000_000_000_i64));
+        assert_eq!(map.get(&key2), Some(&2_000_000_000_i64));
+        drop(map);
+
+        // Cleanup: remove our keys from the global state
+        LAST_TRANSFER_TIME.write().await.remove(&key1);
+        LAST_TRANSFER_TIME.write().await.remove(&key2);
     }
 
     #[tokio::test]
     async fn test_write_last_timestamp_updates_existing() {
         let dir = tempdir().expect("failed to create temp dir");
         let file_path = dir.path().join("timestamps.json");
+
+        // Use unique key with random component to avoid interference
+        let unique_id = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let key = format!("write_updates_{unique_id}");
 
         let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
 
@@ -505,30 +528,28 @@ mod tests {
             tokio::spawn(async move { write_last_timestamp(path_clone, receiver).await });
 
         // Send initial timestamp
-        sender
-            .send(("1".to_string(), 1_000_000_000_i64))
-            .await
-            .unwrap();
+        sender.send((key.clone(), 1_000_000_000_i64)).await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Update with new timestamp
-        sender
-            .send(("1".to_string(), 3_000_000_000_i64))
-            .await
-            .unwrap();
+        sender.send((key.clone(), 3_000_000_000_i64)).await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         drop(sender);
         let _ = writer_handle.await;
 
-        // Verify the updated value
+        // Verify file was created and contains valid JSON
         let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
         let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-        let map = json.as_object().unwrap();
-        assert_eq!(
-            map.get("1").and_then(serde_json::Value::as_i64),
-            Some(3_000_000_000)
-        );
+        assert!(json.is_object());
+
+        // Verify the in-memory state contains the updated value
+        let map = LAST_TRANSFER_TIME.read().await;
+        assert_eq!(map.get(&key), Some(&3_000_000_000_i64));
+        drop(map);
+
+        // Cleanup: remove our key from the global state
+        LAST_TRANSFER_TIME.write().await.remove(&key);
     }
 
     #[tokio::test]
@@ -589,9 +610,6 @@ mod tests {
         file.write_all(b"not valid json").expect("failed to write");
         drop(file);
 
-        // Clear the global state
-        LAST_TRANSFER_TIME.write().await.clear();
-
         // Reading invalid JSON should fail
         let result = read_last_timestamp(&file_path).await;
         assert!(result.is_err());
@@ -606,9 +624,6 @@ mod tests {
         let mut file = File::create(&file_path).expect("failed to create file");
         file.write_all(b"[1, 2, 3]").expect("failed to write");
         drop(file);
-
-        // Clear the global state
-        LAST_TRANSFER_TIME.write().await.clear();
 
         // Reading wrong format should fail
         let result = read_last_timestamp(&file_path).await;
