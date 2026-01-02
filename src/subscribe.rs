@@ -112,8 +112,7 @@ impl ColumnValue for Rdp {}
 
 impl ColumnValue for Http {}
 
-#[cfg_attr(feature = "integration-tests", allow(missing_docs))]
-pub struct Client {
+pub(crate) struct Client {
     ingest_addr: SocketAddr,
     publish_addr: SocketAddr,
     server_name: String,
@@ -124,14 +123,7 @@ pub struct Client {
 
 #[allow(clippy::too_many_arguments)]
 impl Client {
-    /// Creates a new subscription client.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the QUIC endpoint cannot be configured with the provided
-    /// certificates.
-    #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         ingest_addr: SocketAddr,
         publish_addr: SocketAddr,
         server_name: String,
@@ -151,14 +143,7 @@ impl Client {
         }
     }
 
-    /// Runs the subscription pipeline, managing connections to the Giganto
-    /// server and processing policies.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a connection to the Giganto server fails
-    /// or cannot be recovered.
-    pub async fn run(
+    pub(crate) async fn run(
         self,
         active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,
@@ -538,16 +523,7 @@ async fn receiver(
     Ok(())
 }
 
-/// Reads the last timestamp data from a JSON file into memory.
-///
-/// This function initializes the timestamp tracking state from persistent
-/// storage. It should be called at startup before running the subscription
-/// pipeline.
-///
-/// # Errors
-///
-/// Returns an error if the file exists but cannot be read or parsed.
-pub async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
+pub(crate) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
     time_series::read_last_timestamp(last_series_time_path).await
 }
 
