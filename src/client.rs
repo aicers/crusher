@@ -22,7 +22,6 @@ pub(crate) struct Certs {
 impl Certs {
     pub(crate) fn try_new(cert_pem: &[u8], key_pem: &[u8], ca_certs_pem: &[&[u8]]) -> Result<Self> {
         let certs = Self::to_cert_chain(cert_pem).context("cannot read certificate chain")?;
-        assert!(!certs.is_empty());
         let key = Self::to_private_key(key_pem).context("cannot read private key")?;
         let ca_certs = Self::to_ca_certs(ca_certs_pem).context("failed to read CA certificates")?;
         Ok(Self {
@@ -33,9 +32,12 @@ impl Certs {
     }
 
     pub(crate) fn to_cert_chain(raw: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
-        let certs = rustls_pemfile::certs(&mut &*raw)
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &*raw)
             .collect::<Result<_, _>>()
             .context("cannot parse certificate chain")?;
+        if certs.is_empty() {
+            return Err(anyhow!("empty certificate chain"));
+        }
         Ok(certs)
     }
 
@@ -61,6 +63,9 @@ impl Certs {
                     .add(cert.to_owned())
                     .context("failed to add CA certificate")?;
             }
+        }
+        if root_cert.is_empty() {
+            return Err(anyhow!("empty CA certificate store"));
         }
         Ok(root_cert)
     }
@@ -149,9 +154,14 @@ mod tests {
     }
 
     #[test]
-    fn test_to_cert_chain_empty_returns_empty() {
-        let certs = Certs::to_cert_chain(b"").expect("Empty input should return empty vec");
-        assert!(certs.is_empty());
+    fn test_to_cert_chain_empty_returns_error() {
+        let result = Certs::to_cert_chain(b"");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty certificate chain"),
+            "Error message should contain 'empty certificate chain': {err_msg}"
+        );
     }
 
     #[test]
@@ -168,10 +178,15 @@ mod tests {
     }
 
     #[test]
-    fn test_to_cert_chain_non_pem_data() {
+    fn test_to_cert_chain_non_pem_data_returns_error() {
         let garbage = b"this is not a PEM file at all";
-        let certs = Certs::to_cert_chain(garbage).expect("Non-PEM data returns empty vec");
-        assert!(certs.is_empty());
+        let result = Certs::to_cert_chain(garbage);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty certificate chain"),
+            "Error message should contain 'empty certificate chain': {err_msg}"
+        );
     }
 
     // =========================================================================
@@ -276,18 +291,27 @@ mod tests {
     }
 
     #[test]
-    fn test_to_ca_certs_empty_list() {
+    fn test_to_ca_certs_empty_list_returns_error() {
         let ca_certs_pem: &[&[u8]] = &[];
-        let root_store = Certs::to_ca_certs(ca_certs_pem).expect("Empty list should succeed");
-        assert!(root_store.is_empty());
+        let result = Certs::to_ca_certs(ca_certs_pem);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty CA certificate store"),
+            "Error message should contain 'empty CA certificate store': {err_msg}"
+        );
     }
 
     #[test]
-    fn test_to_ca_certs_empty_pem() {
+    fn test_to_ca_certs_empty_pem_returns_error() {
         let ca_certs_pem: &[&[u8]] = &[b""];
-        let root_store = Certs::to_ca_certs(ca_certs_pem)
-            .expect("Empty PEM content should succeed with empty store");
-        assert!(root_store.is_empty());
+        let result = Certs::to_ca_certs(ca_certs_pem);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty CA certificate store"),
+            "Error message should contain 'empty CA certificate store': {err_msg}"
+        );
     }
 
     #[test]
@@ -305,12 +329,16 @@ mod tests {
     }
 
     #[test]
-    fn test_to_ca_certs_non_pem_data() {
+    fn test_to_ca_certs_non_pem_data_returns_error() {
         let garbage: &[u8] = b"this is not a certificate";
         let ca_certs_pem: &[&[u8]] = &[garbage];
-        let root_store =
-            Certs::to_ca_certs(ca_certs_pem).expect("Non-PEM data should succeed with empty store");
-        assert!(root_store.is_empty());
+        let result = Certs::to_ca_certs(ca_certs_pem);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty CA certificate store"),
+            "Error message should contain 'empty CA certificate store': {err_msg}"
+        );
     }
 
     // =========================================================================
