@@ -1195,4 +1195,120 @@ mod tests {
         // All 5 events should aggregate into slot 0
         assert!((series.series[0] - 5.0).abs() < f64::EPSILON);
     }
+
+    // =========================================================================
+    // Tests for SamplingPolicyExt::start_timestamp
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_start_timestamp_no_last_transmission() {
+        // When there is no last transmission timestamp in LAST_TRANSFER_TIME,
+        // start_timestamp() should return 0
+
+        // Use a unique policy ID that won't conflict with other tests
+        let policy_id = 999_999_u32;
+        let policy = SamplingPolicy {
+            id: policy_id,
+            kind: SamplingKind::Conn,
+            interval: Duration::from_secs(60),
+            period: Duration::from_secs(3600),
+            offset: 0,
+            src_ip: None,
+            dst_ip: None,
+            node: Some("test_start_timestamp_no_last".to_string()),
+            column: None,
+        };
+
+        // Ensure the key doesn't exist in the global map
+        LAST_TRANSFER_TIME
+            .write()
+            .await
+            .remove(&policy_id.to_string());
+
+        // start_timestamp should return 0 when no last timestamp exists
+        let start = policy.start_timestamp().await.expect("should succeed");
+        assert_eq!(start, 0);
+    }
+
+    #[tokio::test]
+    async fn test_start_timestamp_with_last_transmission() {
+        // When there is a last transmission timestamp, start_timestamp() should
+        // return last_time + period (in nanoseconds)
+
+        // Use a unique policy ID to avoid interference
+        let policy_id = 888_888_u32;
+        let policy = SamplingPolicy {
+            id: policy_id,
+            kind: SamplingKind::Conn,
+            interval: Duration::from_secs(60),
+            period: Duration::from_secs(3600), // 1 hour
+            offset: 0,
+            src_ip: None,
+            dst_ip: None,
+            node: Some("test_start_timestamp_with_last".to_string()),
+            column: None,
+        };
+
+        // Set a known last transmission timestamp (in nanoseconds)
+        let last_timestamp_ns: i64 = 1_705_320_000_000_000_000; // 2024-01-15 12:00:00 UTC in nanos
+        LAST_TRANSFER_TIME
+            .write()
+            .await
+            .insert(policy_id.to_string(), last_timestamp_ns);
+
+        // start_timestamp should return last_time + period_in_nanos
+        // period = 3600 seconds = 3_600_000_000_000 nanoseconds
+        let expected = last_timestamp_ns + 3600 * SECOND_TO_NANO;
+        let start = policy.start_timestamp().await.expect("should succeed");
+        assert_eq!(start, expected);
+
+        // Cleanup
+        LAST_TRANSFER_TIME
+            .write()
+            .await
+            .remove(&policy_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_start_timestamp_period_conversion_overflow() {
+        // When the period is too large to convert to nanoseconds (overflow),
+        // start_timestamp() should return an error
+
+        // Use a unique policy ID
+        let policy_id = 777_777_u32;
+        let policy = SamplingPolicy {
+            id: policy_id,
+            kind: SamplingKind::Conn,
+            interval: Duration::from_secs(60),
+            // Use a very large period that will overflow when multiplied by SECOND_TO_NANO
+            // i64::MAX / SECOND_TO_NANO ≈ 9_223_372_036 seconds
+            // So a period larger than this will overflow
+            period: Duration::from_secs(10_000_000_000), // ~317 years, will overflow
+            offset: 0,
+            src_ip: None,
+            dst_ip: None,
+            node: Some("test_start_timestamp_overflow".to_string()),
+            column: None,
+        };
+
+        // Set a last transmission timestamp to trigger the overflow path
+        let last_timestamp_ns: i64 = 1_000_000_000_000_000_000;
+        LAST_TRANSFER_TIME
+            .write()
+            .await
+            .insert(policy_id.to_string(), last_timestamp_ns);
+
+        // start_timestamp should fail due to overflow in period conversion
+        let result = policy.start_timestamp().await;
+        assert!(
+            result.is_err(),
+            "Expected error due to period conversion overflow"
+        );
+
+        // Cleanup
+        LAST_TRANSFER_TIME
+            .write()
+            .await
+            .remove(&policy_id.to_string());
+    }
 }
