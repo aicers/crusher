@@ -4,6 +4,15 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added TLS/QUIC configuration tests covering certificate parsing, private key
+  loading, CA certificate handling, and quinn endpoint settings. Tests exercise
+  both success and failure paths for parsing PEM chains, keys, and CA certs,
+  and verify transport settings like keep-alive are applied correctly.
+
 ## [0.7.0] - 2025-12-04
 
 ### Changed
@@ -204,6 +213,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.7.0...main
 [0.7.0]: https://github.com/aicers/crusher/compare/0.6.4...0.7.0
 [0.6.4]: https://github.com/aicers/crusher/compare/0.6.3...0.6.4
 [0.6.3]: https://github.com/aicers/crusher/compare/0.6.2...0.6.3
