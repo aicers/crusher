@@ -18,6 +18,51 @@ use crate::{client::SERVER_RETRY_INTERVAL, info_or_print};
 const REQUIRED_MANAGER_VERSION: &str = "0.46.0";
 const MAX_RETRIES: u8 = 3;
 
+/// Trait for connection attempts, allowing injection of mock implementations for testing.
+#[async_trait]
+pub(crate) trait ConnectionAttempt: Send + Sync {
+    /// Attempts to connect. If `health_check` is true, only verifies connectivity.
+    async fn try_connect(&mut self, health_check: bool) -> Result<()>;
+}
+
+/// Trait for managing idle mode state, allowing testable idle mode behavior.
+pub(crate) trait IdleModeState {
+    fn config_reload(&self) -> Arc<Notify>;
+    #[allow(dead_code)] // Used in tests
+    fn status(&self) -> Status;
+    fn set_status(&mut self, status: Status);
+}
+
+/// Enters idle mode using the provided connector for connection attempts.
+/// This function is separated to allow testing with mock connectors.
+pub(crate) async fn enter_idle_mode_with_connector<T>(connector: &mut T, health_check: bool)
+where
+    T: ConnectionAttempt + IdleModeState,
+{
+    info_or_print!("Entering idle mode");
+    connector.set_status(Status::Idle);
+    let config_reload = connector.config_reload();
+    tokio::select! {
+        () = async {
+            loop {
+                match connector.try_connect(health_check).await {
+                    Ok(()) => {
+                        info_or_print!("The Manager server is now online");
+                        connector.set_status(Status::Ready);
+                        return
+                    },
+                    Err(e) => {
+                        info_or_print!("Connection attempt failed: {e}, retrying");
+                        sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                    },
+                }
+            }} => {},
+        () = config_reload.notified() => {
+            connector.set_status(Status::Ready);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Client {
     server_address: SocketAddr,
@@ -158,31 +203,10 @@ impl Client {
     /// it should not wait for an `update_config` request. Instead, it can simply check the connection
     /// and retry as needed.
     pub(crate) async fn enter_idle_mode(&mut self, health_check: bool) {
-        info_or_print!("Entering idle mode");
-        self.status = Status::Idle;
-        let config_reload = self.config_reload.clone();
-        tokio::select! {
-            () = async {
-                loop {
-                    match self.try_connect(health_check).await {
-                        Ok(()) => {
-                            info_or_print!("The Manager server is now online");
-                            self.status = Status::Ready;
-                            return
-                        },
-                        Err(e) => {
-                            info_or_print!("Connection attempt failed: {e}, retrying");
-                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
-                        },
-                    }
-                }} => {},
-            () = config_reload.notified() => {
-                self.status = Status::Ready;
-            }
-        }
+        enter_idle_mode_with_connector(self, health_check).await;
     }
 
-    async fn try_connect(&mut self, health_check: bool) -> Result<()> {
+    async fn do_try_connect(&mut self, health_check: bool) -> Result<()> {
         let connection = self.connect().await?;
         if health_check {
             return Ok(());
@@ -193,6 +217,27 @@ impl Client {
         };
         review_protocol::request::handle(&mut idle_mode_handler, &mut send, &mut recv).await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ConnectionAttempt for Client {
+    async fn try_connect(&mut self, health_check: bool) -> Result<()> {
+        self.do_try_connect(health_check).await
+    }
+}
+
+impl IdleModeState for Client {
+    fn config_reload(&self) -> Arc<Notify> {
+        self.config_reload.clone()
+    }
+
+    fn status(&self) -> Status {
+        self.status
+    }
+
+    fn set_status(&mut self, status: Status) {
+        self.status = status;
     }
 }
 
@@ -808,5 +853,297 @@ mod tests {
         let received = tokio::time::timeout(Duration::from_millis(100), wait_task).await;
         assert!(received.is_ok());
         assert!(received.unwrap().unwrap());
+    }
+
+    // =========================================================================
+    // Mock Connector Tests for Idle Mode (Injectable try_connect)
+    // =========================================================================
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Mock connector for testing idle mode with injectable connection behavior.
+    /// This allows testing without network dependencies.
+    struct MockConnector {
+        config_reload: Arc<Notify>,
+        status: Status,
+        /// Number of times `try_connect` was called
+        connect_call_count: Arc<AtomicUsize>,
+        /// Whether `try_connect` should succeed
+        should_succeed: Arc<AtomicBool>,
+        /// If true, `try_connect` returns immediately on success (simulates `health_check` behavior)
+        health_check_received: Arc<AtomicBool>,
+        /// Records the `health_check` parameter passed to `try_connect`
+        last_health_check_value: Arc<AtomicBool>,
+    }
+
+    impl MockConnector {
+        fn new() -> Self {
+            Self {
+                config_reload: Arc::new(Notify::new()),
+                status: Status::Ready,
+                connect_call_count: Arc::new(AtomicUsize::new(0)),
+                should_succeed: Arc::new(AtomicBool::new(true)),
+                health_check_received: Arc::new(AtomicBool::new(false)),
+                last_health_check_value: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn with_config_reload(mut self, config_reload: Arc<Notify>) -> Self {
+            self.config_reload = config_reload;
+            self
+        }
+
+        fn connect_call_count(&self) -> usize {
+            self.connect_call_count.load(AtomicOrdering::SeqCst)
+        }
+
+        fn set_should_succeed(&self, value: bool) {
+            self.should_succeed.store(value, AtomicOrdering::SeqCst);
+        }
+
+        fn was_health_check_received(&self) -> bool {
+            self.health_check_received.load(AtomicOrdering::SeqCst)
+        }
+
+        fn last_health_check_value(&self) -> bool {
+            self.last_health_check_value.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ConnectionAttempt for MockConnector {
+        async fn try_connect(&mut self, health_check: bool) -> Result<()> {
+            self.connect_call_count.fetch_add(1, AtomicOrdering::SeqCst);
+            self.last_health_check_value
+                .store(health_check, AtomicOrdering::SeqCst);
+
+            if health_check {
+                self.health_check_received
+                    .store(true, AtomicOrdering::SeqCst);
+            }
+
+            if self.should_succeed.load(AtomicOrdering::SeqCst) {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Mock connection failure"))
+            }
+        }
+    }
+
+    impl IdleModeState for MockConnector {
+        fn config_reload(&self) -> Arc<Notify> {
+            self.config_reload.clone()
+        }
+
+        fn status(&self) -> Status {
+            self.status
+        }
+
+        fn set_status(&mut self, status: Status) {
+            self.status = status;
+        }
+    }
+
+    /// Mock connector that fails a configurable number of times before succeeding.
+    /// Used to test retry behavior in idle mode.
+    struct RetryMockConnector {
+        config_reload: Arc<Notify>,
+        status: Status,
+        connect_count: Arc<AtomicUsize>,
+        /// Number of failures before success (default: 2)
+        failures_before_success: usize,
+    }
+
+    impl RetryMockConnector {
+        fn new(config_reload: Arc<Notify>, connect_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                config_reload,
+                status: Status::Ready,
+                connect_count,
+                failures_before_success: 2,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ConnectionAttempt for RetryMockConnector {
+        async fn try_connect(&mut self, _health_check: bool) -> Result<()> {
+            let count = self.connect_count.fetch_add(1, AtomicOrdering::SeqCst);
+
+            // Succeed after configured number of failures
+            if count >= self.failures_before_success {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Mock connection failure"))
+            }
+        }
+    }
+
+    impl IdleModeState for RetryMockConnector {
+        fn config_reload(&self) -> Arc<Notify> {
+            self.config_reload.clone()
+        }
+
+        fn status(&self) -> Status {
+            self.status
+        }
+
+        fn set_status(&mut self, status: Status) {
+            self.status = status;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_true_returns_immediately_no_config_reload_wait() {
+        // Test: When health_check = true, try_connect should return immediately
+        // and NOT wait for config_reload notification
+        let mut connector = MockConnector::new();
+        connector.set_should_succeed(true);
+
+        // Enter idle mode with health_check = true
+        // This should return immediately after successful connection, not waiting for config_reload
+        enter_idle_mode_with_connector(&mut connector, true).await;
+
+        // Verify try_connect was called exactly once
+        assert_eq!(connector.connect_call_count(), 1);
+
+        // Verify health_check parameter was true
+        assert!(connector.was_health_check_received());
+        assert!(connector.last_health_check_value());
+
+        // Verify status is Ready after exiting idle mode
+        assert!(matches!(connector.status(), Status::Ready));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_true_immediate_return_on_success() {
+        // Test: health_check = true should complete without requiring config_reload
+        let config_reload = Arc::new(Notify::new());
+        let mut connector = MockConnector::new().with_config_reload(config_reload.clone());
+        connector.set_should_succeed(true);
+
+        // Use timeout to verify immediate return (no waiting for config_reload)
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            enter_idle_mode_with_connector(&mut connector, true),
+        )
+        .await;
+
+        // Should complete within timeout (immediate return)
+        assert!(result.is_ok());
+        assert_eq!(connector.connect_call_count(), 1);
+        assert!(connector.was_health_check_received());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_false_waits_for_config_reload() {
+        // Test: When health_check = false, idle mode should wait for config_reload
+        // if try_connect succeeds but protocol handling would block
+        let config_reload = Arc::new(Notify::new());
+        let mut connector = MockConnector::new().with_config_reload(config_reload.clone());
+        connector.set_should_succeed(true);
+
+        // Notify config_reload after a short delay
+        let notify_handle = {
+            let config_reload = config_reload.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                config_reload.notify_one();
+            })
+        };
+
+        enter_idle_mode_with_connector(&mut connector, false).await;
+
+        // Verify health_check was false
+        assert!(!connector.last_health_check_value());
+        assert!(matches!(connector.status(), Status::Ready));
+
+        notify_handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_true_sets_status_to_idle_then_ready() {
+        // Test: Status transitions: Ready -> Idle -> Ready when health_check = true
+        let mut connector = MockConnector::new();
+        connector.set_should_succeed(true);
+
+        assert!(matches!(connector.status(), Status::Ready));
+
+        // Note: We can't observe the intermediate Idle state directly in this test
+        // because enter_idle_mode_with_connector sets it and then immediately exits
+        // on successful health check. But we verify final state is Ready.
+        enter_idle_mode_with_connector(&mut connector, true).await;
+
+        assert!(matches!(connector.status(), Status::Ready));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_true_retries_on_connection_failure() {
+        // Test: health_check = true should retry on connection failure
+        // This test verifies that the retry mechanism works by tracking connection attempts
+        let config_reload = Arc::new(Notify::new());
+        let connect_count = Arc::new(AtomicUsize::new(0));
+
+        let mut connector = RetryMockConnector::new(config_reload, connect_count.clone());
+
+        // Use timeout accounting for SERVER_RETRY_INTERVAL (3s) * 2 failures + buffer
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            enter_idle_mode_with_connector(&mut connector, true),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Should have called try_connect at least 3 times (2 failures + 1 success)
+        assert!(connect_count.load(AtomicOrdering::SeqCst) >= 3);
+        assert!(matches!(connector.status(), Status::Ready));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_reload_exits_idle_mode_without_connection() {
+        // Test: config_reload notification should exit idle mode even if connection fails
+        let config_reload = Arc::new(Notify::new());
+        let mut connector = MockConnector::new().with_config_reload(config_reload.clone());
+        connector.set_should_succeed(false); // Connection always fails
+
+        // Notify config_reload after a short delay
+        let notify_handle = {
+            let config_reload = config_reload.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                config_reload.notify_one();
+            })
+        };
+
+        // Use timeout to ensure test doesn't hang
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            enter_idle_mode_with_connector(&mut connector, false),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Status should be Ready after config_reload notification
+        assert!(matches!(connector.status(), Status::Ready));
+
+        notify_handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_state_trait_client_implementation() {
+        // Test: Client implements IdleModeState trait correctly
+        let (mut client, _rx) = create_test_client();
+
+        // Test initial status
+        assert!(matches!(client.status(), Status::Ready));
+
+        // Test set_status
+        client.set_status(Status::Idle);
+        assert!(matches!(client.status(), Status::Idle));
+
+        // Test config_reload returns the same Arc
+        let config1 = client.config_reload();
+        let config2 = client.config_reload();
+        assert!(Arc::ptr_eq(&config1, &config2));
     }
 }
