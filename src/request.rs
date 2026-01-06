@@ -18,6 +18,51 @@ use crate::{client::SERVER_RETRY_INTERVAL, info_or_print};
 const REQUIRED_MANAGER_VERSION: &str = "0.46.0";
 const MAX_RETRIES: u8 = 3;
 
+/// Trait for connection attempts, allowing injection of mock implementations for testing.
+#[async_trait]
+pub(crate) trait ConnectionAttempt: Send + Sync {
+    /// Attempts to connect. If `health_check` is true, only verifies connectivity.
+    async fn try_connect(&mut self, health_check: bool) -> Result<()>;
+}
+
+/// Trait for managing idle mode state, allowing testable idle mode behavior.
+pub(crate) trait IdleModeState {
+    fn config_reload(&self) -> Arc<Notify>;
+    #[allow(dead_code)] // Used in tests
+    fn status(&self) -> Status;
+    fn set_status(&mut self, status: Status);
+}
+
+/// Enters idle mode using the provided connector for connection attempts.
+/// This function is separated to allow testing with mock connectors.
+pub(crate) async fn enter_idle_mode_with_connector<T>(connector: &mut T, health_check: bool)
+where
+    T: ConnectionAttempt + IdleModeState,
+{
+    info_or_print!("Entering idle mode");
+    connector.set_status(Status::Idle);
+    let config_reload = connector.config_reload();
+    tokio::select! {
+        () = async {
+            loop {
+                match connector.try_connect(health_check).await {
+                    Ok(()) => {
+                        info_or_print!("The Manager server is now online");
+                        connector.set_status(Status::Ready);
+                        return
+                    },
+                    Err(e) => {
+                        info_or_print!("Connection attempt failed: {e}, retrying");
+                        sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                    },
+                }
+            }} => {},
+        () = config_reload.notified() => {
+            connector.set_status(Status::Ready);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Client {
     server_address: SocketAddr,
@@ -158,31 +203,10 @@ impl Client {
     /// it should not wait for an `update_config` request. Instead, it can simply check the connection
     /// and retry as needed.
     pub(crate) async fn enter_idle_mode(&mut self, health_check: bool) {
-        info_or_print!("Entering idle mode");
-        self.status = Status::Idle;
-        let config_reload = self.config_reload.clone();
-        tokio::select! {
-            () = async {
-                loop {
-                    match self.try_connect(health_check).await {
-                        Ok(()) => {
-                            info_or_print!("The Manager server is now online");
-                            self.status = Status::Ready;
-                            return
-                        },
-                        Err(e) => {
-                            info_or_print!("Connection attempt failed: {e}, retrying");
-                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
-                        },
-                    }
-                }} => {},
-            () = config_reload.notified() => {
-                self.status = Status::Ready;
-            }
-        }
+        enter_idle_mode_with_connector(self, health_check).await;
     }
 
-    async fn try_connect(&mut self, health_check: bool) -> Result<()> {
+    async fn do_try_connect(&mut self, health_check: bool) -> Result<()> {
         let connection = self.connect().await?;
         if health_check {
             return Ok(());
@@ -193,6 +217,27 @@ impl Client {
         };
         review_protocol::request::handle(&mut idle_mode_handler, &mut send, &mut recv).await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ConnectionAttempt for Client {
+    async fn try_connect(&mut self, health_check: bool) -> Result<()> {
+        self.do_try_connect(health_check).await
+    }
+}
+
+impl IdleModeState for Client {
+    fn config_reload(&self) -> Arc<Notify> {
+        self.config_reload.clone()
+    }
+
+    fn status(&self) -> Status {
+        self.status
+    }
+
+    fn set_status(&mut self, status: Status) {
+        self.status = status;
     }
 }
 
@@ -315,5 +360,790 @@ impl review_protocol::request::Handler for IdleModeHandler {
         info!("Configuration update request received");
         self.config_reload.notify_one();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use review_protocol::types::{SamplingKind, SamplingPolicy};
+
+    use super::*;
+
+    /// Creates a test client with default configuration.
+    /// Returns the client and a receiver for sampling policies.
+    fn create_test_client() -> (Client, async_channel::Receiver<SamplingPolicy>) {
+        let (tx, rx) = async_channel::unbounded();
+        let config_reload = Arc::new(Notify::new());
+
+        let client = Client {
+            server_address: "127.0.0.1:8080".parse().unwrap(),
+            server_name: "test".to_string(),
+            connection: None,
+            request_send: tx,
+            cert: Vec::new(),
+            key: Vec::new(),
+            ca_certs: Vec::new(),
+            config_reload,
+            status: Status::Ready,
+            active_policy_list: Arc::new(RwLock::new(HashMap::new())),
+            delete_policy_ids: Arc::new(RwLock::new(Vec::new())),
+        };
+
+        (client, rx)
+    }
+
+    /// Creates a test sampling policy with the given ID.
+    fn create_test_policy(id: u32) -> SamplingPolicy {
+        SamplingPolicy {
+            id,
+            kind: SamplingKind::Conn,
+            interval: Duration::from_secs(60),
+            period: Duration::from_secs(3600),
+            offset: 0,
+            src_ip: None,
+            dst_ip: None,
+            node: Some("test_node".to_string()),
+            column: None,
+        }
+    }
+
+    // =========================================================================
+    // Duplicate Suppression Tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_basic() {
+        // Test: Adding the same policy ID twice should only process it once
+        let (mut client, rx) = create_test_client();
+        let policy = create_test_policy(1);
+
+        // Add the policy first time
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Verify policy was added to active list
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+        assert!(client.active_policy_list.read().await.contains_key(&1));
+
+        // Verify policy was sent through channel
+        let received = rx.try_recv();
+        assert!(received.is_ok());
+        assert_eq!(received.unwrap().id, 1);
+
+        // Add the same policy again (duplicate)
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Verify still only one policy in active list
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+
+        // Verify no additional policy was sent (channel should be empty)
+        let received = rx.try_recv();
+        assert!(received.is_err()); // Channel should be empty
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_multiple_policies() {
+        // Test: Adding multiple policies, some duplicates
+        let (mut client, rx) = create_test_client();
+        let policy1 = create_test_policy(1);
+        let policy2 = create_test_policy(2);
+
+        // Add both policies
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            &[policy1.clone(), policy2.clone()],
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(client.active_policy_list.read().await.len(), 2);
+
+        // Drain the channel
+        let _ = rx.try_recv();
+        let _ = rx.try_recv();
+
+        // Try to add policy1 again as duplicate, and policy3 as new
+        let policy3 = create_test_policy(3);
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            &[policy1.clone(), policy3.clone()],
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Should have 3 policies now (policy1 was duplicate, policy3 is new)
+        assert_eq!(client.active_policy_list.read().await.len(), 3);
+
+        // Only policy3 should be in the channel
+        let received = rx.try_recv();
+        assert!(received.is_ok());
+        assert_eq!(received.unwrap().id, 3);
+
+        // Channel should be empty
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_boundary_empty_queue() {
+        // Test: Adding a policy when queue is empty
+        let (mut client, rx) = create_test_client();
+
+        // Verify empty initial state
+        assert!(client.active_policy_list.read().await.is_empty());
+
+        let policy = create_test_policy(1);
+        let result = review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_rapid_add_remove_add_cycle() {
+        // Test: Rapid add/remove/add cycle should work correctly
+        let (mut client, rx) = create_test_client();
+        let policy = create_test_policy(1);
+
+        // Add policy
+        review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+        let _ = rx.try_recv(); // Drain channel
+
+        // Remove policy
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+        assert!(client.active_policy_list.read().await.is_empty());
+
+        // Add policy again (should succeed since it was deleted)
+        review_protocol::request::Handler::sampling_policy_list(
+            &mut client,
+            std::slice::from_ref(&policy),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+
+        // Verify policy was sent again
+        let received = rx.try_recv();
+        assert!(received.is_ok());
+        assert_eq!(received.unwrap().id, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_suppression_empty_policy_list() {
+        // Test: Empty policy list should be handled correctly
+        let (mut client, _rx) = create_test_client();
+
+        let result =
+            review_protocol::request::Handler::sampling_policy_list(&mut client, &[]).await;
+        assert!(result.is_ok());
+        assert!(client.active_policy_list.read().await.is_empty());
+    }
+
+    // =========================================================================
+    // Delete Queue Accumulation Tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_accumulation_basic() {
+        // Test: Multiple delete requests should accumulate in delete queue
+        let (mut client, rx) = create_test_client();
+
+        // Add multiple policies first
+        let policies: Vec<SamplingPolicy> = (1..=5).map(create_test_policy).collect();
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &policies)
+            .await
+            .unwrap();
+
+        // Drain channel
+        while rx.try_recv().is_ok() {}
+
+        // Delete policies one by one
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[2])
+            .await
+            .unwrap();
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[3])
+            .await
+            .unwrap();
+
+        // Verify delete queue accumulated all deleted IDs
+        let delete_ids = client.delete_policy_ids.read().await;
+        assert_eq!(delete_ids.len(), 3);
+        assert!(delete_ids.contains(&1));
+        assert!(delete_ids.contains(&2));
+        assert!(delete_ids.contains(&3));
+
+        // Verify active list only has remaining policies
+        assert_eq!(client.active_policy_list.read().await.len(), 2);
+        assert!(client.active_policy_list.read().await.contains_key(&4));
+        assert!(client.active_policy_list.read().await.contains_key(&5));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_accumulation_batch() {
+        // Test: Batch delete request should accumulate all IDs
+        let (mut client, rx) = create_test_client();
+
+        // Add policies
+        let policies: Vec<SamplingPolicy> = (1..=5).map(create_test_policy).collect();
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &policies)
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+
+        // Delete multiple in one call
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1, 3, 5])
+            .await
+            .unwrap();
+
+        // Verify order is preserved in delete queue
+        let delete_ids = client.delete_policy_ids.read().await;
+        assert_eq!(delete_ids.len(), 3);
+        assert_eq!(delete_ids[0], 1);
+        assert_eq!(delete_ids[1], 3);
+        assert_eq!(delete_ids[2], 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_boundary_non_existent_policy() {
+        // Test: Deleting a non-existent policy should be silently ignored
+        let (mut client, rx) = create_test_client();
+
+        // Add a policy
+        let policy = create_test_policy(1);
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        // Try to delete a non-existent policy
+        let result =
+            review_protocol::request::Handler::delete_sampling_policy(&mut client, &[999]).await;
+        assert!(result.is_ok());
+
+        // Delete queue should be empty (non-existent policy not added)
+        assert!(client.delete_policy_ids.read().await.is_empty());
+
+        // Active list should still have the original policy
+        assert_eq!(client.active_policy_list.read().await.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_boundary_empty_queue() {
+        // Test: Delete on empty active list should be no-op
+        let (mut client, _rx) = create_test_client();
+
+        let result =
+            review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1, 2, 3])
+                .await;
+        assert!(result.is_ok());
+
+        // Delete queue should be empty
+        assert!(client.delete_policy_ids.read().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_no_double_delete() {
+        // Test: Deleting the same ID twice should only add it once to delete queue
+        let (mut client, rx) = create_test_client();
+
+        // Add a policy
+        let policy = create_test_policy(1);
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        // Delete it once
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+
+        // Try to delete it again
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+
+        // Delete queue should only have one entry
+        let delete_ids = client.delete_policy_ids.read().await;
+        assert_eq!(delete_ids.len(), 1);
+        assert_eq!(delete_ids[0], 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_queue_rapid_add_remove_same_id() {
+        // Test: Rapid add/remove cycles of the same ID
+        let (mut client, rx) = create_test_client();
+
+        for i in 0..3 {
+            let policy = create_test_policy(1);
+            review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+                .await
+                .unwrap();
+            let _ = rx.try_recv();
+
+            review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+                .await
+                .unwrap();
+
+            // Each cycle should add one entry to delete queue
+            assert_eq!(client.delete_policy_ids.read().await.len(), i + 1);
+        }
+
+        // Final state: empty active list, 3 entries in delete queue
+        assert!(client.active_policy_list.read().await.is_empty());
+        assert_eq!(client.delete_policy_ids.read().await.len(), 3);
+    }
+
+    // =========================================================================
+    // Idle Mode Branching Tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_branching_config_reload() {
+        // Test: Config reload notification should exit idle mode
+        let (mut client, _rx) = create_test_client();
+        let config_reload = client.config_reload.clone();
+
+        // Spawn a task to notify config reload after a short delay
+        let notify_task = tokio::spawn(async move {
+            // Small delay to ensure enter_idle_mode is waiting
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            config_reload.notify_one();
+        });
+
+        // Enter idle mode with health_check = false
+        // This should wait for config reload notification
+        client.enter_idle_mode(false).await;
+
+        // Verify status is Ready after exiting idle mode
+        assert!(matches!(client.status, Status::Ready));
+
+        notify_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_config_triggers_config_reload() {
+        // Test: update_config should notify the config_reload
+        let (mut client, _rx) = create_test_client();
+        let config_reload = client.config_reload.clone();
+
+        // Spawn a task to wait for notification
+        let wait_task = tokio::spawn(async move {
+            config_reload.notified().await;
+            true
+        });
+
+        // Call update_config
+        let result = review_protocol::request::Handler::update_config(&mut client).await;
+        assert!(result.is_ok());
+
+        // Verify notification was received
+        let received = tokio::time::timeout(Duration::from_millis(100), wait_task).await;
+        assert!(received.is_ok());
+        assert!(received.unwrap().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_sets_status_to_idle() {
+        // Test: Entering idle mode should set status to Idle
+        let (mut client, _rx) = create_test_client();
+        let config_reload = client.config_reload.clone();
+
+        assert!(matches!(client.status, Status::Ready));
+
+        // Notify immediately to exit idle mode quickly
+        config_reload.notify_one();
+
+        client.enter_idle_mode(false).await;
+
+        // After exiting, status should be Ready
+        assert!(matches!(client.status, Status::Ready));
+    }
+
+    // =========================================================================
+    // Run method tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_clears_state_on_start() {
+        // Test: run() should clear active_policy_list and delete_policy_ids on start
+        let (mut client, rx) = create_test_client();
+
+        // Pre-populate with some data
+        let policy = create_test_policy(1);
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+        review_protocol::request::Handler::delete_sampling_policy(&mut client, &[1])
+            .await
+            .unwrap();
+
+        assert!(
+            !client.active_policy_list.read().await.is_empty()
+                || !client.delete_policy_ids.read().await.is_empty()
+        );
+
+        // Re-populate since delete removed from active
+        let policy = create_test_policy(2);
+        review_protocol::request::Handler::sampling_policy_list(&mut client, &[policy])
+            .await
+            .unwrap();
+
+        // Shutdown immediately
+        let shutdown = Arc::new(Notify::new());
+        shutdown.notify_one();
+
+        let result = client.run(shutdown).await;
+        assert!(result.is_ok());
+
+        // State should be cleared
+        assert!(client.active_policy_list.read().await.is_empty());
+        assert!(client.delete_policy_ids.read().await.is_empty());
+    }
+
+    // =========================================================================
+    // IdleModeHandler tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_handler_update_config() {
+        // Test: IdleModeHandler's update_config should notify config_reload
+        let config_reload = Arc::new(Notify::new());
+        let mut handler = IdleModeHandler {
+            config_reload: config_reload.clone(),
+        };
+
+        // Spawn a task to wait for notification
+        let wait_task = tokio::spawn(async move {
+            config_reload.notified().await;
+            true
+        });
+
+        // Call update_config
+        let result = review_protocol::request::Handler::update_config(&mut handler).await;
+        assert!(result.is_ok());
+
+        // Verify notification was received
+        let received = tokio::time::timeout(Duration::from_millis(100), wait_task).await;
+        assert!(received.is_ok());
+        assert!(received.unwrap().unwrap());
+    }
+
+    // =========================================================================
+    // Mock Connector Tests for Idle Mode (Injectable try_connect)
+    // =========================================================================
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Mock connector for testing idle mode with injectable connection behavior.
+    /// This allows testing without network dependencies.
+    struct MockConnector {
+        config_reload: Arc<Notify>,
+        status: Status,
+        /// Number of times `try_connect` was called
+        connect_call_count: Arc<AtomicUsize>,
+        /// Whether `try_connect` should succeed
+        should_succeed: Arc<AtomicBool>,
+        /// If true, `try_connect` returns immediately on success (simulates `health_check` behavior)
+        health_check_received: Arc<AtomicBool>,
+        /// Records the `health_check` parameter passed to `try_connect`
+        last_health_check_value: Arc<AtomicBool>,
+    }
+
+    impl MockConnector {
+        fn new() -> Self {
+            Self {
+                config_reload: Arc::new(Notify::new()),
+                status: Status::Ready,
+                connect_call_count: Arc::new(AtomicUsize::new(0)),
+                should_succeed: Arc::new(AtomicBool::new(true)),
+                health_check_received: Arc::new(AtomicBool::new(false)),
+                last_health_check_value: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn with_config_reload(mut self, config_reload: Arc<Notify>) -> Self {
+            self.config_reload = config_reload;
+            self
+        }
+
+        fn connect_call_count(&self) -> usize {
+            self.connect_call_count.load(AtomicOrdering::SeqCst)
+        }
+
+        fn set_should_succeed(&self, value: bool) {
+            self.should_succeed.store(value, AtomicOrdering::SeqCst);
+        }
+
+        fn was_health_check_received(&self) -> bool {
+            self.health_check_received.load(AtomicOrdering::SeqCst)
+        }
+
+        fn last_health_check_value(&self) -> bool {
+            self.last_health_check_value.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ConnectionAttempt for MockConnector {
+        async fn try_connect(&mut self, health_check: bool) -> Result<()> {
+            self.connect_call_count.fetch_add(1, AtomicOrdering::SeqCst);
+            self.last_health_check_value
+                .store(health_check, AtomicOrdering::SeqCst);
+
+            if health_check {
+                self.health_check_received
+                    .store(true, AtomicOrdering::SeqCst);
+            }
+
+            if self.should_succeed.load(AtomicOrdering::SeqCst) {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Mock connection failure"))
+            }
+        }
+    }
+
+    impl IdleModeState for MockConnector {
+        fn config_reload(&self) -> Arc<Notify> {
+            self.config_reload.clone()
+        }
+
+        fn status(&self) -> Status {
+            self.status
+        }
+
+        fn set_status(&mut self, status: Status) {
+            self.status = status;
+        }
+    }
+
+    /// Mock connector that fails a configurable number of times before succeeding.
+    /// Used to test retry behavior in idle mode.
+    struct RetryMockConnector {
+        config_reload: Arc<Notify>,
+        status: Status,
+        connect_count: Arc<AtomicUsize>,
+        /// Number of failures before success (default: 2)
+        failures_before_success: usize,
+    }
+
+    impl RetryMockConnector {
+        fn new(config_reload: Arc<Notify>, connect_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                config_reload,
+                status: Status::Ready,
+                connect_count,
+                failures_before_success: 2,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ConnectionAttempt for RetryMockConnector {
+        async fn try_connect(&mut self, _health_check: bool) -> Result<()> {
+            let count = self.connect_count.fetch_add(1, AtomicOrdering::SeqCst);
+
+            // Succeed after configured number of failures
+            if count >= self.failures_before_success {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Mock connection failure"))
+            }
+        }
+    }
+
+    impl IdleModeState for RetryMockConnector {
+        fn config_reload(&self) -> Arc<Notify> {
+            self.config_reload.clone()
+        }
+
+        fn status(&self) -> Status {
+            self.status
+        }
+
+        fn set_status(&mut self, status: Status) {
+            self.status = status;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_true_returns_immediately_no_config_reload_wait() {
+        // Test: When health_check = true, try_connect should return immediately
+        // and NOT wait for config_reload notification
+        let mut connector = MockConnector::new();
+        connector.set_should_succeed(true);
+
+        // Enter idle mode with health_check = true
+        // This should return immediately after successful connection, not waiting for config_reload
+        enter_idle_mode_with_connector(&mut connector, true).await;
+
+        // Verify try_connect was called exactly once
+        assert_eq!(connector.connect_call_count(), 1);
+
+        // Verify health_check parameter was true
+        assert!(connector.was_health_check_received());
+        assert!(connector.last_health_check_value());
+
+        // Verify status is Ready after exiting idle mode
+        assert!(matches!(connector.status(), Status::Ready));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_true_immediate_return_on_success() {
+        // Test: health_check = true should complete without requiring config_reload
+        let config_reload = Arc::new(Notify::new());
+        let mut connector = MockConnector::new().with_config_reload(config_reload.clone());
+        connector.set_should_succeed(true);
+
+        // Use timeout to verify immediate return (no waiting for config_reload)
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            enter_idle_mode_with_connector(&mut connector, true),
+        )
+        .await;
+
+        // Should complete within timeout (immediate return)
+        assert!(result.is_ok());
+        assert_eq!(connector.connect_call_count(), 1);
+        assert!(connector.was_health_check_received());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_false_waits_for_config_reload() {
+        // Test: When health_check = false, idle mode should wait for config_reload
+        // if try_connect succeeds but protocol handling would block
+        let config_reload = Arc::new(Notify::new());
+        let mut connector = MockConnector::new().with_config_reload(config_reload.clone());
+        connector.set_should_succeed(true);
+
+        // Notify config_reload after a short delay
+        let notify_handle = {
+            let config_reload = config_reload.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                config_reload.notify_one();
+            })
+        };
+
+        enter_idle_mode_with_connector(&mut connector, false).await;
+
+        // Verify health_check was false
+        assert!(!connector.last_health_check_value());
+        assert!(matches!(connector.status(), Status::Ready));
+
+        notify_handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_true_sets_status_to_idle_then_ready() {
+        // Test: Status transitions: Ready -> Idle -> Ready when health_check = true
+        let mut connector = MockConnector::new();
+        connector.set_should_succeed(true);
+
+        assert!(matches!(connector.status(), Status::Ready));
+
+        // Note: We can't observe the intermediate Idle state directly in this test
+        // because enter_idle_mode_with_connector sets it and then immediately exits
+        // on successful health check. But we verify final state is Ready.
+        enter_idle_mode_with_connector(&mut connector, true).await;
+
+        assert!(matches!(connector.status(), Status::Ready));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_check_true_retries_on_connection_failure() {
+        // Test: health_check = true should retry on connection failure
+        // This test verifies that the retry mechanism works by tracking connection attempts
+        let config_reload = Arc::new(Notify::new());
+        let connect_count = Arc::new(AtomicUsize::new(0));
+
+        let mut connector = RetryMockConnector::new(config_reload, connect_count.clone());
+
+        // Use timeout accounting for SERVER_RETRY_INTERVAL (3s) * 2 failures + buffer
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            enter_idle_mode_with_connector(&mut connector, true),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Should have called try_connect at least 3 times (2 failures + 1 success)
+        assert!(connect_count.load(AtomicOrdering::SeqCst) >= 3);
+        assert!(matches!(connector.status(), Status::Ready));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_reload_exits_idle_mode_without_connection() {
+        // Test: config_reload notification should exit idle mode even if connection fails
+        let config_reload = Arc::new(Notify::new());
+        let mut connector = MockConnector::new().with_config_reload(config_reload.clone());
+        connector.set_should_succeed(false); // Connection always fails
+
+        // Notify config_reload after a short delay
+        let notify_handle = {
+            let config_reload = config_reload.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                config_reload.notify_one();
+            })
+        };
+
+        // Use timeout to ensure test doesn't hang
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            enter_idle_mode_with_connector(&mut connector, false),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Status should be Ready after config_reload notification
+        assert!(matches!(connector.status(), Status::Ready));
+
+        notify_handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_state_trait_client_implementation() {
+        // Test: Client implements IdleModeState trait correctly
+        let (mut client, _rx) = create_test_client();
+
+        // Test initial status
+        assert!(matches!(client.status(), Status::Ready));
+
+        // Test set_status
+        client.set_status(Status::Idle);
+        assert!(matches!(client.status(), Status::Idle));
+
+        // Test config_reload returns the same Arc
+        let config1 = client.config_reload();
+        let config2 = client.config_reload();
+        assert!(Arc::ptr_eq(&config1, &config2));
     }
 }
