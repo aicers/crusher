@@ -9,9 +9,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Added
 
 - Integration tests for the subscription pipeline with a fake Giganto server.
-  Tests cover stream lifecycle (open/close on policy add/delete), timestamp
-  cleanup when policies are deleted, and multiple concurrent policy streams.
-  Run with `cargo test --features integration-tests`.
+  Tests cover end-to-end communication, notify flow with data reception,
+  disconnect/reconnection handling, and multiple concurrent policy streams.
+  Run with `cargo test`.
 
 ## [0.7.0] - 2025-12-04
 
