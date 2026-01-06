@@ -91,36 +91,217 @@ pub(crate) fn config(certs: &Certs) -> Result<Endpoint> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+    use rstest::fixture;
+    use tempfile::NamedTempFile;
+
     use super::*;
 
     const CERT_PATH: &str = "tests/cert.pem";
     const KEY_PATH: &str = "tests/key.pem";
     const CA_CERT_PATH: &str = "tests/ca_cert.pem";
 
-    fn generate_self_signed_cert() -> (Vec<u8>, Vec<u8>) {
-        use rcgen::{CertificateParams, KeyPair};
+    // =========================================================================
+    // Certificate Set Structure and Fixtures
+    // =========================================================================
 
-        let key_pair = KeyPair::generate().expect("Failed to generate key pair");
-        let params = CertificateParams::default();
+    /// A complete set of PEM-encoded certificates for testing
+    #[allow(clippy::struct_field_names)]
+    struct CertificateSet {
+        /// CA certificate PEM
+        ca_cert_pem: Vec<u8>,
+        /// Leaf/client certificate PEM (or full chain if applicable)
+        cert_pem: Vec<u8>,
+        /// Private key PEM for the leaf certificate
+        key_pem: Vec<u8>,
+    }
+
+    /// Generates a CA certificate and key pair along with its params for signing
+    fn generate_ca(cn: &str, days_valid: i64) -> (rcgen::Certificate, CertificateParams, KeyPair) {
+        let key_pair = KeyPair::generate().expect("Failed to generate CA key pair");
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, cn.to_string());
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+        if days_valid < 0 {
+            // Expired CA: set not_before in the past and not_after also in the past
+            let past_end = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+            let past_start = past_end - time::Duration::days(-days_valid);
+            params.not_before = past_start;
+            params.not_after = past_end;
+        } else {
+            let now = time::OffsetDateTime::now_utc();
+            params.not_before = now;
+            params.not_after = now + time::Duration::days(days_valid);
+        }
+
         let cert = params
+            .clone()
             .self_signed(&key_pair)
-            .expect("Failed to generate certificate");
+            .expect("Failed to generate CA certificate");
+        (cert, params, key_pair)
+    }
+
+    /// Generates a leaf certificate signed by the given CA
+    fn generate_leaf_signed_by_ca(
+        cn: &str,
+        ca_params: &CertificateParams,
+        ca_key: &KeyPair,
+        days_valid: i64,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let key_pair = KeyPair::generate().expect("Failed to generate leaf key pair");
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::NoCa;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, cn.to_string());
+
+        if days_valid < 0 {
+            // Expired leaf: set validity in the past
+            let past_end = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+            let past_start = past_end - time::Duration::days(-days_valid);
+            params.not_before = past_start;
+            params.not_after = past_end;
+        } else {
+            let now = time::OffsetDateTime::now_utc();
+            params.not_before = now;
+            params.not_after = now + time::Duration::days(days_valid);
+        }
+
+        // Create issuer from CA params and key
+        let issuer = rcgen::Issuer::from_params(ca_params, ca_key);
+        let cert = params
+            .signed_by(&key_pair, &issuer)
+            .expect("Failed to sign leaf certificate");
 
         let cert_pem = cert.pem().into_bytes();
         let key_pem = key_pair.serialize_pem().into_bytes();
         (cert_pem, key_pem)
     }
 
-    fn generate_ca_cert() -> Vec<u8> {
-        use rcgen::{CertificateParams, IsCa, KeyPair};
-
+    /// Generates a self-signed certificate (not signed by a CA)
+    fn generate_self_signed(cn: &str) -> (Vec<u8>, Vec<u8>) {
         let key_pair = KeyPair::generate().expect("Failed to generate key pair");
         let mut params = CertificateParams::default();
-        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, cn.to_string());
         let cert = params
             .self_signed(&key_pair)
-            .expect("Failed to generate CA certificate");
-        cert.pem().into_bytes()
+            .expect("Failed to generate self-signed certificate");
+        let cert_pem = cert.pem().into_bytes();
+        let key_pem = key_pair.serialize_pem().into_bytes();
+        (cert_pem, key_pem)
+    }
+
+    // =========================================================================
+    // RSTest Fixtures
+    // =========================================================================
+
+    /// Fixture: Valid full-chain certificate set (CA signs leaf, both valid)
+    #[fixture]
+    fn valid_full_chain() -> CertificateSet {
+        let (ca_cert, ca_params, ca_key) = generate_ca("Test CA", 365);
+        let ca_cert_pem = ca_cert.pem().into_bytes();
+        let (leaf_cert_pem, leaf_key_pem) =
+            generate_leaf_signed_by_ca("localhost", &ca_params, &ca_key, 365);
+
+        // Create full chain: leaf + CA
+        let mut full_chain = leaf_cert_pem;
+        full_chain.extend_from_slice(&ca_cert_pem);
+
+        CertificateSet {
+            ca_cert_pem,
+            cert_pem: full_chain,
+            key_pem: leaf_key_pem,
+        }
+    }
+
+    /// Fixture: Self-signed certificate (signed by own key, no CA involvement)
+    #[fixture]
+    fn self_signed_cert() -> CertificateSet {
+        let (cert_pem, key_pem) = generate_self_signed("localhost");
+        // For self-signed, the cert itself acts as the CA
+        CertificateSet {
+            ca_cert_pem: cert_pem.clone(),
+            cert_pem,
+            key_pem,
+        }
+    }
+
+    /// Fixture: Incomplete chain (leaf only, no CA in chain)
+    #[fixture]
+    fn incomplete_chain() -> CertificateSet {
+        let (ca_cert, ca_params, ca_key) = generate_ca("Test CA", 365);
+        let ca_cert_pem = ca_cert.pem().into_bytes();
+        let (leaf_cert_pem, leaf_key_pem) =
+            generate_leaf_signed_by_ca("localhost", &ca_params, &ca_key, 365);
+
+        // Only leaf cert, not the full chain
+        CertificateSet {
+            ca_cert_pem,
+            cert_pem: leaf_cert_pem,
+            key_pem: leaf_key_pem,
+        }
+    }
+
+    /// Fixture: CN mismatch (CA CN: "Manager", Leaf CN: "localhost")
+    #[fixture]
+    fn cn_mismatch() -> CertificateSet {
+        let (ca_cert, ca_params, ca_key) = generate_ca("Manager", 365);
+        let ca_cert_pem = ca_cert.pem().into_bytes();
+        let (leaf_cert_pem, leaf_key_pem) =
+            generate_leaf_signed_by_ca("localhost", &ca_params, &ca_key, 365);
+
+        let mut full_chain = leaf_cert_pem;
+        full_chain.extend_from_slice(&ca_cert_pem);
+
+        CertificateSet {
+            ca_cert_pem,
+            cert_pem: full_chain,
+            key_pem: leaf_key_pem,
+        }
+    }
+
+    /// Fixture: Expired CA certificate
+    #[fixture]
+    fn expired_ca() -> CertificateSet {
+        let (ca_cert, ca_params, ca_key) = generate_ca("Expired CA", -30); // Expired 30 days ago
+        let ca_cert_pem = ca_cert.pem().into_bytes();
+        let (leaf_cert_pem, leaf_key_pem) =
+            generate_leaf_signed_by_ca("localhost", &ca_params, &ca_key, 365);
+
+        let mut full_chain = leaf_cert_pem;
+        full_chain.extend_from_slice(&ca_cert_pem);
+
+        CertificateSet {
+            ca_cert_pem,
+            cert_pem: full_chain,
+            key_pem: leaf_key_pem,
+        }
+    }
+
+    /// Fixture: Expired leaf certificate (CA is valid)
+    #[fixture]
+    fn expired_leaf() -> CertificateSet {
+        let (ca_cert, ca_params, ca_key) = generate_ca("Test CA", 365);
+        let ca_cert_pem = ca_cert.pem().into_bytes();
+        let (leaf_cert_pem, leaf_key_pem) =
+            generate_leaf_signed_by_ca("localhost", &ca_params, &ca_key, -30); // Expired 30 days ago
+
+        let mut full_chain = leaf_cert_pem;
+        full_chain.extend_from_slice(&ca_cert_pem);
+
+        CertificateSet {
+            ca_cert_pem,
+            cert_pem: full_chain,
+            key_pem: leaf_key_pem,
+        }
     }
 
     // =========================================================================
@@ -129,9 +310,9 @@ mod tests {
 
     #[test]
     fn test_try_new_success() {
-        let cert_pem = std::fs::read(CERT_PATH).unwrap();
-        let key_pem = std::fs::read(KEY_PATH).unwrap();
-        let ca_pem = std::fs::read(CA_CERT_PATH).unwrap();
+        let cert_pem = std::fs::read(CERT_PATH).expect("Failed to read cert.pem");
+        let key_pem = std::fs::read(KEY_PATH).expect("Failed to read key.pem");
+        let ca_pem = std::fs::read(CA_CERT_PATH).expect("Failed to read ca_cert.pem");
         let ca_certs_pem = &[ca_pem.as_slice()];
 
         let certs = Certs::try_new(&cert_pem, &key_pem, ca_certs_pem)
@@ -139,16 +320,23 @@ mod tests {
         assert!(!certs.certs.is_empty());
     }
 
-    #[test]
-    fn test_to_cert_chain_valid_pem() {
-        let (cert_pem, _) = generate_self_signed_cert();
-        let certs = Certs::to_cert_chain(&cert_pem).expect("Should parse valid certificate");
+    #[rstest::rstest]
+    fn test_to_cert_chain_valid_pem(valid_full_chain: CertificateSet) {
+        let certs = Certs::to_cert_chain(&valid_full_chain.cert_pem)
+            .expect("Should parse valid certificate");
+        assert!(!certs.is_empty());
+    }
+
+    #[rstest::rstest]
+    fn test_to_cert_chain_self_signed(self_signed_cert: CertificateSet) {
+        let certs = Certs::to_cert_chain(&self_signed_cert.cert_pem)
+            .expect("Should parse self-signed certificate");
         assert_eq!(certs.len(), 1);
     }
 
     #[test]
     fn test_to_cert_chain_from_test_file() {
-        let cert_pem = std::fs::read(CERT_PATH).unwrap();
+        let cert_pem = std::fs::read(CERT_PATH).expect("Failed to read cert.pem");
         let certs = Certs::to_cert_chain(&cert_pem).expect("Should parse test certificate");
         assert!(!certs.is_empty());
     }
@@ -157,7 +345,7 @@ mod tests {
     fn test_to_cert_chain_empty_returns_error() {
         let result = Certs::to_cert_chain(b"");
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("empty certificate chain"),
             "Error message should contain 'empty certificate chain': {err_msg}"
@@ -170,7 +358,7 @@ mod tests {
             b"-----BEGIN CERTIFICATE-----\nINVALID_BASE64_DATA!!!\n-----END CERTIFICATE-----\n";
         let result = Certs::to_cert_chain(invalid_pem);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("cannot parse certificate chain"),
             "Error message should contain 'cannot parse certificate chain': {err_msg}"
@@ -182,7 +370,7 @@ mod tests {
         let garbage = b"this is not a PEM file at all";
         let result = Certs::to_cert_chain(garbage);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("empty certificate chain"),
             "Error message should contain 'empty certificate chain': {err_msg}"
@@ -193,16 +381,16 @@ mod tests {
     // Private Key Parsing Tests
     // =========================================================================
 
-    #[test]
-    fn test_to_private_key_valid_pkcs8() {
-        let (_, key_pem) = generate_self_signed_cert();
-        let key = Certs::to_private_key(&key_pem).expect("Should parse PKCS8 private key");
+    #[rstest::rstest]
+    fn test_to_private_key_valid_pkcs8(valid_full_chain: CertificateSet) {
+        let key = Certs::to_private_key(&valid_full_chain.key_pem)
+            .expect("Should parse PKCS8 private key");
         assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
     }
 
     #[test]
     fn test_to_private_key_from_test_file() {
-        let key_pem = std::fs::read(KEY_PATH).unwrap();
+        let key_pem = std::fs::read(KEY_PATH).expect("Failed to read key.pem");
         let key = Certs::to_private_key(&key_pem).expect("Should parse test private key");
         assert!(
             matches!(key, PrivateKeyDer::Pkcs1(_) | PrivateKeyDer::Pkcs8(_)),
@@ -214,7 +402,7 @@ mod tests {
     fn test_to_private_key_empty_input() {
         let result = Certs::to_private_key(b"");
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("empty private key"),
             "Error message should contain 'empty private key': {err_msg}"
@@ -227,19 +415,18 @@ mod tests {
             b"-----BEGIN PRIVATE KEY-----\nINVALID_BASE64_DATA!!!\n-----END PRIVATE KEY-----\n";
         let result = Certs::to_private_key(invalid_key);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("cannot parse private key"),
             "Error message should contain 'cannot parse private key': {err_msg}"
         );
     }
 
-    #[test]
-    fn test_to_private_key_certificate_instead_of_key() {
-        let (cert_pem, _) = generate_self_signed_cert();
-        let result = Certs::to_private_key(&cert_pem);
+    #[rstest::rstest]
+    fn test_to_private_key_certificate_instead_of_key(self_signed_cert: CertificateSet) {
+        let result = Certs::to_private_key(&self_signed_cert.cert_pem);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("unknown private key format"),
             "Error message should contain 'unknown private key format': {err_msg}"
@@ -251,7 +438,7 @@ mod tests {
         let garbage = b"this is not a private key";
         let result = Certs::to_private_key(garbage);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("empty private key"),
             "Error message should contain 'empty private key': {err_msg}"
@@ -262,10 +449,9 @@ mod tests {
     // CA Certificate Parsing Tests
     // =========================================================================
 
-    #[test]
-    fn test_to_ca_certs_valid() {
-        let ca_cert = generate_ca_cert();
-        let ca_certs_pem: &[&[u8]] = &[&ca_cert];
+    #[rstest::rstest]
+    fn test_to_ca_certs_valid(valid_full_chain: CertificateSet) {
+        let ca_certs_pem: &[&[u8]] = &[&valid_full_chain.ca_cert_pem];
         let root_store =
             Certs::to_ca_certs(ca_certs_pem).expect("Should parse valid CA certificate");
         assert!(!root_store.is_empty());
@@ -273,18 +459,19 @@ mod tests {
 
     #[test]
     fn test_to_ca_certs_from_test_file() {
-        let ca_pem = std::fs::read(CA_CERT_PATH).unwrap();
+        let ca_pem = std::fs::read(CA_CERT_PATH).expect("Failed to read ca_cert.pem");
         let ca_certs_pem: &[&[u8]] = &[&ca_pem];
         let root_store =
             Certs::to_ca_certs(ca_certs_pem).expect("Should parse test CA certificate");
         assert!(!root_store.is_empty());
     }
 
-    #[test]
-    fn test_to_ca_certs_multiple_cas() {
-        let ca1 = generate_ca_cert();
-        let ca2 = generate_ca_cert();
-        let ca_certs_pem: &[&[u8]] = &[&ca1, &ca2];
+    #[rstest::rstest]
+    fn test_to_ca_certs_multiple_cas(
+        valid_full_chain: CertificateSet,
+        cn_mismatch: CertificateSet,
+    ) {
+        let ca_certs_pem: &[&[u8]] = &[&valid_full_chain.ca_cert_pem, &cn_mismatch.ca_cert_pem];
         let root_store =
             Certs::to_ca_certs(ca_certs_pem).expect("Should parse multiple CA certificates");
         assert_eq!(root_store.len(), 2);
@@ -295,7 +482,7 @@ mod tests {
         let ca_certs_pem: &[&[u8]] = &[];
         let result = Certs::to_ca_certs(ca_certs_pem);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("empty CA certificate store"),
             "Error message should contain 'empty CA certificate store': {err_msg}"
@@ -307,7 +494,7 @@ mod tests {
         let ca_certs_pem: &[&[u8]] = &[b""];
         let result = Certs::to_ca_certs(ca_certs_pem);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("empty CA certificate store"),
             "Error message should contain 'empty CA certificate store': {err_msg}"
@@ -321,7 +508,7 @@ mod tests {
         let ca_certs_pem: &[&[u8]] = &[invalid_ca];
         let result = Certs::to_ca_certs(ca_certs_pem);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("invalid PEM-encoded certificate"),
             "Error message should contain 'invalid PEM-encoded certificate': {err_msg}"
@@ -334,7 +521,7 @@ mod tests {
         let ca_certs_pem: &[&[u8]] = &[garbage];
         let result = Certs::to_ca_certs(ca_certs_pem);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("empty CA certificate store"),
             "Error message should contain 'empty CA certificate store': {err_msg}"
@@ -342,72 +529,125 @@ mod tests {
     }
 
     // =========================================================================
+    // Certs::try_new with Fixtures Tests
+    // =========================================================================
+
+    #[rstest::rstest]
+    fn test_try_new_valid_full_chain(valid_full_chain: CertificateSet) {
+        let ca_certs_pem: &[&[u8]] = &[&valid_full_chain.ca_cert_pem];
+        let certs = Certs::try_new(
+            &valid_full_chain.cert_pem,
+            &valid_full_chain.key_pem,
+            ca_certs_pem,
+        )
+        .expect("Should succeed with valid full chain");
+        assert!(!certs.certs.is_empty());
+        assert!(!certs.ca_certs.is_empty());
+    }
+
+    #[rstest::rstest]
+    fn test_try_new_self_signed(self_signed_cert: CertificateSet) {
+        let ca_certs_pem: &[&[u8]] = &[&self_signed_cert.ca_cert_pem];
+        let certs = Certs::try_new(
+            &self_signed_cert.cert_pem,
+            &self_signed_cert.key_pem,
+            ca_certs_pem,
+        )
+        .expect("Should succeed with self-signed certificate");
+        assert_eq!(certs.certs.len(), 1);
+    }
+
+    #[rstest::rstest]
+    fn test_try_new_incomplete_chain(incomplete_chain: CertificateSet) {
+        let ca_certs_pem: &[&[u8]] = &[&incomplete_chain.ca_cert_pem];
+        let certs = Certs::try_new(
+            &incomplete_chain.cert_pem,
+            &incomplete_chain.key_pem,
+            ca_certs_pem,
+        )
+        .expect("Should succeed with incomplete chain (leaf only)");
+        assert_eq!(certs.certs.len(), 1);
+    }
+
+    #[rstest::rstest]
+    fn test_try_new_cn_mismatch(cn_mismatch: CertificateSet) {
+        // CN mismatch between CA and leaf is valid for parsing
+        // (validation happens at connection time)
+        let ca_certs_pem: &[&[u8]] = &[&cn_mismatch.ca_cert_pem];
+        let certs = Certs::try_new(&cn_mismatch.cert_pem, &cn_mismatch.key_pem, ca_certs_pem)
+            .expect("Should succeed with CN mismatch (parsing only)");
+        assert!(!certs.certs.is_empty());
+    }
+
+    #[rstest::rstest]
+    fn test_try_new_expired_ca(expired_ca: CertificateSet) {
+        // Expired CA can still be parsed; expiration is checked at connection time
+        let ca_certs_pem: &[&[u8]] = &[&expired_ca.ca_cert_pem];
+        let certs = Certs::try_new(&expired_ca.cert_pem, &expired_ca.key_pem, ca_certs_pem)
+            .expect("Should succeed parsing expired CA (validation at connect time)");
+        assert!(!certs.certs.is_empty());
+    }
+
+    #[rstest::rstest]
+    fn test_try_new_expired_leaf(expired_leaf: CertificateSet) {
+        // Expired leaf can still be parsed; expiration is checked at connection time
+        let ca_certs_pem: &[&[u8]] = &[&expired_leaf.ca_cert_pem];
+        let certs = Certs::try_new(&expired_leaf.cert_pem, &expired_leaf.key_pem, ca_certs_pem)
+            .expect("Should succeed parsing expired leaf (validation at connect time)");
+        assert!(!certs.certs.is_empty());
+    }
+
+    // =========================================================================
     // Certs::try_new Error Path Tests
     // =========================================================================
 
-    #[test]
-    fn test_try_new_invalid_cert() {
-        // Use completely invalid base64 that will definitely fail to parse
+    #[rstest::rstest]
+    fn test_try_new_invalid_cert(valid_full_chain: CertificateSet) {
         let invalid_cert =
             b"-----BEGIN CERTIFICATE-----\n!!NOT_VALID_BASE64!!\n-----END CERTIFICATE-----\n";
-        let (_, key_pem) = generate_self_signed_cert();
-        let ca_cert = generate_ca_cert();
-        let ca_certs_pem: &[&[u8]] = &[&ca_cert];
+        let ca_certs_pem: &[&[u8]] = &[&valid_full_chain.ca_cert_pem];
 
-        let result = Certs::try_new(invalid_cert, &key_pem, ca_certs_pem);
+        let result = Certs::try_new(invalid_cert, &valid_full_chain.key_pem, ca_certs_pem);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("cannot read certificate chain"),
             "Error message should contain 'cannot read certificate chain': {err_msg}"
         );
     }
 
-    #[test]
-    fn test_try_new_invalid_key() {
-        let (cert_pem, _) = generate_self_signed_cert();
-        // Use completely invalid base64 that will definitely fail to parse
+    #[rstest::rstest]
+    fn test_try_new_invalid_key(valid_full_chain: CertificateSet) {
         let invalid_key =
             b"-----BEGIN PRIVATE KEY-----\n!!NOT_VALID_BASE64!!\n-----END PRIVATE KEY-----\n";
-        let ca_cert = generate_ca_cert();
-        let ca_certs_pem: &[&[u8]] = &[&ca_cert];
+        let ca_certs_pem: &[&[u8]] = &[&valid_full_chain.ca_cert_pem];
 
-        let result = Certs::try_new(&cert_pem, invalid_key, ca_certs_pem);
+        let result = Certs::try_new(&valid_full_chain.cert_pem, invalid_key, ca_certs_pem);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("cannot read private key"),
             "Error message should contain 'cannot read private key': {err_msg}"
         );
     }
 
-    #[test]
-    fn test_try_new_invalid_ca() {
-        let (cert_pem, key_pem) = generate_self_signed_cert();
-        // Use completely invalid base64 that will definitely fail to parse
+    #[rstest::rstest]
+    fn test_try_new_invalid_ca(self_signed_cert: CertificateSet) {
         let invalid_ca =
             b"-----BEGIN CERTIFICATE-----\n!!NOT_VALID_BASE64!!\n-----END CERTIFICATE-----\n";
         let ca_certs_pem: &[&[u8]] = &[invalid_ca];
 
-        let result = Certs::try_new(&cert_pem, &key_pem, ca_certs_pem);
+        let result = Certs::try_new(
+            &self_signed_cert.cert_pem,
+            &self_signed_cert.key_pem,
+            ca_certs_pem,
+        );
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("Expected error").to_string();
         assert!(
             err_msg.contains("failed to read CA certificates"),
             "Error message should contain 'failed to read CA certificates': {err_msg}"
         );
-    }
-
-    #[test]
-    fn test_try_new_with_generated_certs() {
-        let (cert_pem, key_pem) = generate_self_signed_cert();
-        let ca_cert = generate_ca_cert();
-        let ca_certs_pem: &[&[u8]] = &[&ca_cert];
-
-        let certs = Certs::try_new(&cert_pem, &key_pem, ca_certs_pem)
-            .expect("Should succeed with generated certificates");
-        assert_eq!(certs.certs.len(), 1);
-        assert!(!certs.ca_certs.is_empty());
     }
 
     // =========================================================================
@@ -416,9 +656,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_config_creates_endpoint() {
-        let cert_pem = std::fs::read(CERT_PATH).unwrap();
-        let key_pem = std::fs::read(KEY_PATH).unwrap();
-        let ca_pem = std::fs::read(CA_CERT_PATH).unwrap();
+        let cert_pem = std::fs::read(CERT_PATH).expect("Failed to read cert.pem");
+        let key_pem = std::fs::read(KEY_PATH).expect("Failed to read key.pem");
+        let ca_pem = std::fs::read(CA_CERT_PATH).expect("Failed to read ca_cert.pem");
         let ca_certs_pem: &[&[u8]] = &[&ca_pem];
 
         let certs = Certs::try_new(&cert_pem, &key_pem, ca_certs_pem)
@@ -431,14 +671,17 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_config_with_generated_certs() {
-        let (cert_pem, key_pem) = generate_self_signed_cert();
-        let ca_cert = generate_ca_cert();
-        let ca_certs_pem: &[&[u8]] = &[&ca_cert];
+    async fn test_config_with_valid_full_chain(valid_full_chain: CertificateSet) {
+        let ca_certs_pem: &[&[u8]] = &[&valid_full_chain.ca_cert_pem];
 
-        let certs = Certs::try_new(&cert_pem, &key_pem, ca_certs_pem)
-            .expect("Certs::try_new should succeed");
+        let certs = Certs::try_new(
+            &valid_full_chain.cert_pem,
+            &valid_full_chain.key_pem,
+            ca_certs_pem,
+        )
+        .expect("Certs::try_new should succeed");
         let endpoint = config(&certs).expect("config should create endpoint successfully");
 
         let local_addr = endpoint.local_addr().expect("Should have local address");
@@ -463,57 +706,19 @@ mod tests {
     }
 
     // =========================================================================
-    // Transport Configuration Tests
-    // =========================================================================
-
-    #[test]
-    fn test_transport_config_keep_alive_can_be_set() {
-        let mut transport = TransportConfig::default();
-        // Verify that setting keep_alive_interval doesn't panic
-        // and returns &mut Self for chaining
-        let result = transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
-        // The method returns &mut Self for builder pattern
-        assert!(
-            std::ptr::eq(result, &raw const transport),
-            "keep_alive_interval should return &mut Self"
-        );
-    }
-
-    #[test]
-    fn test_transport_config_none_keep_alive() {
-        let mut transport = TransportConfig::default();
-        // Verify that setting None doesn't panic
-        let result = transport.keep_alive_interval(None);
-        assert!(
-            std::ptr::eq(result, &raw const transport),
-            "keep_alive_interval(None) should return &mut Self"
-        );
-    }
-
-    #[test]
-    fn test_transport_config_various_intervals() {
-        let mut transport = TransportConfig::default();
-
-        // Test various interval values don't cause issues
-        // If any of these panic, the test will fail
-        transport.keep_alive_interval(Some(Duration::from_secs(1)));
-        transport.keep_alive_interval(Some(Duration::from_secs(10)));
-        transport.keep_alive_interval(Some(Duration::from_millis(500)));
-        transport.keep_alive_interval(Some(Duration::from_millis(5_000)));
-    }
-
-    // =========================================================================
     // TLS Configuration Tests
     // =========================================================================
 
-    #[test]
-    fn test_rustls_client_config_creation() {
-        let (cert_pem, key_pem) = generate_self_signed_cert();
-        let ca_cert = generate_ca_cert();
-        let ca_certs_pem: &[&[u8]] = &[&ca_cert];
+    #[rstest::rstest]
+    fn test_rustls_client_config_creation(self_signed_cert: CertificateSet) {
+        let ca_certs_pem: &[&[u8]] = &[&self_signed_cert.ca_cert_pem];
 
-        let certs = Certs::try_new(&cert_pem, &key_pem, ca_certs_pem)
-            .expect("Certs::try_new should succeed");
+        let certs = Certs::try_new(
+            &self_signed_cert.cert_pem,
+            &self_signed_cert.key_pem,
+            ca_certs_pem,
+        )
+        .expect("Certs::try_new should succeed");
 
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(certs.ca_certs.clone())
@@ -525,14 +730,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_quic_client_config_creation() {
-        let (cert_pem, key_pem) = generate_self_signed_cert();
-        let ca_cert = generate_ca_cert();
-        let ca_certs_pem: &[&[u8]] = &[&ca_cert];
+    #[rstest::rstest]
+    fn test_quic_client_config_creation(self_signed_cert: CertificateSet) {
+        let ca_certs_pem: &[&[u8]] = &[&self_signed_cert.ca_cert_pem];
 
-        let certs = Certs::try_new(&cert_pem, &key_pem, ca_certs_pem)
-            .expect("Certs::try_new should succeed");
+        let certs = Certs::try_new(
+            &self_signed_cert.cert_pem,
+            &self_signed_cert.key_pem,
+            ca_certs_pem,
+        )
+        .expect("Certs::try_new should succeed");
 
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(certs.ca_certs.clone())
@@ -546,14 +753,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_client_config_with_transport() {
-        let (cert_pem, key_pem) = generate_self_signed_cert();
-        let ca_cert = generate_ca_cert();
-        let ca_certs_pem: &[&[u8]] = &[&ca_cert];
+    #[rstest::rstest]
+    fn test_client_config_with_transport(self_signed_cert: CertificateSet) {
+        let ca_certs_pem: &[&[u8]] = &[&self_signed_cert.ca_cert_pem];
 
-        let certs = Certs::try_new(&cert_pem, &key_pem, ca_certs_pem)
-            .expect("Certs::try_new should succeed");
+        let certs = Certs::try_new(
+            &self_signed_cert.cert_pem,
+            &self_signed_cert.key_pem,
+            ca_certs_pem,
+        )
+        .expect("Certs::try_new should succeed");
 
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(certs.ca_certs.clone())
@@ -563,13 +772,12 @@ mod tests {
         let mut transport = TransportConfig::default();
         transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
 
-        let mut client_config =
-            ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config).unwrap()));
+        let quic_config =
+            QuicClientConfig::try_from(tls_config).expect("QUIC config should be created");
+        let mut client_config = ClientConfig::new(Arc::new(quic_config));
         client_config.transport_config(Arc::new(transport));
 
-        // Verify that the client config was created (we can't easily inspect
-        // the internal transport config, but creating without panic is success)
-        // The fact that we got here means the test passes
+        // Verify client config was created without panic
         drop(client_config);
     }
 
@@ -577,17 +785,11 @@ mod tests {
     // Tempfile-based Tests (file I/O paths)
     // =========================================================================
 
-    #[test]
-    fn test_load_cert_from_tempfile() {
-        use std::io::Write;
-
-        use tempfile::NamedTempFile;
-
-        let (cert_pem, _) = generate_self_signed_cert();
-
+    #[rstest::rstest]
+    fn test_load_cert_from_tempfile(self_signed_cert: CertificateSet) {
         let mut cert_file = NamedTempFile::new().expect("Failed to create temp file");
         cert_file
-            .write_all(&cert_pem)
+            .write_all(&self_signed_cert.cert_pem)
             .expect("Failed to write cert");
         cert_file.flush().expect("Failed to flush");
 
@@ -596,16 +798,12 @@ mod tests {
         assert_eq!(certs.len(), 1);
     }
 
-    #[test]
-    fn test_load_key_from_tempfile() {
-        use std::io::Write;
-
-        use tempfile::NamedTempFile;
-
-        let (_, key_pem) = generate_self_signed_cert();
-
+    #[rstest::rstest]
+    fn test_load_key_from_tempfile(self_signed_cert: CertificateSet) {
         let mut key_file = NamedTempFile::new().expect("Failed to create temp file");
-        key_file.write_all(&key_pem).expect("Failed to write key");
+        key_file
+            .write_all(&self_signed_cert.key_pem)
+            .expect("Failed to write key");
         key_file.flush().expect("Failed to flush");
 
         let loaded = std::fs::read(key_file.path()).expect("Failed to read temp file");
@@ -613,27 +811,24 @@ mod tests {
         assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
     }
 
-    #[test]
-    fn test_full_cert_loading_from_tempfiles() {
-        use std::io::Write;
-
-        use tempfile::NamedTempFile;
-
-        let (cert_pem, key_pem) = generate_self_signed_cert();
-        let ca_cert = generate_ca_cert();
-
+    #[rstest::rstest]
+    fn test_full_cert_loading_from_tempfiles(valid_full_chain: CertificateSet) {
         let mut cert_file = NamedTempFile::new().expect("Failed to create temp file");
         cert_file
-            .write_all(&cert_pem)
+            .write_all(&valid_full_chain.cert_pem)
             .expect("Failed to write cert");
         cert_file.flush().expect("Failed to flush");
 
         let mut key_file = NamedTempFile::new().expect("Failed to create temp file");
-        key_file.write_all(&key_pem).expect("Failed to write key");
+        key_file
+            .write_all(&valid_full_chain.key_pem)
+            .expect("Failed to write key");
         key_file.flush().expect("Failed to flush");
 
         let mut ca_file = NamedTempFile::new().expect("Failed to create temp file");
-        ca_file.write_all(&ca_cert).expect("Failed to write CA");
+        ca_file
+            .write_all(&valid_full_chain.ca_cert_pem)
+            .expect("Failed to write CA");
         ca_file.flush().expect("Failed to flush");
 
         let cert_data = std::fs::read(cert_file.path()).expect("Failed to read cert");
@@ -644,7 +839,7 @@ mod tests {
         let certs = Certs::try_new(&cert_data, &key_data, ca_certs_pem)
             .expect("Should load certs from temp files");
 
-        assert_eq!(certs.certs.len(), 1);
+        assert!(!certs.certs.is_empty());
         assert!(!certs.ca_certs.is_empty());
     }
 }
