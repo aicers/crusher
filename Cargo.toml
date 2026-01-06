@@ -5,6 +5,9 @@ edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+
 [dependencies]
 anyhow = "1"
 async-channel = "2"
@@ -36,3 +39,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [lints.clippy]
 pedantic = "warn"
 unwrap_used = "warn"
+
+[dev-dependencies]
+tempfile = "3.24"
