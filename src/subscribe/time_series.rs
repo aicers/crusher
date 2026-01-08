@@ -55,6 +55,13 @@ pub(super) struct TimeSeries {
 
 impl TimeSeries {
     pub(super) async fn try_new(policy: &SamplingPolicy) -> Result<Self> {
+        if !policy
+            .period
+            .as_secs()
+            .is_multiple_of(policy.interval.as_secs())
+        {
+            bail!("period must be divisible by interval");
+        }
         let start = Utc.timestamp_nanos(policy.start_timestamp().await?);
         let len = usize::try_from(policy.period.as_secs() / policy.interval.as_secs())?;
         let series = vec![0_f64; len];
