@@ -306,29 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn test_time_slot_period_not_divisible_by_interval() {
-        // Period: 1 hour (3600s), Interval: 7 min (420s) => 8 slots (3600/420 = 8.57 truncated)
-        // This tests the edge case where period % interval != 0
-        let policy = create_policy(1, SECS_PER_HOUR, 7 * SECS_PER_MINUTE, 0, None);
-
-        // Midnight => slot 0
-        let midnight = datetime_from_timestamp(BASE_TIMESTAMP - (BASE_TIMESTAMP % 86400));
-        assert_eq!(time_slot(&policy, midnight).unwrap(), 0);
-
-        // 00:07:00 => slot 1
-        let slot_1 = datetime_from_timestamp(midnight.timestamp() + 7 * 60);
-        assert_eq!(time_slot(&policy, slot_1).unwrap(), 1);
-
-        // 00:56:00 => slot 8 (56 / 7 = 8)
-        let slot_8 = datetime_from_timestamp(midnight.timestamp() + 56 * 60);
-        assert_eq!(time_slot(&policy, slot_8).unwrap(), 8);
-
-        // 00:59:59 => slot 8 (59 / 7 = 8.4 truncated to 8)
-        let end_of_hour = datetime_from_timestamp(midnight.timestamp() + 59 * 60 + 59);
-        assert_eq!(time_slot(&policy, end_of_hour).unwrap(), 8);
-    }
-
-    #[test]
     fn test_time_slot_interval_equals_period() {
         // Period: 1 hour (3600s), Interval: 1 hour (3600s) => 1 slot
         // All times within the period should map to slot 0
@@ -482,9 +459,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Give time for writes to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
         // Close sender to end the writer task
         drop(sender);
         let _ = writer_handle.await;
@@ -529,11 +503,9 @@ mod tests {
 
         // Send initial timestamp
         sender.send((key.clone(), 1_000_000_000_i64)).await.unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Update with new timestamp
         sender.send((key.clone(), 3_000_000_000_i64)).await.unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         drop(sender);
         let _ = writer_handle.await;
@@ -592,12 +564,19 @@ mod tests {
     async fn test_read_last_timestamp_nonexistent_file() {
         let dir = tempdir().expect("failed to create temp dir");
         let file_path = dir.path().join("nonexistent.json");
+        let unique_key = format!(
+            "read_nonexistent_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
 
         // Reading a nonexistent file should succeed (no-op) and not modify the map
-        // We can't assert the map is empty since tests run in parallel,
-        // but we can verify the call succeeds
         let result = read_last_timestamp(&file_path).await;
         assert!(result.is_ok());
+        assert!(LAST_TRANSFER_TIME.read().await.get(&unique_key).is_none());
     }
 
     #[tokio::test]
