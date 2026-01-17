@@ -2,7 +2,7 @@
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
-use config::{Config as cfg, ConfigBuilder, ConfigError, File, builder::DefaultState};
+use config::{Config as cfg, ConfigBuilder, File, builder::DefaultState};
 use serde::{Deserialize, Deserializer, de::Error};
 
 const DEFAULT_GIGANTO_NAME: &str = "localhost";
@@ -24,12 +24,19 @@ pub(crate) struct Settings {
 impl Settings {
     /// Creates a new `Settings` instance, populated from the given
     /// configuration file.
-    pub(crate) fn from_file(cfg_path: &str) -> Result<Self, ConfigError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or parsed as a valid
+    /// settings configuration.
+    pub(crate) fn from_file(cfg_path: &str) -> Result<Self> {
         let s = default_config_builder()
             .add_source(File::with_name(cfg_path))
-            .build()?;
+            .build()
+            .context("failed to load configuration file")?;
 
         s.try_deserialize()
+            .context("failed to parse configuration file")
     }
 }
 
