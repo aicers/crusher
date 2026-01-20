@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use quinn::{ClientConfig, Endpoint, TransportConfig, crypto::rustls::QuicClientConfig};
 use rustls::{
     RootCertStore,
@@ -21,7 +21,6 @@ pub(crate) struct Certs {
 impl Certs {
     pub(crate) fn try_new(cert_pem: &[u8], key_pem: &[u8], ca_certs_pem: &[&[u8]]) -> Result<Self> {
         let certs = Self::to_cert_chain(cert_pem).context("cannot read certificate chain")?;
-        assert!(!certs.is_empty());
         let key = Self::to_private_key(key_pem).context("cannot read private key")?;
         let ca_certs = Self::to_ca_certs(ca_certs_pem).context("failed to read CA certificates")?;
         Ok(Self {
@@ -33,8 +32,9 @@ impl Certs {
 
     pub(crate) fn to_cert_chain(raw: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
         let certs = rustls_pemfile::certs(&mut &*raw)
-            .collect::<Result<_, _>>()
+            .collect::<Result<Vec<_>, _>>()
             .context("cannot parse certificate chain")?;
+        ensure!(!certs.is_empty(), "empty certificate chain");
         Ok(certs)
     }
 
@@ -414,6 +414,12 @@ mod tests {
         b"".to_vec()
     }
 
+    /// A PEM file with the wrong format.
+    #[fixture]
+    fn wrong_format_pem() -> Vec<u8> {
+        b"this is not a PEM file at all".to_vec()
+    }
+
     /// An invalid certificate PEM file.
     #[fixture]
     fn invalid_cert_pem() -> Vec<u8> {
@@ -743,6 +749,8 @@ mod tests {
     #[rstest]
     #[case::bad_cert(invalid_cert_pem(), "cannot parse certificate chain")]
     #[case::bad_leaf(tls_bundle_invalid_leaf_cert().0.fullchain_cert_pem, "cannot parse certificate chain")]
+    #[case::empty(empty_pem(), "empty certificate chain")]
+    #[case::wrong_pem(wrong_format_pem(), "empty certificate chain")]
     fn to_cert_chain_failure(
         #[case] invalid_cert_pem: Vec<u8>,
         #[case] part_of_error_message: &str,
