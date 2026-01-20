@@ -143,23 +143,18 @@ mod tests {
         }
     }
 
-    /// Dataset used for generating the `TlsBundle` for server's certificate.
+    /// Setup parameters used for generating the Server's endpoint and certificates.
     #[derive(Debug)]
-    struct CertHintForServer {
-        /// Root certificate that issued the server's certificate.
-        /// Used for generating the `TlsBundle` for server's certificate.
-        /// In order to be valid, server's `TlsBundle`'s `ca_cert_pems` should include this certificate.
-        fullchain_root_cert: Certificate,
+    struct ServerCertsSetup {
+        /// The Root CA used to verify client certificates (mTLS).
+        /// This creates the trust anchor for the server.
+        client_trust_root: Certificate,
 
-        /// First CA certificate among server's `ca_cert_pems`.
-        /// Used for generating the `TlsBundle` for server's certificate.
-        /// Use of this certificate as server's fullchain root cert make it valid.
-        first_ca_cert: Certificate,
+        /// The CA certificate used to sign the server's leaf certificate.
+        server_issuer_cert: Certificate,
 
-        /// First CA key pair among server's `ca_cert_pems`.
-        /// Used for generating the `TlsBundle` for server's certificate.
-        /// Use of this key pair as server's fullchain root key pair make it valid.
-        first_ca_key_pair: KeyPair,
+        /// The Private Key of the CA used to sign the server's leaf certificate.
+        server_issuer_key: KeyPair,
     }
 
     fn generate_params(is_ca: bool, cn: &str, sans: &[&str], days_valid: i64) -> CertificateParams {
@@ -295,11 +290,11 @@ mod tests {
         cn: &str,
         sans: &[&str],
         days_valid: i64,
-        cert_hint: &CertHintForServer,
+        cert_setup: &ServerCertsSetup,
     ) -> (TlsBundle, SocketAddr) {
-        let client_root_cert = &cert_hint.fullchain_root_cert;
-        let issuer_cert = &cert_hint.first_ca_cert;
-        let issuer_key_pair = &cert_hint.first_ca_key_pair;
+        let client_trust_root = &cert_setup.client_trust_root;
+        let issuer_cert = &cert_setup.server_issuer_cert;
+        let issuer_key_pair = &cert_setup.server_issuer_key;
 
         let (cert, key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
             cn,
@@ -309,7 +304,7 @@ mod tests {
             issuer_key_pair,
         );
 
-        let server_bundle = bundle([&cert, issuer_cert], &key_pair, [client_root_cert]);
+        let server_bundle = bundle([&cert, issuer_cert], &key_pair, [client_trust_root]);
         let server_addr = format!("{}:0", sans.first().expect("SANs should not be empty"))
             .to_socket_addrs()
             .expect("Assumed to succeed to parse server address")
@@ -326,12 +321,12 @@ mod tests {
         config(&certs).context("Failed to create client endpoint")
     }
 
-    fn create_server_endpoint(hint: &CertHintForServer) -> Result<Endpoint> {
+    fn create_server_endpoint(cert_setup: &ServerCertsSetup) -> Result<Endpoint> {
         let (server_bundle, server_addr) = generate_valid_server_tls_bundle_and_server_address(
             "localhost",
             &["localhost"],
             365,
-            hint,
+            cert_setup,
         );
 
         let server_ca_certs = Certs::to_ca_certs(&server_bundle.ca_certs())
@@ -356,11 +351,11 @@ mod tests {
         Endpoint::server(server_config, server_addr).context("Failed to create server endpoint")
     }
 
-    async fn handshake(client_bundle: TlsBundle, hint: CertHintForServer) -> Result<()> {
+    async fn handshake(client_bundle: TlsBundle, cert_setup: ServerCertsSetup) -> Result<()> {
         let client_endpoint =
             create_client_endpoint(&client_bundle).context("Failed to create client endpoint")?;
         let server_endpoint =
-            create_server_endpoint(&hint).context("Failed to create server endpoint")?;
+            create_server_endpoint(&cert_setup).context("Failed to create server endpoint")?;
         let server_local_addr = server_endpoint
             .local_addr()
             .context("Failed to get server local address")?;
@@ -437,7 +432,7 @@ mod tests {
 
     /// Most-commonly-used valid fullchain certificate bundle.
     #[fixture]
-    fn tls_bundle_valid_fullchain() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_valid_fullchain() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) =
             generate_key_pair_and_self_signed_cert("localhost", &["localhost"], 365);
         let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
@@ -448,13 +443,13 @@ mod tests {
             &ca_key_pair,
         );
         let client_bundle = bundle([&leaf_cert, &ca_cert], &leaf_key_pair, [&ca_cert]);
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: ca_cert.clone(),
-            first_ca_key_pair: ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     /// A certificate bundle with multiple intermediate certificates.
@@ -465,7 +460,7 @@ mod tests {
     /// ```
     ///
     #[fixture]
-    fn tls_bundle_valid_fullchain_multiple_intermediates() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_valid_fullchain_multiple_intermediates() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) = generate_key_pair_and_self_signed_cert("ca", &["ca"], 365);
         let (intermediate_2_cert, intermediate_2_key_pair) =
             generate_intermediate_key_pair_and_signed_cert_by_issuer(
@@ -500,17 +495,17 @@ mod tests {
             &leaf_key_pair,
             [&ca_cert],
         );
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: ca_cert.clone(),
-            first_ca_key_pair: ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     #[fixture]
-    fn tls_bundle_valid_fullchain_multiple_leaf_san() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_valid_fullchain_multiple_leaf_san() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) =
             generate_key_pair_and_self_signed_cert("localhost", &["localhost"], 365);
         let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
@@ -521,13 +516,13 @@ mod tests {
             &ca_key_pair,
         );
         let client_bundle = bundle([&leaf_cert, &ca_cert], &leaf_key_pair, [&ca_cert]);
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: ca_cert.clone(),
-            first_ca_key_pair: ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     /// A certificate bundle with various leaf Subject Alternative Names.
@@ -539,7 +534,7 @@ mod tests {
     /// - IPv6 address
     /// - Extremely long subdomain name
     #[fixture]
-    fn tls_bundle_valid_fullchain_various_leaf_san() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_valid_fullchain_various_leaf_san() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) =
             generate_key_pair_and_self_signed_cert("example.com", &["example.com"], 365);
         let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
@@ -556,17 +551,17 @@ mod tests {
             &ca_key_pair,
         );
         let client_bundle = bundle([&leaf_cert, &ca_cert], &leaf_key_pair, [&ca_cert]);
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: ca_cert.clone(),
-            first_ca_key_pair: ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     #[fixture]
-    fn tls_bundle_valid_fullchain_different_ca_certs() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_valid_fullchain_different_ca_certs() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) =
             generate_key_pair_and_self_signed_cert("localhost", &["localhost"], 365);
         let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
@@ -587,17 +582,17 @@ mod tests {
             &leaf_key_pair,
             [&other_ca_cert_1, &other_ca_cert_2, &other_ca_cert_3],
         );
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: other_ca_cert_1.clone(),
-            first_ca_key_pair: other_ca_key_pair_1,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: other_ca_cert_1.clone(),
+            server_issuer_key: other_ca_key_pair_1,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     #[fixture]
-    fn tls_bundle_valid_fullchain_short_valid_days() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_valid_fullchain_short_valid_days() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) =
             generate_key_pair_and_self_signed_cert("localhost", &["localhost"], 1);
         let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
@@ -608,17 +603,17 @@ mod tests {
             &ca_key_pair,
         );
         let client_bundle = bundle([&leaf_cert, &ca_cert], &leaf_key_pair, [&ca_cert]);
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: ca_cert.clone(),
-            first_ca_key_pair: ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     #[fixture]
-    fn tls_bundle_expired_leaf_cert() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_expired_leaf_cert() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) =
             generate_key_pair_and_self_signed_cert("localhost", &["localhost"], 365);
         let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
@@ -629,17 +624,17 @@ mod tests {
             &ca_key_pair,
         );
         let client_bundle = bundle([&leaf_cert, &ca_cert], &leaf_key_pair, [&ca_cert]);
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: ca_cert.clone(),
-            first_ca_key_pair: ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     #[fixture]
-    fn tls_bundle_invalid_leaf_cert() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_invalid_leaf_cert() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) =
             generate_key_pair_and_self_signed_cert("localhost", &["localhost"], 365);
         let (_, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
@@ -655,17 +650,17 @@ mod tests {
             key_pem: leaf_key_pair.serialize_pem().into_bytes(),
             ca_cert_pems: vec![ca_cert.pem().into_bytes()],
         };
-        let hint = CertHintForServer {
-            first_ca_cert: ca_cert.clone(),
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: first_ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     #[fixture]
-    fn tls_bundle_empty_ca_certs() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_empty_ca_certs() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) =
             generate_key_pair_and_self_signed_cert("localhost", &["localhost"], 365);
         let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
@@ -676,17 +671,17 @@ mod tests {
             &ca_key_pair,
         );
         let client_bundle = bundle([&leaf_cert, &ca_cert], &leaf_key_pair, []);
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: ca_cert.clone(),
-            first_ca_key_pair: ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     #[fixture]
-    fn tls_bundle_wrong_chain_order() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_wrong_chain_order() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) = generate_key_pair_and_self_signed_cert("ca", &["ca"], 365);
         let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
             "crusher@localhost",
@@ -696,17 +691,17 @@ mod tests {
             &ca_key_pair,
         );
         let client_bundle = bundle([&ca_cert, &leaf_cert], &leaf_key_pair, [&ca_cert]);
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: ca_cert.clone(),
-            first_ca_key_pair: ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     #[fixture]
-    fn tls_bundle_leaf_key_not_matching_cert() -> (TlsBundle, CertHintForServer) {
+    fn tls_bundle_leaf_key_not_matching_cert() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) = generate_key_pair_and_self_signed_cert("ca", &["ca"], 365);
         let (leaf_cert, _) = generate_leaf_key_pair_and_signed_cert_by_issuer(
             "crusher@localhost",
@@ -718,13 +713,13 @@ mod tests {
         let unrelated_leaf_key_pair =
             KeyPair::generate().expect("Assumed to succeed to generate key pair");
         let client_bundle = bundle([&leaf_cert, &ca_cert], &unrelated_leaf_key_pair, [&ca_cert]);
-        let hint = CertHintForServer {
-            fullchain_root_cert: ca_cert.clone(),
-            first_ca_cert: ca_cert.clone(),
-            first_ca_key_pair: ca_key_pair,
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: ca_cert.clone(),
+            server_issuer_cert: ca_cert.clone(),
+            server_issuer_key: ca_key_pair,
         };
 
-        (client_bundle, hint)
+        (client_bundle, cert_setup)
     }
 
     // =========================================================================
@@ -847,7 +842,7 @@ mod tests {
     #[case::diff_ca(tls_bundle_valid_fullchain_different_ca_certs(), 2, 3)]
     #[case::short_days(tls_bundle_valid_fullchain_short_valid_days(), 2, 1)]
     fn try_new_success(
-        #[case] (tls_bundle, _): (TlsBundle, CertHintForServer),
+        #[case] (tls_bundle, _): (TlsBundle, ServerCertsSetup),
         #[case] expected_certs_len: usize,
         #[case] expected_ca_certs_len: usize,
     ) {
@@ -864,7 +859,7 @@ mod tests {
 
     #[rstest]
     #[case::bad_leaf(tls_bundle_invalid_leaf_cert())]
-    fn try_new_failure(#[case] (tls_bundle, _): (TlsBundle, CertHintForServer)) {
+    fn try_new_failure(#[case] (tls_bundle, _): (TlsBundle, ServerCertsSetup)) {
         let result = Certs::try_new(
             tls_bundle.fullchain_cert(),
             tls_bundle.key(),
@@ -886,7 +881,7 @@ mod tests {
     #[case::diff_ca(tls_bundle_valid_fullchain_different_ca_certs())]
     #[case::short_days(tls_bundle_valid_fullchain_short_valid_days())]
     async fn config_creates_endpoint_success(
-        #[case] (tls_bundle, _): (TlsBundle, CertHintForServer),
+        #[case] (tls_bundle, _): (TlsBundle, ServerCertsSetup),
     ) {
         let certs = Certs::try_new(
             tls_bundle.fullchain_cert(),
@@ -912,8 +907,8 @@ mod tests {
     #[case::various_san(tls_bundle_valid_fullchain_various_leaf_san())]
     #[case::diff_ca(tls_bundle_valid_fullchain_different_ca_certs())]
     #[case::short_days(tls_bundle_valid_fullchain_short_valid_days())]
-    async fn handshake_success(#[case] (client_bundle, hint): (TlsBundle, CertHintForServer)) {
-        let result = handshake(client_bundle, hint).await;
+    async fn handshake_success(#[case] (client_bundle, cert_setup): (TlsBundle, ServerCertsSetup)) {
+        let result = handshake(client_bundle, cert_setup).await;
         assert!(result.is_ok(), "Handshake result should be successful");
     }
 
@@ -924,8 +919,8 @@ mod tests {
     #[case::empty_ca(tls_bundle_empty_ca_certs())]
     #[case::wrong_order(tls_bundle_wrong_chain_order())]
     #[case::key_mismatch(tls_bundle_leaf_key_not_matching_cert())]
-    async fn handshake_failure(#[case] (client_bundle, hint): (TlsBundle, CertHintForServer)) {
-        let result = handshake(client_bundle, hint).await;
+    async fn handshake_failure(#[case] (client_bundle, cert_setup): (TlsBundle, ServerCertsSetup)) {
+        let result = handshake(client_bundle, cert_setup).await;
         assert!(result.is_err(), "Handshake result should be an error");
     }
 }
