@@ -9,7 +9,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 
 - Unified the error type returned by `Settings::from_file` to use
-  `anyhow::Error`, matching `FromStr::from_str` for API consistency.
+  `anyhow::Error`, matching `FromStr::from_str` for API consistency. Error
+  messages now include the configuration file path for better diagnostics.
 
 ## [0.7.0] - 2025-12-04
 

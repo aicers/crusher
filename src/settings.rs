@@ -33,7 +33,7 @@ impl Settings {
         let s = default_config_builder()
             .add_source(File::with_name(cfg_path))
             .build()
-            .context("failed to load configuration file")?;
+            .with_context(|| format!("failed to load configuration file: {cfg_path}"))?;
 
         s.try_deserialize()
             .context("failed to parse configuration file")
