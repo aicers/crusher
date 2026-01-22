@@ -45,6 +45,7 @@ impl SamplingPolicyExt for SamplingPolicy {
     }
 }
 
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[derive(Default, Clone, Debug, Serialize)]
 pub(super) struct TimeSeries {
     pub(super) sampling_policy_id: String,
@@ -186,6 +187,11 @@ pub(super) fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Re
     serde_json::to_writer(BufWriter::new(file), &json)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn clear_last_transfer_time() {
+    LAST_TRANSFER_TIME.write().await.clear();
 }
 
 #[cfg(test)]
