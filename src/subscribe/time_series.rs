@@ -45,6 +45,7 @@ impl SamplingPolicyExt for SamplingPolicy {
     }
 }
 
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[derive(Default, Clone, Debug, Serialize)]
 pub(super) struct TimeSeries {
     pub(super) sampling_policy_id: String,
@@ -186,6 +187,11 @@ pub(super) fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Re
     serde_json::to_writer(BufWriter::new(file), &json)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn clear_last_transfer_time() {
+    LAST_TRANSFER_TIME.write().await.clear();
 }
 
 #[cfg(test)]
@@ -857,12 +863,18 @@ mod tests {
         }
     }
 
+    async fn reset_ingest_channel() {
+        INGEST_CHANNEL.write().await.clear();
+    }
+
     // =========================================================================
     // Tests for TimeSeries::fill and column aggregation
     // =========================================================================
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_single_event_counts_as_one() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: None => count events (each event adds 1.0)
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
@@ -888,8 +900,10 @@ mod tests {
         assert_eq!(series.series[3], 0.0);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_multiple_events_same_slot_aggregates() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: None => count events
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
@@ -918,8 +932,10 @@ mod tests {
         assert_eq!(series.series[0], 3.0);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_events_in_different_slots() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
@@ -963,8 +979,10 @@ mod tests {
         }
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_with_column_aggregation_duration() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: Some(5) => sum duration values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(5));
@@ -999,8 +1017,10 @@ mod tests {
         );
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_with_column_aggregation_bytes() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: Some(7) => sum orig_bytes values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(7));
@@ -1039,8 +1059,10 @@ mod tests {
         );
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_with_column_aggregation_packets() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 30 min => 2 slots
         // column: Some(9) => sum orig_pkts values
         let policy = create_policy(1, SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 0, Some(9));
@@ -1093,8 +1115,10 @@ mod tests {
         );
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_period_boundary_sends_and_resets() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
@@ -1133,8 +1157,42 @@ mod tests {
         assert_eq!(series.series[1], 0.0);
     }
 
+    #[serial]
+    #[tokio::test]
+    async fn test_fill_kst_offset_events_aggregate_same_slot() {
+        reset_ingest_channel().await;
+        // Period: 1 day, Interval: 15 min => 96 slots
+        // Offset: +9 hours (KST)
+        let policy = create_policy(1, SECS_PER_DAY, 15 * SECS_PER_MINUTE, 32_400, None);
+        let midnight = datetime_from_utc("2022/11/17 00:00:00").timestamp();
+        let mut series = create_test_series("1", 96, midnight);
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(1);
+
+        for event_time in [
+            "2022/11/17 00:03:00",
+            "2022/11/17 00:06:00",
+            "2022/11/17 00:09:00",
+        ] {
+            let conn = create_test_conn();
+            series
+                .fill(
+                    &policy,
+                    datetime_from_utc(event_time),
+                    &Event::Conn(conn),
+                    &sender,
+                )
+                .await
+                .expect("fill should succeed");
+        }
+
+        // UTC 00:03/00:06/00:09 becomes KST 09:03/09:06/09:09, which is slot 36.
+        assert_eq!(series.series[36], 3.0);
+    }
+
+    #[serial]
     #[tokio::test]
     async fn test_fill_with_offset_affects_slot_calculation() {
+        reset_ingest_channel().await;
         // Period: 1 day, Interval: 1 hour => 24 slots
         // Offset: +9 hours (32400s) - KST adjustment
         let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
@@ -1162,8 +1220,10 @@ mod tests {
         }
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_missing_slots_remain_zero() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 10 min => 6 slots
         let policy = create_policy(1, SECS_PER_HOUR, 10 * SECS_PER_MINUTE, 0, None);
 
@@ -1196,8 +1256,10 @@ mod tests {
         assert_eq!(series.series[5], 1.0);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_duplicate_timestamps_aggregate() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
