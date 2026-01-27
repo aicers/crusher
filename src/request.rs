@@ -686,6 +686,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn delete_policy_ignores_non_existent_id_in_batch() {
+        // Test: Deleting a non-existent policy should be silently ignored
+        let (mut client, rx) = create_test_client();
+
+        let policies: Vec<SamplingPolicy> = (1..=7).map(create_test_policy).collect();
+        client
+            .sampling_policy_list(&policies)
+            .await
+            .expect("Success to add policies");
+
+        // Drain channel
+        (1..=7).for_each(|id| {
+            let received = rx.try_recv().expect("Success to receive policy");
+            assert_eq!(received.id, id);
+        });
+
+        // Try to delete a batch including non-existent policy and some existent policies
+        let result = client.delete_sampling_policy(&[1, 2, 3, 999, 4, 5]).await;
+        assert!(result.is_ok());
+
+        let delete_ids = client.delete_policy_ids.read().await;
+        assert_eq!(delete_ids.len(), 5);
+        assert_eq!(delete_ids[0], 1);
+        assert_eq!(delete_ids[1], 2);
+        assert_eq!(delete_ids[2], 3);
+        assert_eq!(delete_ids[3], 4);
+        assert_eq!(delete_ids[4], 5);
+
+        assert_eq!(client.active_policy_list.read().await.len(), 2);
+        assert!(client.active_policy_list.read().await.contains_key(&6));
+        assert!(client.active_policy_list.read().await.contains_key(&7));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn delete_policy_empty_list() {
         // Test: Delete on empty active list should be no-op
         let (mut client, _) = create_test_client();
@@ -755,6 +789,34 @@ mod tests {
         // Final state: empty active list, 3 entries in delete queue
         assert!(client.active_policy_list.read().await.is_empty());
         assert_eq!(client.delete_policy_ids.read().await.len(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_policy_succeeds_after_receiver_dropped() {
+        let (mut client, rx) = create_test_client();
+
+        let policy = create_test_policy(1);
+        client
+            .sampling_policy_list(&[policy])
+            .await
+            .expect("Success to add policy");
+        let received = rx.try_recv().expect("Success to receive policy");
+        assert_eq!(received.id, 1);
+
+        // Drop receiver to simulate the notification channel being unavailable.
+        // Delete path should remain functional regardless.
+        drop(rx);
+
+        assert!(client.active_policy_list.read().await.contains_key(&1));
+
+        client
+            .delete_sampling_policy(&[1])
+            .await
+            .expect("Success to delete policy");
+
+        // Final state: empty active list, 1 entry in delete queue
+        assert_eq!(client.delete_policy_ids.read().await.as_slice(), &[1]);
+        assert!(client.active_policy_list.read().await.is_empty());
     }
 
     // =========================================================================
