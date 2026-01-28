@@ -756,7 +756,6 @@ mod tests {
         #[case] part_of_error_message: &str,
     ) {
         let result = Certs::to_cert_chain(&invalid_cert_pem);
-        assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains(part_of_error_message),
@@ -788,7 +787,6 @@ mod tests {
     #[case::bad_key(invalid_key_pem(), "cannot parse private key")]
     fn to_private_key_failure(#[case] invalid_pem: Vec<u8>, #[case] part_of_error_message: &str) {
         let result = Certs::to_private_key(&invalid_pem);
-        assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains(part_of_error_message),
@@ -830,7 +828,6 @@ mod tests {
                 .map(std::vec::Vec::as_slice)
                 .collect::<Vec<_>>(),
         );
-        assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains(part_of_error_message),
