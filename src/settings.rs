@@ -227,6 +227,14 @@ last_timestamp_data = "/tmp/timestamp.dat"
     }
 
     #[test]
+    fn from_file_non_existent_file() {
+        let file_name = "/non/existent/path/non_existent_file.toml";
+        let result = Settings::from_file(file_name);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(file_name));
+    }
+
+    #[test]
     fn from_str_ipv4_parsing() {
         // Test IPv4 address parsing with explicit port.
         let config = r#"
