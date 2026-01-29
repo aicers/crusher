@@ -60,6 +60,7 @@ impl TimeSeries {
     ///
     /// Returns an error if:
     /// - The policy's interval is zero.
+    /// - The policy's period is zero.
     /// - The policy's period is not a multiple of the interval (i.e.,
     ///   `period % interval != 0`).
     /// - The start timestamp cannot be computed.
@@ -69,6 +70,9 @@ impl TimeSeries {
         let period_secs = policy.period.as_secs();
         if interval_secs == 0 {
             bail!("interval must be greater than 0");
+        }
+        if period_secs == 0 {
+            bail!("period must be greater than 0");
         }
         if !period_secs.is_multiple_of(interval_secs) {
             bail!("period must be a multiple of interval");
@@ -1398,6 +1402,19 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("interval must be greater than 0"),
+            "unexpected error message: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_new_period_zero() {
+        // period is 0, should error
+        let policy = create_simple_policy(60, 0);
+        let result = TimeSeries::try_new(&policy).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("period must be greater than 0"),
             "unexpected error message: {err_msg}"
         );
     }
