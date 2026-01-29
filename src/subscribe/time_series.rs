@@ -54,9 +54,32 @@ pub(super) struct TimeSeries {
 }
 
 impl TimeSeries {
+    /// Creates a new `TimeSeries` from the given sampling policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The policy's interval is zero.
+    /// - The policy's period is zero.
+    /// - The policy's period is not a multiple of the interval (i.e.,
+    ///   `period % interval != 0`).
+    /// - The start timestamp cannot be computed.
+    /// - The series length overflows `usize`.
     pub(super) async fn try_new(policy: &SamplingPolicy) -> Result<Self> {
+        let interval_secs = policy.interval.as_secs();
+        let period_secs = policy.period.as_secs();
+        if interval_secs == 0 {
+            bail!("interval must be greater than 0");
+        }
+        if period_secs == 0 {
+            bail!("period must be greater than 0");
+        }
+        if !period_secs.is_multiple_of(interval_secs) {
+            bail!("period must be a multiple of interval");
+        }
+
         let start = Utc.timestamp_nanos(policy.start_timestamp().await?);
-        let len = usize::try_from(policy.period.as_secs() / policy.interval.as_secs())?;
+        let len = usize::try_from(period_secs / interval_secs)?;
         let series = vec![0_f64; len];
         Ok(TimeSeries {
             sampling_policy_id: policy.id.to_string(),
@@ -186,4 +209,76 @@ pub(super) fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Re
     serde_json::to_writer(BufWriter::new(file), &json)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use review_protocol::types::{SamplingKind, SamplingPolicy};
+
+    use super::*;
+
+    fn make_policy(interval_secs: u64, period_secs: u64) -> SamplingPolicy {
+        SamplingPolicy {
+            id: 1,
+            kind: SamplingKind::Conn,
+            interval: Duration::from_secs(interval_secs),
+            period: Duration::from_secs(period_secs),
+            offset: 0,
+            src_ip: None,
+            dst_ip: None,
+            node: None,
+            column: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn try_new_valid_period_interval() {
+        // period (3600) is a multiple of interval (60)
+        let policy = make_policy(60, 3600);
+        let result = TimeSeries::try_new(&policy).await;
+        assert!(result.is_ok());
+        let ts = result.unwrap();
+        assert_eq!(ts.series.len(), 60); // 3600 / 60 = 60
+    }
+
+    #[tokio::test]
+    async fn try_new_invalid_period_not_multiple_of_interval() {
+        // period (100) is not a multiple of interval (30)
+        let policy = make_policy(30, 100);
+        let result = TimeSeries::try_new(&policy).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("period must be a multiple of interval"),
+            "unexpected error message: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_new_interval_zero() {
+        // interval is 0, should error before division
+        let policy = make_policy(0, 3600);
+        let result = TimeSeries::try_new(&policy).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("interval must be greater than 0"),
+            "unexpected error message: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_new_period_zero() {
+        // period is 0, should error
+        let policy = make_policy(60, 0);
+        let result = TimeSeries::try_new(&policy).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("period must be greater than 0"),
+            "unexpected error message: {err_msg}"
+        );
+    }
 }
