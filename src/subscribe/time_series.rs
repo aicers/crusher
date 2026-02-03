@@ -63,6 +63,7 @@ impl TimeSeries {
     /// - The policy's period is zero.
     /// - The policy's period is not a multiple of the interval (i.e.,
     ///   `period % interval != 0`).
+    /// - The policy's period is not a divisor of 1 day (86400 seconds).
     /// - The start timestamp cannot be computed.
     /// - The series length overflows `usize`.
     pub(super) async fn try_new(policy: &SamplingPolicy) -> Result<Self> {
@@ -73,6 +74,9 @@ impl TimeSeries {
         }
         if period_secs == 0 {
             bail!("period must be greater than 0");
+        }
+        if !86400_u64.is_multiple_of(period_secs) {
+            bail!("period must be a divisor of 1 day (86400 seconds)");
         }
         if !period_secs.is_multiple_of(interval_secs) {
             bail!("period must be a multiple of interval");
@@ -87,6 +91,7 @@ impl TimeSeries {
             series,
         })
     }
+
     pub(super) async fn fill(
         &mut self,
         policy: &SamplingPolicy,
@@ -1378,6 +1383,19 @@ mod tests {
         assert!(result.is_ok());
         let ts = result.unwrap();
         assert_eq!(ts.series.len(), 60); // 3600 / 60 = 60
+    }
+
+    #[tokio::test]
+    async fn try_new_invalid_period_not_divisor_of_1_day() {
+        // period (777) is not a divisor of 1 day (86400 seconds)
+        let policy = create_simple_policy(7, 777);
+        let result = TimeSeries::try_new(&policy).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("period must be a divisor of 1 day (86400 seconds)"),
+            "unexpected error message: {err_msg}"
+        );
     }
 
     #[tokio::test]
