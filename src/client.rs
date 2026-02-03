@@ -49,19 +49,23 @@ impl Certs {
         }
     }
 
-    pub(crate) fn to_ca_certs(ca_certs_pem: &[&[u8]]) -> Result<rustls::RootCertStore> {
-        let mut root_cert = rustls::RootCertStore::empty();
-        for &ca_cert_pem in ca_certs_pem {
-            let root_certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut &*ca_cert_pem)
+    pub(crate) fn to_ca_certs(pem_bundles: &[&[u8]]) -> Result<rustls::RootCertStore> {
+        let mut root_store = rustls::RootCertStore::empty();
+        for &pem in pem_bundles {
+            ensure!(!pem.is_empty(), "empty PEM-encoded certificate");
+            let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut &*pem)
                 .collect::<Result<_, _>>()
                 .context("invalid PEM-encoded certificate")?;
-            if let Some(cert) = root_certs.first() {
-                root_cert
-                    .add(cert.to_owned())
+            ensure!(!certs.is_empty(), "invalid PEM-encoded certificate");
+
+            for cert in certs {
+                root_store
+                    .add(cert)
                     .context("failed to add CA certificate")?;
             }
         }
-        Ok(root_cert)
+        ensure!(!root_store.is_empty(), "empty CA certificate store");
+        Ok(root_store)
     }
 }
 
@@ -261,6 +265,10 @@ mod tests {
         (cert, key_pair)
     }
 
+    fn bundle_pem(pems: &[Vec<u8>]) -> Vec<u8> {
+        pems.concat()
+    }
+
     fn bundle<'a>(
         certs_for_fullchain: impl IntoIterator<Item = &'a Certificate>,
         leaf_key_pair: &KeyPair,
@@ -407,6 +415,12 @@ mod tests {
     // =========================================================================
     // Test Fixtures: Raw PEMs
     // =========================================================================
+
+    #[fixture]
+    fn valid_pem() -> Vec<u8> {
+        let (cert, _) = generate_key_pair_and_self_signed_cert("localhost", &["localhost"], 365);
+        cert.pem().into_bytes()
+    }
 
     /// An empty PEM file.
     #[fixture]
@@ -798,6 +812,8 @@ mod tests {
     // CA Certificate Parsing Tests
     // =========================================================================
     #[rstest]
+    #[case::single_valid_pem(vec![valid_pem()], 1)]
+    #[case::single_pem_bundle_ignores_invalid_part(vec![bundle_pem(&[valid_pem(), wrong_format_pem(), valid_pem()])], 1)]
     #[case::basic(tls_bundle_valid_fullchain().0.ca_cert_pems, 1)]
     #[case::intermediates(tls_bundle_valid_fullchain_multiple_intermediates().0.ca_cert_pems, 1)]
     #[case::multi_san(tls_bundle_valid_fullchain_multiple_leaf_san().0.ca_cert_pems, 1)]
@@ -817,7 +833,20 @@ mod tests {
     }
 
     #[rstest]
-    #[case::bad_cert(vec![invalid_cert_pem()], "invalid PEM-encoded certificate")]
+    #[case::empty_list(vec![], "empty")]
+    #[case::empty_pem(vec![empty_pem()], "empty")]
+    #[case::wrong_pem(vec![wrong_format_pem()], "invalid")]
+    #[case::bad_cert(vec![invalid_cert_pem()], "invalid")]
+    #[case::multiple_pems_contain_empty({
+        let mut multiple_pems = tls_bundle_valid_fullchain().0.ca_cert_pems;
+        multiple_pems.push(empty_pem());
+        multiple_pems
+    },"empty")]
+    #[case::multiple_pems_contain_wrong_format({
+        let mut multiple_pems = tls_bundle_valid_fullchain().0.ca_cert_pems;
+        multiple_pems.push(wrong_format_pem());
+        multiple_pems
+    }, "invalid")]
     fn to_ca_certs_failure(
         #[case] ca_certs_pem: Vec<Vec<u8>>,
         #[case] part_of_error_message: &str,
