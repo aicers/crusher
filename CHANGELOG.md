@@ -9,9 +9,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 
 - `TimeSeries::try_new` now validates that `interval` and `period` are greater
-  than zero and that `period` is a multiple of `interval`, returning an error if
-  any condition is violated. This makes implicit assumptions explicit and
-  prevents potential misuse.
+  than zero and that `period` is a multiple of `interval`, `period` is a divisor
+  of 1 day, and returning an error if any condition is violated.
 
 ## [0.7.0] - 2025-12-04
 
