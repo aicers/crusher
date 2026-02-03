@@ -289,15 +289,15 @@ impl review_protocol::request::Handler for Client {
                 debug!("Duplicated policy: {:?}", policy);
                 continue;
             }
-            self.active_policy_list
-                .write()
-                .await
-                .insert(policy.id, policy.clone());
             info!("Received request to update time series policy list");
             self.request_send
                 .send(policy.clone())
                 .await
                 .map_err(|e| format!("send fail: {e}"))?;
+            self.active_policy_list
+                .write()
+                .await
+                .insert(policy.id, policy.clone());
         }
 
         Ok(())
@@ -578,6 +578,25 @@ mod tests {
             .unwrap();
         assert_eq!(stored.interval, original_policy.interval);
         assert_eq!(stored.node.as_deref(), original_policy.node.as_deref());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_policy_when_send_fails() {
+        let (mut client, rx) = create_test_client();
+        let policy = create_test_policy(1);
+
+        drop(rx);
+
+        let err = client
+            .sampling_policy_list(std::slice::from_ref(&policy))
+            .await
+            .expect_err("Failed to add policy");
+        assert!(err.contains("send fail"));
+
+        assert!(
+            client.active_policy_list.read().await.is_empty(),
+            "active_policy_list must be empty if channel send fails"
+        );
     }
 
     // =========================================================================
