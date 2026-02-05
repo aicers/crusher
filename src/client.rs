@@ -813,6 +813,7 @@ mod tests {
     // =========================================================================
     #[rstest]
     #[case::single_valid_pem(vec![valid_pem()], 1)]
+    #[case::single_pem_bundle_with_two_valid_certs(vec![bundle_pem(&[valid_pem(), valid_pem()])], 2)]
     #[case::single_pem_bundle_ignores_invalid_part(vec![bundle_pem(&[valid_pem(), wrong_format_pem(), valid_pem()])], 1)]
     #[case::basic(tls_bundle_valid_fullchain().0.ca_cert_pems, 1)]
     #[case::intermediates(tls_bundle_valid_fullchain_multiple_intermediates().0.ca_cert_pems, 1)]
