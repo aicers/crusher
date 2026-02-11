@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{client::SERVER_RETRY_INTERVAL, info_or_print};
 
-const REQUIRED_MANAGER_VERSION: &str = "0.46.0";
+const REQUIRED_MANAGER_VERSION: &str = "0.47.0";
 const MAX_RETRIES: u8 = 3;
 
 #[derive(Clone)]
