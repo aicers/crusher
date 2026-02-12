@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::sync::LazyLock;
+use std::collections::HashMap;
 use std::time::Duration;
 use std::{
     fs,
@@ -19,16 +19,16 @@ use giganto_client::{
 use quinn::{
     Connection, Endpoint, RecvStream, SendStream, ServerConfig, crypto::rustls::QuicServerConfig,
 };
+use review_protocol::request::Handler;
 use review_protocol::types::{SamplingKind, SamplingPolicy};
+use serial_test::serial;
 use tempfile::TempDir;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 
 use super::time_series::clear_last_transfer_time;
-use super::{Client, Conn, REQUIRED_GIGANTO_VERSION, TimeSeries};
+use super::*;
 use crate::client::Certs;
-
-static TOKEN: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
 
 const CERT_PATH: &str = "tests/cert.pem";
 const KEY_PATH: &str = "tests/key.pem";
@@ -36,6 +36,7 @@ const CA_CERT_PATH: &str = "tests/ca_cert.pem";
 const HOST: &str = "localhost";
 const SECS_PER_MINUTE: u64 = 60;
 const SECS_PER_DAY: u64 = 86_400;
+const DEFAULT_POLICY_ID: u32 = 1;
 
 struct FakeGigantoServer {
     server_config: ServerConfig,
@@ -45,7 +46,7 @@ struct FakeGigantoServer {
     publish_repeat_delay: Duration,
 }
 
-struct TestServers {
+struct TestServerHandlers {
     ingest_shutdown: Arc<Notify>,
     publish_shutdown: Arc<Notify>,
     ingest_handle: tokio::task::JoinHandle<()>,
@@ -183,7 +184,6 @@ async fn handle_publish_connection(
 
         for idx in 0..repeat_count {
             let ts = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-            eprintln!("publish ts sent: {ts}");
             let _ = send_bytes(&mut uni, &ts.to_le_bytes()).await;
             let _ = send_raw(&mut uni, &record_bytes).await;
             if idx + 1 < repeat_count {
@@ -225,7 +225,6 @@ async fn handle_ingest_stream(
             {
                 return;
             }
-            eprintln!("ingest ack sent (series start ts): {timestamp}");
             if let Some(notify) = &notify {
                 let _ = notify.send(policy_id).await;
             }
@@ -235,7 +234,7 @@ async fn handle_ingest_stream(
 
 fn start_servers() -> (
     async_channel::Receiver<u32>,
-    TestServers,
+    TestServerHandlers,
     SocketAddr,
     SocketAddr,
 ) {
@@ -248,7 +247,7 @@ fn start_servers() -> (
     let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
     (
         notify_recv,
-        TestServers {
+        TestServerHandlers {
             ingest_shutdown,
             publish_shutdown,
             ingest_handle,
@@ -336,24 +335,19 @@ async fn reset_last_transfer_time() {
     clear_last_transfer_time().await;
 }
 
-async fn wait_for_policy_ids(last_time_series_path: &Path, ids: &[u32]) {
+async fn wait_for_policy_ids(
+    last_time_series_path: &Path,
+    ids: &[u32],
+    should_exist: bool,
+) -> HashMap<String, i64> {
     loop {
         if last_time_series_path.exists() {
-            let content = fs::read_to_string(last_time_series_path).unwrap_or_default();
-            if ids.iter().all(|id| content.contains(&format!("\"{id}\""))) {
-                return;
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn wait_for_policy_ids_removed(last_time_series_path: &Path, ids: &[u32]) {
-    loop {
-        if last_time_series_path.exists() {
-            let content = fs::read_to_string(last_time_series_path).unwrap_or_default();
-            if ids.iter().all(|id| !content.contains(&format!("\"{id}\""))) {
-                return;
+            let map = read_time_data_map(last_time_series_path);
+            if ids
+                .iter()
+                .all(|id| map.contains_key(&id.to_string()) == should_exist)
+            {
+                return map;
             }
         }
         sleep(Duration::from_millis(50)).await;
@@ -363,42 +357,26 @@ async fn wait_for_policy_ids_removed(last_time_series_path: &Path, ids: &[u32]) 
 async fn shutdown_test(
     client_shutdown: Arc<Notify>,
     client_handle: tokio::task::JoinHandle<()>,
-    servers: TestServers,
+    servers: TestServerHandlers,
     last_time_series_path: &Path,
 ) {
     client_shutdown.notify_one();
     servers.ingest_shutdown.notify_one();
     servers.publish_shutdown.notify_one();
-    let mut client_handle = client_handle;
-    if timeout(Duration::from_secs(2), &mut client_handle)
-        .await
-        .is_err()
-    {
-        eprintln!("client shutdown timeout, aborting");
-        client_handle.abort();
-        let _ = client_handle.await;
-    }
-    let mut ingest_handle = servers.ingest_handle;
-    if timeout(Duration::from_secs(2), &mut ingest_handle)
-        .await
-        .is_err()
-    {
-        eprintln!("ingest shutdown timeout, aborting");
-        ingest_handle.abort();
-        let _ = ingest_handle.await;
-    }
-    let mut publish_handle = servers.publish_handle;
-    if timeout(Duration::from_secs(2), &mut publish_handle)
-        .await
-        .is_err()
-    {
-        eprintln!("publish shutdown timeout, aborting");
-        publish_handle.abort();
-        let _ = publish_handle.await;
-    }
+
+    let _ = tokio::join!(client_handle, servers.ingest_handle, servers.publish_handle);
+
     if last_time_series_path.exists() {
         let _ = fs::remove_file(last_time_series_path);
     }
+}
+
+fn read_time_data_map(last_time_series_path: &Path) -> HashMap<String, i64> {
+    let content = fs::read_to_string(last_time_series_path).unwrap_or_default();
+    if content.trim().is_empty() {
+        return HashMap::new();
+    }
+    serde_json::from_str::<HashMap<String, i64>>(&content).expect("Failed to parse time_data.json")
 }
 
 fn config_server() -> ServerConfig {
@@ -496,9 +474,6 @@ fn gen_conn() -> Conn {
 // Period: 1 day
 #[tokio::test]
 async fn timeseries_with_conn() {
-    use crate::subscribe::TimeSeries;
-    const THREE_MIN: i64 = 3;
-
     // Arrange: build a policy/model and an empty series buffer.
     let (policy, mut series) = test_conn_model();
     // Start at 3 minutes and keep stepping by 3 minutes to cover several slots.
@@ -524,13 +499,13 @@ async fn timeseries_with_conn() {
             .fill(
                 &policy,
                 event_time,
-                &crate::subscribe::Event::Conn(conn_event),
+                &Event::Conn(conn_event),
                 &series_sender,
             )
             .await
             .unwrap();
 
-        minutes_since_start += THREE_MIN;
+        minutes_since_start += 3;
     }
 
     // Assert: three events should aggregate into the same slot.
@@ -541,11 +516,9 @@ async fn timeseries_with_conn() {
     );
 }
 
+#[serial]
 #[tokio::test]
 async fn sampling_policy_flow_with_fake_giganto_server() {
-    use review_protocol::request::Handler;
-
-    let _lock = TOKEN.lock().await;
     reset_last_transfer_time().await;
     // Arrange: start fake servers and a request client.
     let (notify_recv, servers, ingest_addr, publish_addr) = start_servers();
@@ -554,7 +527,7 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
     let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
         setup_request_client(1);
 
-    let policy = new_policy(1);
+    let policy = new_policy(DEFAULT_POLICY_ID);
 
     // Act: insert policy into request client.
     request_client
@@ -581,22 +554,22 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
     );
 
     // Act/Assert: wait for ingest ACK and timestamp file creation.
-    timeout(Duration::from_secs(5), notify_recv.recv())
+    let id = notify_recv
+        .recv()
         .await
-        .expect("ingest notify timeout")
-        .expect("ingest notify recv");
+        .expect("Failed to receive ingest notify");
+    assert_eq!(id, policy.id);
 
-    timeout(
+    let map = timeout(
         Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy.id]),
+        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
     )
     .await
-    .expect("time_data.json timeout");
+    .expect("Timeout: time_data.json was not updated with the expected policy IDs");
 
-    if last_time_series_path.exists() {
-        let content = fs::read_to_string(&last_time_series_path).unwrap_or_default();
-        eprintln!("time_data.json content: {content}");
-    }
+    assert!(last_time_series_path.exists());
+    let expected: HashMap<String, i64> = [(policy.id.to_string(), 0)].into_iter().collect();
+    assert_eq!(map, expected);
 
     // Cleanup: stop client and servers.
     shutdown_test(
@@ -611,11 +584,9 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
 /// Test: Validates notify flow - when a policy is added, the client sends a stream
 /// request and receives data from the server. When the policy is deleted, the stream
 /// should be stopped and timestamp cleaned up.
+#[serial]
 #[tokio::test]
 async fn sampling_policy_notify_flow_with_delete() {
-    use review_protocol::request::Handler;
-
-    let _lock = TOKEN.lock().await;
     reset_last_transfer_time().await;
     // Arrange: start servers and request client.
     let (notify_recv, servers, ingest_addr, publish_addr) = start_servers();
@@ -623,7 +594,7 @@ async fn sampling_policy_notify_flow_with_delete() {
     let certs = cert_key();
     let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
         setup_request_client(1);
-    let policy = new_policy(3);
+    let policy = new_policy(DEFAULT_POLICY_ID);
 
     // Act: insert policy.
     request_client
@@ -650,20 +621,22 @@ async fn sampling_policy_notify_flow_with_delete() {
     );
 
     // Act/Assert: wait for ingest ACK and timestamp file creation.
-    timeout(Duration::from_secs(5), notify_recv.recv())
+    let id = notify_recv
+        .recv()
         .await
-        .expect("ingest notify timeout")
-        .expect("ingest notify recv");
+        .expect("Failed to receive ingest notify");
+    assert_eq!(id, policy.id);
 
-    timeout(
+    let map = timeout(
         Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy.id]),
+        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
     )
     .await
-    .expect("time_data.json timeout");
+    .expect("Timeout: time_data.json did not remove the expected policy IDs");
+
     assert!(last_time_series_path.exists());
-    let content = fs::read_to_string(&last_time_series_path).unwrap_or_default();
-    eprintln!("time_data.json content before delete: {content}");
+    let expected: HashMap<String, i64> = [(policy.id.to_string(), 0)].into_iter().collect();
+    assert_eq!(map, expected);
 
     // Act: delete policy.
     request_client
@@ -672,16 +645,16 @@ async fn sampling_policy_notify_flow_with_delete() {
         .unwrap();
 
     // Assert: timestamp entry is removed after deletion.
-    timeout(
+    let map = timeout(
         Duration::from_secs(5),
-        wait_for_policy_ids_removed(&last_time_series_path, &[policy.id]),
+        wait_for_policy_ids(&last_time_series_path, &[policy.id], false),
     )
     .await
-    .expect("time_data.json delete timeout");
-    if last_time_series_path.exists() {
-        let content = fs::read_to_string(&last_time_series_path).unwrap_or_default();
-        eprintln!("time_data.json content after delete: {content}");
-    }
+    .expect("Timeout: time_data.json was not updated with the expected policy IDs");
+
+    assert!(last_time_series_path.exists());
+    let expected: HashMap<String, i64> = HashMap::new();
+    assert_eq!(map, expected);
 
     // Cleanup: stop client and servers.
     shutdown_test(
@@ -694,11 +667,9 @@ async fn sampling_policy_notify_flow_with_delete() {
 }
 
 /// Test: Adding multiple policies should create multiple concurrent streams.
+#[serial]
 #[tokio::test]
 async fn sampling_policy_multiple_streams() {
-    use review_protocol::request::Handler;
-
-    let _lock = TOKEN.lock().await;
     reset_last_transfer_time().await;
     // Arrange: start servers and request client with two policies.
     let (notify_recv, servers, ingest_addr, publish_addr) = start_servers();
@@ -743,10 +714,10 @@ async fn sampling_policy_multiple_streams() {
     // Act/Assert: receive policy IDs for both streams.
     let mut expected_ids = vec![policy_a.id, policy_b.id];
     for _ in 0..2 {
-        let id = timeout(Duration::from_secs(5), notify_recv.recv())
+        let id = notify_recv
+            .recv()
             .await
-            .expect("ingest policy notify timeout")
-            .expect("ingest policy notify recv");
+            .expect("Channel closed before receiving ingest ACKs for all policies.");
         expected_ids.retain(|expected| *expected != id);
     }
     assert!(
@@ -754,16 +725,19 @@ async fn sampling_policy_multiple_streams() {
         "Not all policy IDs produced streams: {expected_ids:?}"
     );
 
-    timeout(
+    let map = timeout(
         Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy_a.id, policy_b.id]),
+        wait_for_policy_ids(&last_time_series_path, &[policy_a.id, policy_b.id], true),
     )
     .await
-    .expect("time_data.json timeout");
-    if last_time_series_path.exists() {
-        let content = fs::read_to_string(&last_time_series_path).unwrap_or_default();
-        eprintln!("time_data.json content: {content}");
-    }
+    .expect("Timeout: time_data.json was not updated with the expected policy IDs");
+
+    assert!(last_time_series_path.exists());
+    let expected: HashMap<String, i64> =
+        [(policy_a.id.to_string(), 0), (policy_b.id.to_string(), 0)]
+            .into_iter()
+            .collect();
+    assert_eq!(map, expected);
 
     // Cleanup: stop client and servers.
     shutdown_test(
