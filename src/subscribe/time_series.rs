@@ -201,6 +201,7 @@ mod tests {
 
     use chrono::NaiveDateTime;
     use review_protocol::types::{SamplingKind, SamplingPolicy};
+    use serial_test::serial;
     use tempfile::tempdir;
 
     use super::*;
@@ -477,6 +478,7 @@ mod tests {
         LAST_TRANSFER_TIME.write().await.remove(&key2);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_write_last_timestamp_updates_existing() {
         let dir = tempdir().expect("failed to create temp dir");
@@ -522,6 +524,7 @@ mod tests {
         LAST_TRANSFER_TIME.write().await.remove(&key);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_read_last_timestamp_from_file() {
         let dir = tempdir().expect("failed to create temp dir");
@@ -558,6 +561,7 @@ mod tests {
         LAST_TRANSFER_TIME.write().await.remove(&key2);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_read_last_timestamp_nonexistent_file() {
         let dir = tempdir().expect("failed to create temp dir");
@@ -1199,6 +1203,7 @@ mod tests {
     // Tests for SamplingPolicyExt::start_timestamp
     // =========================================================================
 
+    #[serial]
     #[tokio::test]
     async fn test_start_timestamp_no_last_transmission() {
         // When there is no last transmission timestamp in LAST_TRANSFER_TIME,
@@ -1229,6 +1234,7 @@ mod tests {
         assert_eq!(start, 0);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_start_timestamp_with_last_transmission() {
         // When there is a last transmission timestamp, start_timestamp() should
@@ -1268,6 +1274,7 @@ mod tests {
             .remove(&policy_id.to_string());
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_start_timestamp_period_conversion_overflow() {
         // When the period is too large to convert to nanoseconds (overflow),
