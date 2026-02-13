@@ -209,7 +209,6 @@ mod tests {
     const SECS_PER_MINUTE: u64 = 60;
     const SECS_PER_HOUR: u64 = 3600;
     const SECS_PER_DAY: u64 = 86_400;
-    const TEST_DATE: &str = "2024/1/15 00:00:00";
 
     /// Helper to create a `SamplingPolicy` with specified parameters
     fn create_policy(
@@ -250,13 +249,17 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_time_slot_basic_day_period_15min_interval() {
+    fn test_time_slot_basic_1day_period_15min_interval() {
         // Period: 1 day (86400s), Interval: 15 min (900s) => 96 slots
         // Offset: 0
         let policy = create_policy(1, SECS_PER_DAY, 15 * SECS_PER_MINUTE, 0, None);
 
+        // Before midnight => last slot (95)
+        let before_midnight = datetime_from_utc("2024/1/14 23:59:59");
+        assert_eq!(time_slot(&policy, before_midnight).unwrap(), 95);
+
         // Midnight UTC => slot 0
-        let midnight = datetime_from_utc(TEST_DATE);
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         assert_eq!(time_slot(&policy, midnight).unwrap(), 0);
 
         // 00:14:59 => still slot 0
@@ -278,6 +281,10 @@ mod tests {
         // 23:59:59 => still slot 95
         let end_of_day = datetime_from_utc("2024/1/15 23:59:59");
         assert_eq!(time_slot(&policy, end_of_day).unwrap(), 95);
+
+        // Next day => slot 0
+        let next_day = datetime_from_utc("2024/1/16 00:00:00");
+        assert_eq!(time_slot(&policy, next_day).unwrap(), 0);
     }
 
     #[test]
@@ -291,7 +298,7 @@ mod tests {
         assert_eq!(time_slot(&policy, kst_midnight_utc).unwrap(), 0);
 
         // KST 09:00(UTC 00:00) => slot 9
-        let kst_9am_utc = datetime_from_utc(TEST_DATE);
+        let kst_9am_utc = datetime_from_utc("2024/1/15 00:00:00");
         assert_eq!(time_slot(&policy, kst_9am_utc).unwrap(), 9);
 
         // KST 23:59:59(UTC 14:59:59) => slot 23
@@ -306,7 +313,7 @@ mod tests {
         let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, -18_000, None);
 
         // At midnight UTC, with -5h offset, offset_time = 19:00 (prev day) => slot 19
-        let midnight = datetime_from_utc(TEST_DATE);
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         assert_eq!(time_slot(&policy, midnight).unwrap(), 19);
 
         // At 05:00 UTC, with -5h offset, offset_time = 00:00 => slot 0
@@ -320,7 +327,7 @@ mod tests {
         // All times within the period should map to slot 0
         let policy = create_policy(1, SECS_PER_HOUR, SECS_PER_HOUR, 0, None);
 
-        let midnight = datetime_from_utc(TEST_DATE);
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
 
         // Any time within the hour should be slot 0
         assert_eq!(time_slot(&policy, midnight).unwrap(), 0);
@@ -335,12 +342,12 @@ mod tests {
     }
 
     #[test]
-    fn test_time_slot_interval_one_second() {
+    fn test_time_slot_interval_1second() {
         // Period: 1 minute (60s), Interval: 1 second (1s) => 60 slots
         // Tests minimum interval
         let policy = create_policy(1, SECS_PER_MINUTE, 1, 0, None);
 
-        let midnight = datetime_from_utc(TEST_DATE);
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
 
         // Each second should be its own slot
         assert_eq!(time_slot(&policy, midnight).unwrap(), 0);
@@ -360,7 +367,7 @@ mod tests {
         // Offset: period - 1 = 3599s
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 3599, None);
 
-        let midnight = datetime_from_utc(TEST_DATE);
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         // At midnight UTC, offset_time = 00:59:59 => slot 3 (59*60+59 = 3599s) / 900 = 3
         // Actually: seconds_of_day = 3599, 3599 % 3600 = 3599, 3599 / 900 = 3
         assert_eq!(time_slot(&policy, midnight).unwrap(), 3);
@@ -372,7 +379,7 @@ mod tests {
         // Offset: 1 hour (3600s) - middle of period
         let policy = create_policy(1, 2 * SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 3600, None);
 
-        let midnight = datetime_from_utc(TEST_DATE);
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         // At midnight UTC, offset_time = 01:00:00 => seconds_of_day = 3600
         // 3600 % 7200 = 3600, 3600 / 1800 = 2 => slot 2
         assert_eq!(time_slot(&policy, midnight).unwrap(), 2);
@@ -393,17 +400,31 @@ mod tests {
         // Offset: 0
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc(TEST_DATE);
+        let expected_results = [
+            ("2024/1/14 23:59:59", "2024/1/14 23:00:00"),
+            ("2024/1/15 00:00:00", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:14:59", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:15:00", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:15:01", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:29:59", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:30:00", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:30:01", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:44:59", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:45:00", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:45:01", "2024/1/15 00:00:00"),
+            ("2024/1/15 00:59:59", "2024/1/15 00:00:00"),
+            ("2024/1/15 01:00:00", "2024/1/15 01:00:00"),
+            ("2024/1/15 01:00:01", "2024/1/15 01:00:00"),
+            ("2024/1/15 01:30:00", "2024/1/15 01:00:00"),
+        ];
 
-        // At 00:30:00, start_time should be 00:00:00 (period boundary)
-        let mid_hour = datetime_from_utc("2024/1/15 00:30:00");
-        let start = start_time(&policy, mid_hour).unwrap();
-        assert_eq!(start.timestamp(), midnight.timestamp());
+        for (time, expected_period_start_time) in expected_results {
+            let time = datetime_from_utc(time);
+            let expected_start_time = datetime_from_utc(expected_period_start_time);
+            let actual_start_time = start_time(&policy, time).expect("Period Start Time");
 
-        // At 01:30:00, start_time should be 01:00:00
-        let mid_second_hour = datetime_from_utc("2024/1/15 01:30:00");
-        let start = start_time(&policy, mid_second_hour).unwrap();
-        assert_eq!(start.timestamp(), midnight.timestamp() + 3600);
+            assert_eq!(actual_start_time, expected_start_time);
+        }
     }
 
     #[test]
@@ -426,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_last_timestamp_creates_file() {
-        let dir = tempdir().expect("failed to create temp dir");
+        let dir = tempdir().expect("Success creating temp dir");
         let file_path = dir.path().join("timestamps.json");
 
         // Use unique keys with random component to avoid interference
@@ -444,9 +465,7 @@ mod tests {
         let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
 
         // Start the writer task
-        let path_clone = file_path.clone();
-        let writer_handle =
-            tokio::spawn(async move { write_last_timestamp(path_clone, receiver).await });
+        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver));
 
         // Send some timestamps
         sender
@@ -460,7 +479,9 @@ mod tests {
 
         // Close sender to end the writer task
         drop(sender);
-        let _ = writer_handle.await;
+        let _ = writer_handle
+            .await
+            .expect("Writer task successfully completed");
 
         // Verify file was created and contains valid JSON
         let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
@@ -847,7 +868,7 @@ mod tests {
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
         // Create a time series starting at midnight
-        let midnight = datetime_from_utc(TEST_DATE).timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -873,7 +894,7 @@ mod tests {
         // column: None => count events
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc(TEST_DATE).timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -902,7 +923,7 @@ mod tests {
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc(TEST_DATE).timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -948,7 +969,7 @@ mod tests {
         // column: Some(5) => sum duration values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(5));
 
-        let midnight = datetime_from_utc(TEST_DATE).timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -984,7 +1005,7 @@ mod tests {
         // column: Some(7) => sum orig_bytes values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(7));
 
-        let midnight = datetime_from_utc(TEST_DATE).timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1024,7 +1045,7 @@ mod tests {
         // column: Some(9) => sum orig_pkts values
         let policy = create_policy(1, SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 0, Some(9));
 
-        let midnight = datetime_from_utc(TEST_DATE).timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
         let mut series = create_test_series("1", 2, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1077,7 +1098,7 @@ mod tests {
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc(TEST_DATE).timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1146,7 +1167,7 @@ mod tests {
         // Period: 1 hour, Interval: 10 min => 6 slots
         let policy = create_policy(1, SECS_PER_HOUR, 10 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc(TEST_DATE).timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
         let mut series = create_test_series("1", 6, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1180,7 +1201,7 @@ mod tests {
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc(TEST_DATE).timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
