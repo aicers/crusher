@@ -369,6 +369,7 @@ async fn cleanup_test_resources(
         server_handles.ingest_handle,
         server_handles.publish_handle
     );
+    INGEST_CHANNEL.write().await.clear();
 
     if last_time_series_path.exists() {
         let _ = fs::remove_file(last_time_series_path);

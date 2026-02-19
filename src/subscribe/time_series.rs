@@ -863,12 +863,18 @@ mod tests {
         }
     }
 
+    async fn reset_ingest_channel() {
+        INGEST_CHANNEL.write().await.clear();
+    }
+
     // =========================================================================
     // Tests for TimeSeries::fill and column aggregation
     // =========================================================================
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_single_event_counts_as_one() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: None => count events (each event adds 1.0)
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
@@ -894,8 +900,10 @@ mod tests {
         assert_eq!(series.series[3], 0.0);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_multiple_events_same_slot_aggregates() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: None => count events
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
@@ -924,8 +932,10 @@ mod tests {
         assert_eq!(series.series[0], 3.0);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_events_in_different_slots() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
@@ -969,8 +979,10 @@ mod tests {
         }
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_with_column_aggregation_duration() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: Some(5) => sum duration values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(5));
@@ -1005,8 +1017,10 @@ mod tests {
         );
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_with_column_aggregation_bytes() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: Some(7) => sum orig_bytes values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(7));
@@ -1045,8 +1059,10 @@ mod tests {
         );
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_with_column_aggregation_packets() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 30 min => 2 slots
         // column: Some(9) => sum orig_pkts values
         let policy = create_policy(1, SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 0, Some(9));
@@ -1099,8 +1115,10 @@ mod tests {
         );
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_period_boundary_sends_and_resets() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
@@ -1139,8 +1157,10 @@ mod tests {
         assert_eq!(series.series[1], 0.0);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_with_offset_affects_slot_calculation() {
+        reset_ingest_channel().await;
         // Period: 1 day, Interval: 1 hour => 24 slots
         // Offset: +9 hours (32400s) - KST adjustment
         let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
@@ -1168,8 +1188,10 @@ mod tests {
         }
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_missing_slots_remain_zero() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 10 min => 6 slots
         let policy = create_policy(1, SECS_PER_HOUR, 10 * SECS_PER_MINUTE, 0, None);
 
@@ -1202,8 +1224,10 @@ mod tests {
         assert_eq!(series.series[5], 1.0);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_fill_duplicate_timestamps_aggregate() {
+        reset_ingest_channel().await;
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
