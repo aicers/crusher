@@ -39,7 +39,6 @@ tempfile = "3"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 time = "0.3"
 rstest = "0.26"
-serial_test = "3"
 
 [lints.clippy]
 pedantic = "warn"

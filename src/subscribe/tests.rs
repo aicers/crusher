@@ -238,15 +238,15 @@ fn start_servers() -> (
     SocketAddr,
     SocketAddr,
 ) {
-    let (notify_send, notify_recv) = async_channel::bounded::<u32>(10);
-    let ingest_server = FakeGigantoServer::new_ingest().with_notify(notify_send);
+    let (ingest_ack_send, ingest_ack_recv) = async_channel::bounded::<u32>(10);
+    let ingest_server = FakeGigantoServer::new_ingest().with_notify(ingest_ack_send);
     let publish_server = FakeGigantoServer::new_publish();
     let ingest_shutdown = Arc::new(Notify::new());
     let publish_shutdown = Arc::new(Notify::new());
     let (ingest_addr, ingest_handle) = ingest_server.start_ingest(ingest_shutdown.clone());
     let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
     (
-        notify_recv,
+        ingest_ack_recv,
         TestServerHandlers {
             ingest_shutdown,
             publish_shutdown,
@@ -354,17 +354,21 @@ async fn wait_for_policy_ids(
     }
 }
 
-async fn shutdown_test(
+async fn cleanup_test_resources(
     client_shutdown: Arc<Notify>,
     client_handle: tokio::task::JoinHandle<()>,
-    servers: TestServerHandlers,
+    server_handles: TestServerHandlers,
     last_time_series_path: &Path,
 ) {
     client_shutdown.notify_one();
-    servers.ingest_shutdown.notify_one();
-    servers.publish_shutdown.notify_one();
+    server_handles.ingest_shutdown.notify_one();
+    server_handles.publish_shutdown.notify_one();
 
-    let _ = tokio::join!(client_handle, servers.ingest_handle, servers.publish_handle);
+    let _ = tokio::join!(
+        client_handle,
+        server_handles.ingest_handle,
+        server_handles.publish_handle
+    );
 
     if last_time_series_path.exists() {
         let _ = fs::remove_file(last_time_series_path);
@@ -521,7 +525,7 @@ async fn timeseries_with_conn() {
 async fn sampling_policy_flow_with_fake_giganto_server() {
     reset_last_transfer_time().await;
     // Arrange: start fake servers and a request client.
-    let (notify_recv, servers, ingest_addr, publish_addr) = start_servers();
+    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
     let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
@@ -554,7 +558,7 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
     );
 
     // Act/Assert: wait for ingest ACK and timestamp file creation.
-    let id = notify_recv
+    let id = ingest_ack_recv
         .recv()
         .await
         .expect("Failed to receive ingest notify");
@@ -565,17 +569,17 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
         wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
     )
     .await
-    .expect("Timeout: time_data.json was not updated with the expected policy IDs");
+    .expect("No timeout: expected policy ID was written to time_data.json");
 
     assert!(last_time_series_path.exists());
     let expected: HashMap<String, i64> = [(policy.id.to_string(), 0)].into_iter().collect();
     assert_eq!(map, expected);
 
     // Cleanup: stop client and servers.
-    shutdown_test(
+    cleanup_test_resources(
         client_shutdown,
         client_handle,
-        servers,
+        server_handles,
         &last_time_series_path,
     )
     .await;
@@ -589,7 +593,7 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
 async fn sampling_policy_notify_flow_with_delete() {
     reset_last_transfer_time().await;
     // Arrange: start servers and request client.
-    let (notify_recv, servers, ingest_addr, publish_addr) = start_servers();
+    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
     let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
@@ -621,7 +625,7 @@ async fn sampling_policy_notify_flow_with_delete() {
     );
 
     // Act/Assert: wait for ingest ACK and timestamp file creation.
-    let id = notify_recv
+    let id = ingest_ack_recv
         .recv()
         .await
         .expect("Failed to receive ingest notify");
@@ -632,7 +636,7 @@ async fn sampling_policy_notify_flow_with_delete() {
         wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
     )
     .await
-    .expect("Timeout: time_data.json did not remove the expected policy IDs");
+    .expect("No timeout: expected policy ID was written to time_data.json");
 
     assert!(last_time_series_path.exists());
     let expected: HashMap<String, i64> = [(policy.id.to_string(), 0)].into_iter().collect();
@@ -650,17 +654,17 @@ async fn sampling_policy_notify_flow_with_delete() {
         wait_for_policy_ids(&last_time_series_path, &[policy.id], false),
     )
     .await
-    .expect("Timeout: time_data.json was not updated with the expected policy IDs");
+    .expect("No timeout: expected policy ID was removed from time_data.json");
 
     assert!(last_time_series_path.exists());
     let expected: HashMap<String, i64> = HashMap::new();
     assert_eq!(map, expected);
 
     // Cleanup: stop client and servers.
-    shutdown_test(
+    cleanup_test_resources(
         client_shutdown,
         client_handle,
-        servers,
+        server_handles,
         &last_time_series_path,
     )
     .await;
@@ -672,7 +676,7 @@ async fn sampling_policy_notify_flow_with_delete() {
 async fn sampling_policy_multiple_streams() {
     reset_last_transfer_time().await;
     // Arrange: start servers and request client with two policies.
-    let (notify_recv, servers, ingest_addr, publish_addr) = start_servers();
+    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
     let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
@@ -714,7 +718,7 @@ async fn sampling_policy_multiple_streams() {
     // Act/Assert: receive policy IDs for both streams.
     let mut expected_ids = vec![policy_a.id, policy_b.id];
     for _ in 0..2 {
-        let id = notify_recv
+        let id = ingest_ack_recv
             .recv()
             .await
             .expect("Channel closed before receiving ingest ACKs for all policies.");
@@ -730,7 +734,7 @@ async fn sampling_policy_multiple_streams() {
         wait_for_policy_ids(&last_time_series_path, &[policy_a.id, policy_b.id], true),
     )
     .await
-    .expect("Timeout: time_data.json was not updated with the expected policy IDs");
+    .expect("No timeout: expected policy IDs were written to time_data.json");
 
     assert!(last_time_series_path.exists());
     let expected: HashMap<String, i64> =
@@ -740,10 +744,10 @@ async fn sampling_policy_multiple_streams() {
     assert_eq!(map, expected);
 
     // Cleanup: stop client and servers.
-    shutdown_test(
+    cleanup_test_resources(
         client_shutdown,
         client_handle,
-        servers,
+        server_handles,
         &last_time_series_path,
     )
     .await;
