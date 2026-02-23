@@ -1159,6 +1159,38 @@ mod tests {
 
     #[serial]
     #[tokio::test]
+    async fn test_fill_kst_offset_events_aggregate_same_slot() {
+        reset_ingest_channel().await;
+        // Period: 1 day, Interval: 15 min => 96 slots
+        // Offset: +9 hours (KST)
+        let policy = create_policy(1, SECS_PER_DAY, 15 * SECS_PER_MINUTE, 32_400, None);
+        let midnight = datetime_from_utc("2022/11/17 00:00:00").timestamp();
+        let mut series = create_test_series("1", 96, midnight);
+        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(1);
+
+        for event_time in [
+            "2022/11/17 00:03:00",
+            "2022/11/17 00:06:00",
+            "2022/11/17 00:09:00",
+        ] {
+            let conn = create_test_conn();
+            series
+                .fill(
+                    &policy,
+                    datetime_from_utc(event_time),
+                    &Event::Conn(conn),
+                    &sender,
+                )
+                .await
+                .expect("fill should succeed");
+        }
+
+        // UTC 00:03/00:06/00:09 becomes KST 09:03/09:06/09:09, which is slot 36.
+        assert_eq!(series.series[36], 3.0);
+    }
+
+    #[serial]
+    #[tokio::test]
     async fn test_fill_with_offset_affects_slot_calculation() {
         reset_ingest_channel().await;
         // Period: 1 day, Interval: 1 hour => 24 slots

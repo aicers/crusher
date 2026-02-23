@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
 use std::{
@@ -8,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::Utc;
 use giganto_client::{
     connection::server_handshake,
     frame::{recv_raw, send_bytes, send_raw},
@@ -424,33 +423,6 @@ fn cert_key() -> Certs {
     }
 }
 
-fn test_conn_model() -> (SamplingPolicy, TimeSeries) {
-    (
-        SamplingPolicy {
-            id: 0,
-            kind: SamplingKind::Conn,
-            interval: Duration::from_secs(15 * SECS_PER_MINUTE),
-            period: Duration::from_secs(SECS_PER_DAY),
-            offset: 32_400,
-            src_ip: None,
-            dst_ip: None,
-            node: Some("cluml".to_string()),
-            column: None,
-        },
-        TimeSeries {
-            sampling_policy_id: "0".to_string(),
-            start: DateTime::<Utc>::from_naive_utc_and_offset(
-                NaiveDate::from_ymd_opt(2022, 11, 17)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap(),
-                Utc,
-            ),
-            series: vec![0_f64; 96],
-        },
-    )
-}
-
 fn gen_conn() -> Conn {
     let tmp_dur = chrono::Duration::nanoseconds(12345);
 
@@ -471,54 +443,6 @@ fn gen_conn() -> Conn {
         orig_l2_bytes: 51235,
         resp_l2_bytes: 48203,
     }
-}
-
-// Start time: 2022/11/17 00:00:00
-// Input time: 2022/11/17 00:03:00, repeated every 3 minutes
-// Interval: 15 minutes
-// Period: 1 day
-#[tokio::test]
-async fn timeseries_with_conn() {
-    // Arrange: build a policy/model and an empty series buffer.
-    let (policy, mut series) = test_conn_model();
-    // Start at 3 minutes and keep stepping by 3 minutes to cover several slots.
-    let mut minutes_since_start: i64 = 3;
-    let (series_sender, _series_receiver) = async_channel::bounded::<TimeSeries>(1);
-
-    // Act: feed events every 3 minutes within the same 15-minute slot.
-    while minutes_since_start < 10 {
-        let conn_event = gen_conn();
-        let offset = chrono::TimeDelta::try_minutes(minutes_since_start).unwrap();
-
-        let event_time = DateTime::<Utc>::from_naive_utc_and_offset(
-            NaiveDate::from_ymd_opt(2022, 11, 17)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .checked_add_signed(offset)
-                .unwrap(),
-            Utc,
-        );
-
-        series
-            .fill(
-                &policy,
-                event_time,
-                &Event::Conn(conn_event),
-                &series_sender,
-            )
-            .await
-            .unwrap();
-
-        minutes_since_start += 3;
-    }
-
-    // Assert: three events should aggregate into the same slot.
-    assert_eq!(
-        // 00:03, 00:06, 00:09 should all land in the same 15-minute slot.
-        series.series[36].partial_cmp(&3.0),
-        Some(Ordering::Equal),
-    );
 }
 
 #[serial]
