@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     fs,
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -219,6 +219,80 @@ async fn connect() {
             Arc::new(Notify::new()),
         )
         .await;
+}
+
+#[tokio::test]
+async fn ingest_connection_control_returns_cert_error_on_server_name_mismatch() {
+    let _lock = TOKEN.lock().await;
+    tokio::spawn(TestServer::new(TEST_INGEST_PORT).run());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let certs = cert_key();
+    let endpoint = crate::client::config(&certs).expect("client endpoint");
+    let (_series_sender, series_receiver) = async_channel::bounded::<TimeSeries>(1);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        super::ingest_connection_control(
+            series_receiver,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_INGEST_PORT),
+            "mismatched-server-name",
+            &endpoint,
+            Path::new(LAST_TIME_SERIES_PATH),
+            PROTOCOL_VERSION,
+            Arc::new(Notify::new()),
+        ),
+    )
+    .await
+    .expect("No timeout");
+
+    endpoint.close(0u32.into(), &[]);
+
+    let err = result.expect_err("Connection should fail on invalid peer certificate");
+    assert!(
+        err.to_string()
+            .contains("Invalid peer certificate contents"),
+        "Unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn publish_connection_control_returns_cert_error_on_server_name_mismatch() {
+    let _lock = TOKEN.lock().await;
+    tokio::spawn(TestServer::new(TEST_PUBLISH_PORT).run());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let certs = cert_key();
+    let endpoint = crate::client::config(&certs).expect("client endpoint");
+    let (series_sender, _series_receiver) = async_channel::bounded::<TimeSeries>(1);
+    let (_request_sender, request_receiver) = async_channel::bounded::<SamplingPolicy>(1);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        super::publish_connection_control(
+            series_sender,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), TEST_PUBLISH_PORT),
+            "mismatched-server-name",
+            &endpoint,
+            PROTOCOL_VERSION,
+            &request_receiver,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(Vec::new())),
+            Path::new(LAST_TIME_SERIES_PATH),
+            Arc::new(Notify::new()),
+        ),
+    )
+    .await
+    .expect("No timeout");
+
+    endpoint.close(0u32.into(), &[]);
+
+    let err = result.expect_err("Connection should fail on invalid peer certificate");
+    assert!(
+        err.to_string()
+            .contains("Invalid peer certificate contents"),
+        "Unexpected error: {err:#}"
+    );
 }
 
 // start time: 2022/11/17 00:00:00
