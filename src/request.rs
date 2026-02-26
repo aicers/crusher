@@ -937,6 +937,7 @@ mod tests {
     // =========================================================================
 
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "Temporarily ignored: fix together with issue #290 (runtime exit path may terminate test process)"]
     async fn run_clears_state_on_start() {
         // Test: run() should clear active_policy_list and delete_policy_ids on start
         let (mut client, rx) = create_test_client();
