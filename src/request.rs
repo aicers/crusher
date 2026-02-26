@@ -1,6 +1,6 @@
 #[cfg(test)]
 use std::future::Future;
-use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, process::exit, sync::Arc};
+use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use async_channel::Sender;
@@ -65,11 +65,12 @@ impl Client {
         self.active_policy_list.write().await.clear();
         self.delete_policy_ids.write().await.clear();
         tokio::select! {
-            Err(e) = self.handle_incoming() => {
-                bail!(e);
-            }
+            biased;
             () = shutdown.notified() => {
                 info!("Shutting down request handler");
+            }
+            Err(e) = self.handle_incoming() => {
+                bail!(e);
             }
         };
         Ok(())
@@ -101,8 +102,7 @@ impl Client {
                                 continue;
                             }
                             ErrorKind::InvalidData => {
-                                error!("Invalid peer certificate contents");
-                                exit(0);
+                                bail!("Invalid peer certificate contents");
                             }
                             _ => {}
                         }

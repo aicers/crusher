@@ -4,6 +4,20 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Replaced `process::exit` calls in `request` and `subscribe`
+  modules with proper error propagation (`bail!`). Previously,
+  invalid peer certificate errors triggered `process::exit(0)`,
+  which could terminate the entire test harness during
+  `cargo test`, causing intermittent missing test coverage.
+- Used `biased` selection in the request handler's `run()` loop
+  so the shutdown branch is checked first, preventing a race
+  where `handle_incoming` could be entered before a pending
+  shutdown notification is observed.
+
 ## [0.7.1] - 2026-02-11
 
 ### Fixed
@@ -215,6 +229,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.7.1...main
 [0.7.1]: https://github.com/aicers/crusher/compare/0.7.0...0.7.1
 [0.7.0]: https://github.com/aicers/crusher/compare/0.6.4...0.7.0
 [0.6.4]: https://github.com/aicers/crusher/compare/0.6.3...0.6.4

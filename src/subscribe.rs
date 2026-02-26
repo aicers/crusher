@@ -4,7 +4,7 @@ mod time_series;
 
 use std::path::Path;
 use std::sync::LazyLock;
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, process::exit, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Result, bail};
 use async_channel::{Receiver, Sender};
@@ -32,7 +32,7 @@ use tokio::{
     task,
     time::{Duration, sleep},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
 
@@ -251,8 +251,7 @@ async fn ingest_connection_control(
                             continue;
                         }
                         ConnectionError::TransportError(_) => {
-                            error!("Invalid peer certificate contents");
-                            exit(0)
+                            bail!("Invalid peer certificate contents");
                         }
                         _ => {}
                     }
@@ -386,8 +385,7 @@ async fn publish_connection_control(
                             continue;
                         }
                         ConnectionError::TransportError(_) => {
-                            error!("Invalid peer certificate contents");
-                            exit(0)
+                            bail!("Invalid peer certificate contents");
                         }
                         _ => {}
                     }
