@@ -1,6 +1,6 @@
 #[cfg(test)]
 use std::future::Future;
-use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, process::exit, sync::Arc};
+use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use async_channel::Sender;
@@ -19,6 +19,27 @@ use crate::{client::SERVER_RETRY_INTERVAL, info_or_print};
 
 const REQUIRED_MANAGER_VERSION: &str = "0.47.0";
 const MAX_RETRIES: u8 = 3;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectErrorDisposition {
+    Retry,
+    InvalidPeerCertificate,
+    Other,
+}
+
+fn classify_connect_error(error: &anyhow::Error) -> ConnectErrorDisposition {
+    if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+        return match io_error.kind() {
+            ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::TimedOut => {
+                ConnectErrorDisposition::Retry
+            }
+            ErrorKind::InvalidData => ConnectErrorDisposition::InvalidPeerCertificate,
+            _ => ConnectErrorDisposition::Other,
+        };
+    }
+
+    ConnectErrorDisposition::Other
+}
 
 #[derive(Clone)]
 pub(crate) struct Client {
@@ -65,11 +86,12 @@ impl Client {
         self.active_policy_list.write().await.clear();
         self.delete_policy_ids.write().await.clear();
         tokio::select! {
-            Err(e) = self.handle_incoming() => {
-                bail!(e);
-            }
+            biased;
             () = shutdown.notified() => {
                 info!("Shutting down request handler");
+            }
+            Err(e) = self.handle_incoming() => {
+                bail!(e);
             }
         };
         Ok(())
@@ -88,24 +110,19 @@ impl Client {
                     }
                 },
                 Err(e) => {
-                    if let Some(e) = e.downcast_ref::<std::io::Error>() {
-                        match e.kind() {
-                            ErrorKind::ConnectionAborted
-                            | ErrorKind::ConnectionReset
-                            | ErrorKind::TimedOut => {
-                                warn!(
-                                    "Retrying connection to {} in {} seconds",
-                                    self.server_address, SERVER_RETRY_INTERVAL,
-                                );
-                                sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
-                                continue;
-                            }
-                            ErrorKind::InvalidData => {
-                                error!("Invalid peer certificate contents");
-                                exit(0);
-                            }
-                            _ => {}
+                    match classify_connect_error(&e) {
+                        ConnectErrorDisposition::Retry => {
+                            warn!(
+                                "Retrying connection to {} in {} seconds",
+                                self.server_address, SERVER_RETRY_INTERVAL,
+                            );
+                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                            continue;
                         }
+                        ConnectErrorDisposition::InvalidPeerCertificate => {
+                            bail!("Invalid peer certificate contents");
+                        }
+                        ConnectErrorDisposition::Other => {}
                     }
                     bail!("Failed to connect to {}: {:?}", self.server_address, e);
                 }
@@ -355,6 +372,8 @@ impl review_protocol::request::Handler for IdleModeHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -362,10 +381,17 @@ mod tests {
     use std::time::Duration;
 
     use async_channel::TryRecvError;
+    use quinn::{Endpoint, ServerConfig, crypto::rustls::QuicServerConfig};
     use review_protocol::request::Handler;
     use review_protocol::types::{SamplingKind, SamplingPolicy};
+    use rustls::server::WebPkiClientVerifier;
 
     use super::*;
+    use crate::client::Certs;
+
+    const CERT_PATH: &str = "tests/cert.pem";
+    const KEY_PATH: &str = "tests/key.pem";
+    const CA_CERT_PATH: &str = "tests/ca_cert.pem";
 
     /// Creates a test client with default configuration.
     /// Returns the client and a receiver for sampling policies.
@@ -403,6 +429,30 @@ mod tests {
             node: Some("test_node".to_string()),
             column: None,
         }
+    }
+
+    fn load_test_certs() -> (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, Certs) {
+        let cert_pem = fs::read(CERT_PATH).expect("read cert");
+        let key_pem = fs::read(KEY_PATH).expect("read key");
+        let ca_certs_pem = vec![fs::read(CA_CERT_PATH).expect("read ca cert")];
+        let ca_slices = ca_certs_pem.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let certs = Certs::try_new(&cert_pem, &key_pem, &ca_slices).expect("parse certs");
+        (cert_pem, key_pem, ca_certs_pem, certs)
+    }
+
+    fn create_test_server_config(certs: &Certs) -> ServerConfig {
+        let client_auth = WebPkiClientVerifier::builder(Arc::new(certs.ca_certs.clone()))
+            .build()
+            .expect("build client cert verifier");
+
+        let server_crypto = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(client_auth)
+            .with_single_cert(certs.certs.clone(), certs.key.clone_key())
+            .expect("build server tls config");
+
+        ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(server_crypto).expect("build quic server config"),
+        ))
     }
 
     // =========================================================================
@@ -932,12 +982,67 @@ mod tests {
         assert!(matches!(client.status, Status::Ready));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_incoming_returns_invalid_peer_certificate_error() {
+        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+        let server_endpoint = Endpoint::server(
+            create_test_server_config(&certs),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        )
+        .expect("create server endpoint");
+        let server_addr = server_endpoint.local_addr().expect("read server address");
+        let _server_task = tokio::spawn(async move {
+            while let Some(conn) = server_endpoint.accept().await {
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+            }
+        });
+
+        let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let mut client = Client::new(
+            server_addr,
+            "mismatched-server-name".to_string(),
+            request_send,
+            cert_pem,
+            key_pem,
+            ca_certs_pem,
+            Arc::new(Notify::new()),
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(3), client.handle_incoming())
+            .await
+            .expect("No timeout");
+        let err = result.expect_err("Expected certificate validation error");
+        assert_eq!(err.to_string(), "Invalid peer certificate contents");
+    }
+
+    #[test]
+    fn classify_connect_error_marks_invalid_data_as_peer_certificate_error() {
+        let err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer cert",
+        ));
+        assert_eq!(
+            classify_connect_error(&err),
+            ConnectErrorDisposition::InvalidPeerCertificate
+        );
+    }
+
+    #[test]
+    fn classify_connect_error_marks_connection_reset_as_retryable() {
+        let err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        assert_eq!(classify_connect_error(&err), ConnectErrorDisposition::Retry);
+    }
+
     // =========================================================================
     // Run method tests
     // =========================================================================
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "Temporarily ignored: fix together with issue #290 (runtime exit path may terminate test process)"]
     async fn run_clears_state_on_start() {
         // Test: run() should clear active_policy_list and delete_policy_ids on start
         let (mut client, rx) = create_test_client();
