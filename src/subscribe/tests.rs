@@ -483,10 +483,10 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
     );
 
     // Act/Assert: wait for ingest ACK and timestamp file creation.
-    let id = ingest_ack_recv
-        .recv()
+    let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
         .await
-        .expect("Failed to receive ingest notify");
+        .expect("Ingest ACK should arrive within 5s after adding sampling policy")
+        .expect("Ingest ACK channel should remain open until ACK is received after adding sampling policy");
     assert_eq!(id, policy.id);
 
     let map = timeout(
@@ -550,10 +550,10 @@ async fn sampling_policy_notify_flow_with_delete() {
     );
 
     // Act/Assert: wait for ingest ACK and timestamp file creation.
-    let id = ingest_ack_recv
-        .recv()
+    let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
         .await
-        .expect("Failed to receive ingest notify");
+        .expect("Ingest ACK should arrive within 5s after adding sampling policy")
+        .expect("Ingest ACK channel should remain open until ACK is received after adding sampling policy");
     assert_eq!(id, policy.id);
 
     let map = timeout(
@@ -643,10 +643,10 @@ async fn sampling_policy_multiple_streams() {
     // Act/Assert: receive policy IDs for both streams.
     let mut expected_ids = vec![policy_a.id, policy_b.id];
     for _ in 0..2 {
-        let id = ingest_ack_recv
-            .recv()
+        let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
             .await
-            .expect("Channel closed before receiving ingest ACKs for all policies.");
+            .expect("Ingest ACKs for all sampling policies should arrive within 5s")
+            .expect("Ingest ACK channel should remain open until ACKs for all sampling policies are received");
         expected_ids.retain(|expected| *expected != id);
     }
     assert!(
