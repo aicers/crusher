@@ -7,6 +7,7 @@ use async_channel::Sender;
 use async_trait::async_trait;
 use review_protocol::{
     client::{Connection, ConnectionBuilder},
+    request::Handler as _,
     types::{self as protocol_types, SamplingPolicy, Status},
 };
 use tokio::{
@@ -97,7 +98,34 @@ impl Client {
         Ok(())
     }
 
+    async fn sync_sampling_policies(&mut self) {
+        match self.connect().await {
+            Ok(connection) => match connection.get_sampling_policy_list().await {
+                Ok(policies) => {
+                    if policies.is_empty() {
+                        info!("No sampling policies to restore from Manager");
+                        return;
+                    }
+                    info!(
+                        "Restoring {} sampling policies from Manager",
+                        policies.len()
+                    );
+                    if let Err(e) = self.sampling_policy_list(&policies).await {
+                        warn!("Failed to register restored sampling policies: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to retrieve sampling policy list: {e}");
+                }
+            },
+            Err(e) => {
+                warn!("Failed to connect for sampling policy sync: {e}");
+            }
+        }
+    }
+
     async fn handle_incoming(&mut self) -> Result<()> {
+        self.sync_sampling_policies().await;
         loop {
             match self.connect().await {
                 Ok(connection) => match connection.accept_bi().await {
@@ -1087,6 +1115,49 @@ mod tests {
         // State should be cleared
         assert!(client.active_policy_list.read().await.is_empty());
         assert!(client.delete_policy_ids.read().await.is_empty());
+    }
+
+    // =========================================================================
+    // Sampling policy reconstruction tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconstruct_active_policy_list_from_fetched_policies() {
+        // Test: Simulates the startup sync by calling sampling_policy_list
+        // with a batch of policies (as get_sampling_policy_list would return)
+        // and verifies that active_policy_list is correctly reconstructed.
+        let (mut client, rx) = create_test_client();
+
+        // Simulate policies fetched from Manager on startup
+        let policies: Vec<SamplingPolicy> = (1..=3).map(create_test_policy).collect();
+        let result = client.sampling_policy_list(&policies).await;
+        assert!(result.is_ok());
+
+        // Verify all policies are in the active list
+        let active = client.active_policy_list.read().await;
+        assert_eq!(active.len(), 3);
+        for id in 1..=3 {
+            assert!(active.contains_key(&id));
+        }
+        drop(active);
+
+        // Verify all policies were sent through the channel
+        for id in 1..=3 {
+            let received = rx.try_recv().expect("policy sent through channel");
+            assert_eq!(received.id, id);
+        }
+        assert_eq!(rx.try_recv().expect_err("Empty"), TryRecvError::Empty);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconstruct_active_policy_list_empty() {
+        // Test: When Manager returns no policies, active list stays empty
+        let (mut client, rx) = create_test_client();
+
+        let result = client.sampling_policy_list(&[]).await;
+        assert!(result.is_ok());
+        assert!(client.active_policy_list.read().await.is_empty());
+        assert_eq!(rx.try_recv().expect_err("Empty"), TryRecvError::Empty);
     }
 
     // =========================================================================
