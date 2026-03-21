@@ -16,7 +16,7 @@ use client::Certs;
 use logging::init_tracing;
 use review_protocol::types::SamplingPolicy;
 use settings::Settings;
-use subscribe::read_last_timestamp;
+use subscribe::{ensure_time_data_exists, read_last_timestamp};
 use tokio::sync::Notify;
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -161,6 +161,8 @@ async fn run(
         if is_local_config { "local" } else { "remote" }
     );
 
+    ensure_time_data_exists(&settings.last_timestamp_data)
+        .context("Failed to initialize last timestamp data file")?;
     read_last_timestamp(&settings.last_timestamp_data).await?;
 
     let subscribe_client = subscribe::Client::new(

@@ -14,6 +14,7 @@ use review_protocol::types::SamplingPolicy;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::RwLock;
+use tracing::info;
 
 use super::{Event, INGEST_CHANNEL};
 
@@ -183,23 +184,45 @@ pub(super) async fn write_last_timestamp(
     Ok(())
 }
 
-pub(super) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
-    if last_series_time_path.exists() {
-        let file = File::open(last_series_time_path)
-            .context("Failed to open last time series timestamp file")?;
-        let json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
-        let Value::Object(map_data) = json else {
-            bail!("Failed to parse json data, invalid json format");
-        };
-        for (key, val) in map_data {
-            let Value::Number(value) = val else {
-                bail!("Failed to parse timestamp data, invalid json format");
-            };
-            let Some(timestamp) = value.as_i64() else {
-                bail!("Failed to convert timestamp data, invalid time data");
-            };
-            LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
+/// Ensures the timestamp data file exists at the given path.
+///
+/// If the file already exists, this is a no-op. If it is missing, an
+/// empty JSON object (`{}`) is written so that subsequent reads and
+/// writes succeed.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be created (e.g. the parent
+/// directory does not exist or a permission error occurs).
+pub fn ensure_time_data_exists(path: &Path) -> std::io::Result<()> {
+    match File::open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                "Timestamp data file not found; creating: {}",
+                path.display()
+            );
+            std::fs::write(path, b"{}")
         }
+        Err(e) => Err(e),
+    }
+}
+
+pub(super) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
+    let file = File::open(last_series_time_path)
+        .context("Failed to open last time series timestamp file")?;
+    let json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
+    let Value::Object(map_data) = json else {
+        bail!("Failed to parse json data, invalid json format");
+    };
+    for (key, val) in map_data {
+        let Value::Number(value) = val else {
+            bail!("Failed to parse timestamp data, invalid json format");
+        };
+        let Some(timestamp) = value.as_i64() else {
+            bail!("Failed to convert timestamp data, invalid time data");
+        };
+        LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
     }
     Ok(())
 }
@@ -629,19 +652,11 @@ mod tests {
     async fn test_read_last_timestamp_nonexistent_file() {
         let dir = tempdir().expect("failed to create temp dir");
         let file_path = dir.path().join("nonexistent.json");
-        let unique_key = format!(
-            "read_nonexistent_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
 
-        // Reading a nonexistent file should succeed (no-op) and not modify the map
+        // Reading a nonexistent file should fail since read_last_timestamp
+        // no longer creates the file (initialization is done in main)
         let result = read_last_timestamp(&file_path).await;
-        assert!(result.is_ok());
-        assert!(LAST_TRANSFER_TIME.read().await.get(&unique_key).is_none());
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1497,5 +1512,39 @@ mod tests {
             err_msg.contains("period must be greater than 0"),
             "unexpected error message: {err_msg}"
         );
+    }
+
+    #[test]
+    fn ensure_time_data_creates_missing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("time_data.json");
+        assert!(!path.exists());
+
+        ensure_time_data_exists(&path).unwrap();
+
+        assert!(path.exists());
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "{}");
+    }
+
+    #[test]
+    fn ensure_time_data_preserves_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("time_data.json");
+        std::fs::write(&path, r#"{"1":100}"#).unwrap();
+
+        ensure_time_data_exists(&path).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, r#"{"1":100}"#);
+    }
+
+    #[test]
+    fn ensure_time_data_missing_parent_propagates_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("no_such_dir").join("time_data.json");
+
+        let err = ensure_time_data_exists(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }
