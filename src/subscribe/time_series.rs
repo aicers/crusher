@@ -209,9 +209,6 @@ pub fn ensure_time_data_exists(path: &Path) -> std::io::Result<()> {
 }
 
 pub(super) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
-    ensure_time_data_exists(last_series_time_path)
-        .context("Failed to initialize last timestamp data file")?;
-
     let file = File::open(last_series_time_path)
         .context("Failed to open last time series timestamp file")?;
     let json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
@@ -655,19 +652,11 @@ mod tests {
     async fn test_read_last_timestamp_nonexistent_file() {
         let dir = tempdir().expect("failed to create temp dir");
         let file_path = dir.path().join("nonexistent.json");
-        let unique_key = format!(
-            "read_nonexistent_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
 
-        // Reading a nonexistent file should succeed (no-op) and not modify the map
+        // Reading a nonexistent file should fail since read_last_timestamp
+        // no longer creates the file (initialization is done in main)
         let result = read_last_timestamp(&file_path).await;
-        assert!(result.is_ok());
-        assert!(LAST_TRANSFER_TIME.read().await.get(&unique_key).is_none());
+        assert!(result.is_err());
     }
 
     #[tokio::test]
