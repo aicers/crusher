@@ -39,6 +39,9 @@ tempfile = "3"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 time = "0.3"
 rstest = "0.26"
+review-protocol = { git = "https://github.com/petabi/review-protocol.git", features = [
+    "server",
+], rev = "c284fa6" }
 
 [lints.clippy]
 pedantic = "warn"
