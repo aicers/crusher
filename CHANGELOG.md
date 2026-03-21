@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- On startup, previously registered `sampling_policy` entries
+  are now automatically synchronized from the Manager using
+  `get_sampling_policy_list`, allowing data collection to
+  resume after a restart.
+
+### Changed
+
+- Updated `review-protocol` dependency to rev `c284fa6`.
+
 ### Fixed
 
 - Replaced `process::exit` calls in `request` and `subscribe`

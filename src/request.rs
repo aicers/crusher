@@ -7,6 +7,7 @@ use async_channel::Sender;
 use async_trait::async_trait;
 use review_protocol::{
     client::{Connection, ConnectionBuilder},
+    request::Handler as _,
     types::{self as protocol_types, SamplingPolicy, Status},
 };
 use tokio::{
@@ -97,7 +98,34 @@ impl Client {
         Ok(())
     }
 
+    async fn sync_sampling_policies(&mut self) {
+        match self.connect().await {
+            Ok(connection) => match connection.get_sampling_policy_list().await {
+                Ok(policies) => {
+                    if policies.is_empty() {
+                        info!("No sampling policies to restore from Manager");
+                        return;
+                    }
+                    info!(
+                        "Restoring {} sampling policies from Manager",
+                        policies.len()
+                    );
+                    if let Err(e) = self.sampling_policy_list(&policies).await {
+                        warn!("Failed to register restored sampling policies: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to retrieve sampling policy list: {e}");
+                }
+            },
+            Err(e) => {
+                warn!("Failed to connect for sampling policy sync: {e}");
+            }
+        }
+    }
+
     async fn handle_incoming(&mut self) -> Result<()> {
+        self.sync_sampling_policies().await;
         loop {
             match self.connect().await {
                 Ok(connection) => match connection.accept_bi().await {
@@ -1087,6 +1115,85 @@ mod tests {
         // State should be cleared
         assert!(client.active_policy_list.read().await.is_empty());
         assert!(client.delete_policy_ids.read().await.is_empty());
+    }
+
+    // =========================================================================
+    // Startup sync test
+    // =========================================================================
+
+    struct TestManagerHandler;
+
+    #[async_trait::async_trait]
+    impl review_protocol::server::Handler for TestManagerHandler {
+        async fn get_sampling_policy_list(
+            &self,
+            _peer: &str,
+        ) -> Result<Vec<SamplingPolicy>, String> {
+            Ok(vec![create_test_policy(10), create_test_policy(20)])
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn syncs_sampling_policies_on_startup() {
+        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+        let server_endpoint = Endpoint::server(
+            create_test_server_config(&certs),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        )
+        .expect("create server endpoint");
+        let server_addr = server_endpoint.local_addr().expect("read server address");
+
+        // Spawn a server that performs the review-protocol handshake
+        // and responds to get_sampling_policy_list requests.
+        let server_task = tokio::spawn(async move {
+            if let Some(conn) = server_endpoint.accept().await {
+                let connection = conn.await.expect("accept connection");
+                let addr = connection.remote_address();
+                let _agent_info =
+                    review_protocol::server::handshake(&connection, addr, ">=0", "0.47.0")
+                        .await
+                        .expect("handshake");
+
+                let mut handler = TestManagerHandler;
+                while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                    review_protocol::server::handle(&mut handler, &mut send, &mut recv, "test")
+                        .await
+                        .ok();
+                }
+            }
+        });
+
+        let (request_send, request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let mut client = Client::new(
+            server_addr,
+            "localhost".to_string(),
+            request_send,
+            cert_pem,
+            key_pem,
+            ca_certs_pem,
+            Arc::new(Notify::new()),
+        );
+
+        client.sync_sampling_policies().await;
+
+        // Verify policies were restored into the active list
+        let active = client.active_policy_list.read().await;
+        assert_eq!(active.len(), 2);
+        assert!(active.contains_key(&10));
+        assert!(active.contains_key(&20));
+        drop(active);
+
+        // Verify policies were sent through the channel
+        let p1 = request_recv.try_recv().expect("first policy");
+        let p2 = request_recv.try_recv().expect("second policy");
+        assert_eq!(p1.id, 10);
+        assert_eq!(p2.id, 20);
+        assert_eq!(
+            request_recv.try_recv().expect_err("Empty"),
+            TryRecvError::Empty
+        );
+
+        server_task.abort();
     }
 
     // =========================================================================
