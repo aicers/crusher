@@ -2235,6 +2235,7 @@ name = "review-protocol"
 version = "0.16.0"
 source = "git+https://github.com/petabi/review-protocol.git?rev=c284fa6#c284fa6099adf81af1e62e253131bd578d786ce4"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bincode 2.0.1",
  "ipnet",
@@ -2250,6 +2251,7 @@ dependencies = [
  "serde_repr",
  "structured",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
