@@ -8,6 +8,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Automatically create `last_timestamp_data` file with an empty
+  JSON object (`{}`) on startup when it does not exist, so
+  fresh deployments no longer require manual file creation.
 - Replaced `process::exit` calls in `request` and `subscribe`
   modules with proper error propagation (`bail!`). Previously,
   invalid peer certificate errors triggered `process::exit(0)`,

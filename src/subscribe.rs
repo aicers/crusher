@@ -521,6 +521,10 @@ async fn receiver(
     Ok(())
 }
 
+pub(crate) fn ensure_time_data_exists(path: &Path) -> std::io::Result<()> {
+    time_series::ensure_time_data_exists(path)
+}
+
 pub(crate) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
     time_series::read_last_timestamp(last_series_time_path).await
 }
