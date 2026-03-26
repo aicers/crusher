@@ -28,6 +28,7 @@ use tokio::time::{sleep, timeout};
 use super::time_series::clear_last_transfer_time;
 use super::*;
 use crate::client::Certs;
+use crate::shutdown::ShutdownCoordinator;
 
 const CERT_PATH: &str = "tests/cert.pem";
 const KEY_PATH: &str = "tests/key.pem";
@@ -306,7 +307,7 @@ fn spawn_subscribe_client(
     ingest_addr: SocketAddr,
     publish_addr: SocketAddr,
     request_client: &crate::request::Client,
-) -> (tokio::task::JoinHandle<()>, Arc<Notify>) {
+) -> (tokio::task::JoinHandle<()>, ShutdownCoordinator) {
     let client = Client::new(
         ingest_addr,
         publish_addr,
@@ -316,18 +317,18 @@ fn spawn_subscribe_client(
         request_recv,
     );
 
-    let client_shutdown = Arc::new(Notify::new());
-    let client_shutdown_clone = client_shutdown.clone();
+    let coordinator = ShutdownCoordinator::new();
+    let coordinator_clone = coordinator.clone();
     let active_policy_list = request_client.active_policy_list.clone();
     let delete_policy_ids = request_client.delete_policy_ids.clone();
 
     let client_handle = tokio::spawn(async move {
         let _ = client
-            .run(active_policy_list, delete_policy_ids, client_shutdown_clone)
+            .run(active_policy_list, delete_policy_ids, coordinator_clone)
             .await;
     });
 
-    (client_handle, client_shutdown)
+    (client_handle, coordinator)
 }
 
 async fn reset_last_transfer_time() {
@@ -354,11 +355,11 @@ async fn wait_for_policy_ids(
 }
 
 async fn cleanup_test_resources(
-    client_shutdown: Arc<Notify>,
+    coordinator: ShutdownCoordinator,
     client_handle: tokio::task::JoinHandle<()>,
     server_handles: TestServerHandlers,
 ) {
-    client_shutdown.notify_one();
+    coordinator.request_shutdown("test cleanup");
     server_handles.ingest_shutdown.notify_one();
     server_handles.publish_shutdown.notify_one();
 

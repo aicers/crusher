@@ -29,12 +29,12 @@ use review_protocol::types::{SamplingKind, SamplingPolicy};
 use time_series::{SamplingPolicyExt, TimeSeries, delete_last_timestamp, write_last_timestamp};
 use tokio::{
     sync::{Mutex, Notify, RwLock},
-    task,
     time::{Duration, sleep},
 };
 use tracing::{debug, info, warn};
 
 use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
+use crate::shutdown::ShutdownCoordinator;
 
 pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.26.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
@@ -147,7 +147,7 @@ impl Client {
         self,
         active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
         delete_policy_ids: Arc<RwLock<Vec<u32>>>,
-        shutdown: Arc<Notify>,
+        coordinator: ShutdownCoordinator,
     ) -> Result<()> {
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
         let connection_notify = Arc::new(Notify::new());
@@ -161,6 +161,7 @@ impl Client {
                     &self.last_series_time_path,
                     REQUIRED_GIGANTO_VERSION,
                     connection_notify.clone(),
+                    coordinator.clone(),
                 ),
                 publish_connection_control(
                     sender,
@@ -173,21 +174,22 @@ impl Client {
                     delete_policy_ids,
                     &self.last_series_time_path,
                     connection_notify.clone(),
+                    coordinator.clone(),
                 )
             )} => {
                 self.endpoint.close(0u32.into(), &[]);
                 bail!("Data store's connection error occurred: {e}");
             }
-            () = shutdown.notified() => {
+            () = coordinator.cancelled() => {
                 info!("Closing the connection to data store endpoint");
                 self.endpoint.close(0u32.into(), &[]);
-                shutdown.notify_one();
                 Ok(())
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ingest_connection_control(
     series_recv: Receiver<TimeSeries>,
     server_addr: SocketAddr,
@@ -196,6 +198,7 @@ async fn ingest_connection_control(
     last_series_time_path: &Path,
     version: &str,
     connection_notify: Arc<Notify>,
+    coordinator: ShutdownCoordinator,
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = connection_notify.clone();
@@ -207,7 +210,7 @@ async fn ingest_connection_control(
                 let (time_sender, time_receiver) = async_channel::bounded::<(String, i64)>(
                     LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE,
                 );
-                tokio::spawn(write_last_timestamp(
+                coordinator.tracker().spawn(write_last_timestamp(
                     last_series_time_path.to_path_buf(),
                     time_receiver,
                 ));
@@ -226,11 +229,12 @@ async fn ingest_connection_control(
                         Ok(series) = series_recv.recv() => {
                             // First time_series data receive
                             let connection = arc_conn.clone();
-                            tokio::spawn(send_time_series(
+                            coordinator.tracker().spawn(send_time_series(
                                 connection,
                                 series,
                                 time_sender.clone(),
                                 connection_notify.clone(),
+                                coordinator.clone(),
                             ));
                         }
                     }
@@ -274,6 +278,7 @@ async fn publish_connection_control(
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     last_series_time_path: &Path,
     connection_notify: Arc<Notify>,
+    coordinator: ShutdownCoordinator,
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = connection_notify.clone();
@@ -290,6 +295,7 @@ async fn publish_connection_control(
                         active_policy_list.clone(),
                         delete_policy_ids.clone(),
                         last_series_time_path.to_path_buf(),
+                        coordinator.clone(),
                     )
                     .await
                     {
@@ -346,6 +352,7 @@ async fn publish_connection_control(
                                 active_policy_list.clone(),
                                 delete_policy_ids.clone(),
                                 last_series_time_path.to_path_buf(),
+                                coordinator.clone(),
                             ).await
                             {
                                 for cause in e.chain() {
@@ -436,6 +443,7 @@ async fn process_network_stream(
     active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     last_series_time_path: PathBuf,
+    coordinator: ShutdownCoordinator,
 ) -> Result<()> {
     let start = policy.start_timestamp().await?;
     let req_msg = RequestTimeSeriesGeneratorStream {
@@ -449,8 +457,14 @@ async fn process_network_stream(
         record_type: RequestStreamRecord::from_ext(policy.kind),
         request: req_msg,
     };
-    send_stream_request(&mut (*send.lock().await), payload).await?;
-    task::spawn(async move {
+    // Acquire the lock, send the request, then release the lock
+    // before any further awaits. This avoids holding a MutexGuard
+    // across an await point.
+    {
+        let mut guard = send.lock().await;
+        send_stream_request(&mut guard, payload).await?;
+    }
+    coordinator.tracker().spawn(async move {
         receiver(
             conn,
             sender,
@@ -534,6 +548,7 @@ async fn send_time_series(
     series: TimeSeries,
     time_sender: Sender<(String, i64)>,
     connection_notify: Arc<Notify>,
+    coordinator: ShutdownCoordinator,
 ) -> Result<()> {
     // Store sender channel (Channel for receiving the next time_series after the first transmission)
     let sampling_policy_id = series.sampling_policy_id.clone();
@@ -556,7 +571,7 @@ async fn send_time_series(
     send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
 
     // Receive start time of giganto last saved time series.
-    tokio::spawn(receive_time_series_timestamp(
+    coordinator.tracker().spawn(receive_time_series_timestamp(
         series_receiver,
         sampling_policy_id,
         time_sender,

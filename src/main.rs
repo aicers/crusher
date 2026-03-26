@@ -2,6 +2,7 @@ mod client;
 mod logging;
 mod request;
 mod settings;
+mod shutdown;
 mod subscribe;
 
 use std::fs;
@@ -9,17 +10,21 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use client::Certs;
 use logging::init_tracing;
 use review_protocol::types::SamplingPolicy;
 use settings::Settings;
+use shutdown::ShutdownCoordinator;
 use subscribe::{ensure_time_data_exists, read_last_timestamp};
 use tokio::sync::Notify;
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
+
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 
@@ -176,31 +181,35 @@ async fn run(
     );
 
     info!("Time series generate started");
-    let shutdown = Arc::new(Notify::new());
-    tokio::select! {
-        Ok(Err(e)) = tokio::spawn(subscribe_client.run(
-            request_client.active_policy_list.clone(),
-            request_client.delete_policy_ids.clone(),
-            shutdown.clone(),
-        )) => {
-            shutdown.notify_waiters();
-            bail!(e);
+    let coordinator = ShutdownCoordinator::new();
+    let tracker = coordinator.tracker().clone();
+
+    let subscribe_handle = tracker.spawn(subscribe_client.run(
+        request_client.active_policy_list.clone(),
+        request_client.delete_policy_ids.clone(),
+        coordinator.clone(),
+    ));
+
+    let request_coordinator = coordinator.clone();
+    let request_handle =
+        tracker.spawn(async move { request_client.run(request_coordinator).await });
+
+    let result = tokio::select! {
+        Ok(Err(e)) = subscribe_handle => {
+            coordinator.request_shutdown("subscribe error");
+            Err(e)
         }
-        Ok(Err(e)) = tokio::spawn({
-            let shutdown = shutdown.clone();
-            async move {
-                request_client.run(shutdown).await
-            }
-        }) => {
-            shutdown.notify_waiters();
-            shutdown.notified().await;
-            bail!(e);
+        Ok(Err(e)) = request_handle => {
+            coordinator.request_shutdown("request error");
+            Err(e)
         }
         () = config_reload.notified(), if args.is_remote_mode() => {
-            shutdown.notify_waiters();
-            shutdown.notified().await;
+            coordinator.request_shutdown("config reload");
             info!("Reloading the configuration");
+            Ok(())
         },
     };
-    Ok(())
+
+    coordinator.wait_for_drain(SHUTDOWN_DRAIN_TIMEOUT).await;
+    result
 }

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{BufReader, BufWriter},
+    fs::File,
+    io::BufReader,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -172,15 +172,33 @@ pub(super) async fn write_last_timestamp(
 ) -> Result<()> {
     while let Ok((id, timestamp)) = time_receiver.recv().await {
         LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&last_series_time_path)
-            .context("Failed to open last time series timestamp file")?;
-        serde_json::to_writer(&file, &(*LAST_TRANSFER_TIME.read().await))
-            .context("Failed to write last time series timestamp file")?;
+        atomic_write_timestamp_file(&last_series_time_path, &*LAST_TRANSFER_TIME.read().await)?;
     }
+    Ok(())
+}
+
+/// Atomically writes the timestamp map to the given path by writing
+/// to a temporary file in the same directory, flushing to disk, and
+/// then renaming over the target path. This prevents partial writes
+/// on crash.
+fn atomic_write_timestamp_file(path: &Path, data: &HashMap<String, i64>) -> Result<()> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .context("timestamp file has no parent directory")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .context("Failed to create temporary timestamp file")?;
+    serde_json::to_writer(&mut tmp, data)
+        .context("Failed to write timestamp data to temporary file")?;
+    tmp.as_file_mut()
+        .flush()
+        .context("Failed to flush temporary timestamp file")?;
+    tmp.as_file_mut()
+        .sync_all()
+        .context("Failed to sync temporary timestamp file")?;
+    tmp.persist(path)
+        .context("Failed to atomically replace timestamp file")?;
     Ok(())
 }
 
@@ -234,9 +252,15 @@ pub(super) fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Re
     if let Value::Object(ref mut map_data) = json {
         map_data.remove(&id);
     }
-    let file = File::create(last_series_time_path)?;
-    serde_json::to_writer(BufWriter::new(file), &json)?;
-
+    let map: HashMap<String, i64> = if let Value::Object(ref map_data) = json {
+        map_data
+            .iter()
+            .filter_map(|(k, v)| v.as_i64().map(|v| (k.clone(), v)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    atomic_write_timestamp_file(last_series_time_path, &map)?;
     Ok(())
 }
 

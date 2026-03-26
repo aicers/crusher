@@ -25,8 +25,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and `giganto_name` is absent, a configuration error is
   returned.
 - Updated `review-protocol` dependency to rev `c284fa6`.
+- Cancellation-safe shutdown framework using
+  `CancellationToken` and `TaskTracker` from `tokio-util`.
+  All spawned tasks are now tracked and drained before the
+  process exits or restarts, preventing detached background
+  work.
+
+### Changed
+
+- Replaced `Arc<Notify>`-based shutdown signalling with a
+  `ShutdownCoordinator` that provides structured shutdown
+  phases (running, draining, completed).
+- Timestamp file (`time_data.json`) writes are now atomic
+  (write-to-temp then rename), preventing partial writes on
+  crash.
 
 ### Fixed
+
+- Fixed lock-across-await in `SendStream` serialisation path
+  (`subscribe.rs`) where a `Mutex` guard was held across an
+  `.await` point, risking deadlock under contention.
 
 - Automatically create `last_timestamp_data` file with an empty
   JSON object (`{}`) on startup when it does not exist, so

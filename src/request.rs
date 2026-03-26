@@ -16,7 +16,9 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{client::SERVER_RETRY_INTERVAL, info_or_print};
+use crate::client::SERVER_RETRY_INTERVAL;
+use crate::info_or_print;
+use crate::shutdown::ShutdownCoordinator;
 
 const REQUIRED_MANAGER_VERSION: &str = "0.47.0";
 const MAX_RETRIES: u8 = 3;
@@ -83,12 +85,12 @@ impl Client {
         }
     }
 
-    pub(crate) async fn run(&mut self, shutdown: Arc<Notify>) -> Result<()> {
+    pub(crate) async fn run(&mut self, coordinator: ShutdownCoordinator) -> Result<()> {
         self.active_policy_list.write().await.clear();
         self.delete_policy_ids.write().await.clear();
         tokio::select! {
             biased;
-            () = shutdown.notified() => {
+            () = coordinator.cancelled() => {
                 info!("Shutting down request handler");
             }
             Err(e) = self.handle_incoming() => {
@@ -1106,10 +1108,10 @@ mod tests {
             .expect("Success to add policy");
 
         // Shutdown immediately
-        let shutdown = Arc::new(Notify::new());
-        shutdown.notify_one();
+        let coordinator = crate::shutdown::ShutdownCoordinator::new();
+        coordinator.request_shutdown("test");
 
-        let result = client.run(shutdown).await;
+        let result = client.run(coordinator).await;
         assert!(result.is_ok());
 
         // State should be cleared
