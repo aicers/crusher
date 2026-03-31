@@ -210,6 +210,10 @@ async fn run(
         },
     };
 
-    coordinator.wait_for_drain(SHUTDOWN_DRAIN_TIMEOUT).await;
+    if !coordinator.wait_for_drain(SHUTDOWN_DRAIN_TIMEOUT).await {
+        return Err(anyhow::anyhow!(
+            "Shutdown drain timed out; child tasks may still be running"
+        ));
+    }
     result
 }

@@ -169,10 +169,36 @@ fn start_time(policy: &SamplingPolicy, time: DateTime<Utc>) -> Result<DateTime<U
 pub(super) async fn write_last_timestamp(
     last_series_time_path: PathBuf,
     time_receiver: Receiver<(String, i64)>,
+    coordinator: crate::shutdown::ShutdownCoordinator,
 ) -> Result<()> {
-    while let Ok((id, timestamp)) = time_receiver.recv().await {
-        LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
-        atomic_write_timestamp_file(&last_series_time_path, &*LAST_TRANSFER_TIME.read().await)?;
+    loop {
+        let item = tokio::select! {
+            biased;
+            () = coordinator.cancelled() => {
+                // Drain any remaining items in the channel before
+                // exiting so timestamps are flushed to disk.
+                while let Ok((id, timestamp)) = time_receiver.try_recv() {
+                    LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
+                }
+                atomic_write_timestamp_file(
+                    &last_series_time_path,
+                    &*LAST_TRANSFER_TIME.read().await,
+                )?;
+                tracing::info!("write_last_timestamp flushed and shutting down");
+                return Ok(());
+            }
+            result = time_receiver.recv() => result,
+        };
+        match item {
+            Ok((id, timestamp)) => {
+                LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
+                atomic_write_timestamp_file(
+                    &last_series_time_path,
+                    &*LAST_TRANSFER_TIME.read().await,
+                )?;
+            }
+            Err(_) => break,
+        }
     }
     Ok(())
 }
@@ -554,7 +580,8 @@ mod tests {
         let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
 
         // Start the writer task
-        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver));
+        let coord = crate::shutdown::ShutdownCoordinator::new();
+        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver, coord));
 
         // Send some timestamps
         sender
@@ -608,8 +635,9 @@ mod tests {
         let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
 
         let path_clone = file_path.clone();
+        let coord = crate::shutdown::ShutdownCoordinator::new();
         let writer_handle =
-            tokio::spawn(async move { write_last_timestamp(path_clone, receiver).await });
+            tokio::spawn(async move { write_last_timestamp(path_clone, receiver, coord).await });
 
         // Send initial timestamp
         sender.send((key.clone(), 1_000_000_000_i64)).await.unwrap();

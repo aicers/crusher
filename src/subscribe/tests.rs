@@ -655,3 +655,183 @@ async fn sampling_policy_multiple_streams() {
     // Cleanup: stop client and servers.
     cleanup_test_resources(client_shutdown, client_handle, server_handles).await;
 }
+
+/// Test: After shutdown, all tracked tasks must drain within the
+/// timeout and no tasks remain alive.
+#[serial]
+#[tokio::test]
+async fn shutdown_drains_all_tasks() {
+    use crate::shutdown::ShutdownPhase;
+
+    reset_last_transfer_time().await;
+    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
+
+    let certs = cert_key();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
+        setup_request_client(1);
+    let policy = new_policy(DEFAULT_POLICY_ID);
+
+    request_client
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+
+    let (client_handle, coordinator) = spawn_subscribe_client(
+        &certs,
+        request_recv,
+        &last_time_series_path,
+        ingest_addr,
+        publish_addr,
+        &request_client,
+    );
+
+    // Wait for the stream to be fully established.
+    let _ = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        .await
+        .expect("Ingest ACK should arrive within 5s");
+
+    let _ = timeout(
+        Duration::from_secs(5),
+        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
+    )
+    .await
+    .expect("Policy ID written to time_data.json");
+
+    // Request shutdown and verify drain completes.
+    coordinator.request_shutdown("drain test");
+    server_handles.ingest_shutdown.notify_one();
+    server_handles.publish_shutdown.notify_one();
+
+    let drained = coordinator.wait_for_drain(Duration::from_secs(10)).await;
+    assert!(drained, "Drain should complete within timeout");
+    assert_eq!(coordinator.phase(), ShutdownPhase::Completed);
+    assert_eq!(coordinator.tracker().active_count(), 0);
+
+    let _ = tokio::join!(
+        client_handle,
+        server_handles.ingest_handle,
+        server_handles.publish_handle,
+    );
+    INGEST_CHANNEL.write().await.clear();
+}
+
+/// Test: Timestamp file is flushed and consistent after shutdown.
+#[serial]
+#[tokio::test]
+async fn shutdown_flushes_timestamps() {
+    reset_last_transfer_time().await;
+    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
+
+    let certs = cert_key();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
+        setup_request_client(1);
+    let policy = new_policy(DEFAULT_POLICY_ID);
+
+    request_client
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+
+    let (client_handle, coordinator) = spawn_subscribe_client(
+        &certs,
+        request_recv,
+        &last_time_series_path,
+        ingest_addr,
+        publish_addr,
+        &request_client,
+    );
+
+    // Wait for timestamp to be written.
+    let _ = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        .await
+        .expect("Ingest ACK should arrive within 5s");
+
+    let map_before = timeout(
+        Duration::from_secs(5),
+        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
+    )
+    .await
+    .expect("Policy ID written to time_data.json");
+
+    // Shutdown and drain.
+    coordinator.request_shutdown("flush test");
+    server_handles.ingest_shutdown.notify_one();
+    server_handles.publish_shutdown.notify_one();
+
+    let drained = coordinator.wait_for_drain(Duration::from_secs(10)).await;
+    assert!(drained, "Drain should complete");
+
+    let _ = tokio::join!(
+        client_handle,
+        server_handles.ingest_handle,
+        server_handles.publish_handle,
+    );
+    INGEST_CHANNEL.write().await.clear();
+
+    // After drain, the timestamp file must still exist and be valid
+    // JSON parseable as a HashMap.
+    assert!(
+        last_time_series_path.exists(),
+        "Timestamp file must survive shutdown"
+    );
+    let map_after = read_time_data_map(&last_time_series_path);
+    // The map should be at least as complete as before shutdown
+    // (the flush may have added entries, but must not have lost any).
+    for (k, v) in &map_before {
+        assert_eq!(
+            map_after.get(k),
+            Some(v),
+            "Timestamp for policy {k} must be preserved after shutdown"
+        );
+    }
+}
+
+/// Test: After shutdown + simulated restart, time data is consistent
+/// and readable.
+#[serial]
+#[tokio::test]
+async fn restart_state_consistency() {
+    reset_last_transfer_time().await;
+    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
+
+    let certs = cert_key();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
+        setup_request_client(1);
+    let policy = new_policy(DEFAULT_POLICY_ID);
+
+    request_client
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+
+    let (client_handle, coordinator) = spawn_subscribe_client(
+        &certs,
+        request_recv,
+        &last_time_series_path,
+        ingest_addr,
+        publish_addr,
+        &request_client,
+    );
+
+    let _ = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        .await
+        .expect("Ingest ACK should arrive within 5s");
+
+    let _ = timeout(
+        Duration::from_secs(5),
+        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
+    )
+    .await
+    .expect("Policy ID written to time_data.json");
+
+    // Shutdown
+    cleanup_test_resources(coordinator, client_handle, server_handles).await;
+
+    // Simulate restart: clear in-memory state and re-read from file.
+    reset_last_transfer_time().await;
+    let read_result = crate::subscribe::read_last_timestamp(&last_time_series_path).await;
+    assert!(
+        read_result.is_ok(),
+        "Timestamp file must be readable after shutdown: {read_result:?}"
+    );
+}

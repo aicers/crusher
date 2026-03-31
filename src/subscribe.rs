@@ -28,7 +28,7 @@ use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarIn
 use review_protocol::types::{SamplingKind, SamplingPolicy};
 use time_series::{SamplingPolicyExt, TimeSeries, delete_last_timestamp, write_last_timestamp};
 use tokio::{
-    sync::{Mutex, Notify, RwLock},
+    sync::{Notify, RwLock, oneshot},
     time::{Duration, sleep},
 };
 use tracing::{debug, info, warn};
@@ -39,6 +39,10 @@ use crate::shutdown::ShutdownCoordinator;
 pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.26.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
+
+/// A request sent to the `SendStream` actor task. The actor owns the
+/// `SendStream` so no lock is needed across an await point.
+type StreamSendRequest = (StreamRequestPayload, oneshot::Sender<Result<()>>);
 
 // A hashmap for data transfer to an already created asynchronous task
 static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
@@ -213,6 +217,7 @@ async fn ingest_connection_control(
                 coordinator.tracker().spawn(write_last_timestamp(
                     last_series_time_path.to_path_buf(),
                     time_receiver,
+                    coordinator.clone(),
                 ));
 
                 loop {
@@ -283,14 +288,30 @@ async fn publish_connection_control(
     'connection: loop {
         let connection_notify = connection_notify.clone();
         match publish_connect(endpoint, server_addr, server_name, version).await {
-            Ok((conn, send)) => {
-                let req_send = Arc::new(Mutex::new(send));
-                for policy in active_policy_list.read().await.values() {
+            Ok((conn, mut send)) => {
+                // Spawn an actor task that owns the SendStream.
+                // Callers send payloads through the channel, avoiding
+                // any lock-across-await on the stream.
+                let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<StreamSendRequest>(1);
+                coordinator.tracker().spawn(async move {
+                    while let Some((payload, reply)) = stream_rx.recv().await {
+                        let result = send_stream_request(&mut send, payload)
+                            .await
+                            .map_err(Into::into);
+                        let _ = reply.send(result);
+                    }
+                });
+
+                // Collect policies under a short-lived read guard to
+                // avoid holding the RwLock across await points.
+                let policies: Vec<SamplingPolicy> =
+                    active_policy_list.read().await.values().cloned().collect();
+                for policy in policies {
                     if let Err(e) = process_network_stream(
                         conn.clone(),
                         series_send.clone(),
-                        policy.clone(),
-                        req_send.clone(),
+                        policy,
+                        stream_tx.clone(),
                         connection_notify.clone(),
                         active_policy_list.clone(),
                         delete_policy_ids.clone(),
@@ -347,7 +368,7 @@ async fn publish_connection_control(
                                 conn.clone(),
                                 series_send.clone(),
                                 policy,
-                                req_send.clone(),
+                                stream_tx.clone(),
                                 connection_notify.clone(),
                                 active_policy_list.clone(),
                                 delete_policy_ids.clone(),
@@ -438,7 +459,7 @@ async fn process_network_stream(
     conn: Connection,
     sender: Sender<TimeSeries>,
     policy: SamplingPolicy,
-    send: Arc<Mutex<SendStream>>,
+    stream_tx: tokio::sync::mpsc::Sender<StreamSendRequest>,
     connection_notify: Arc<Notify>,
     active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
@@ -457,13 +478,18 @@ async fn process_network_stream(
         record_type: RequestStreamRecord::from_ext(policy.kind),
         request: req_msg,
     };
-    // Acquire the lock, send the request, then release the lock
-    // before any further awaits. This avoids holding a MutexGuard
-    // across an await point.
-    {
-        let mut guard = send.lock().await;
-        send_stream_request(&mut guard, payload).await?;
-    }
+    // Send the payload to the actor task that owns the SendStream.
+    // This avoids holding any lock across an await point.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    stream_tx
+        .send((payload, reply_tx))
+        .await
+        .map_err(|_| anyhow::anyhow!("SendStream actor closed"))?;
+    reply_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("SendStream actor dropped reply"))??;
+
+    let recv_coordinator = coordinator.clone();
     coordinator.tracker().spawn(async move {
         receiver(
             conn,
@@ -472,6 +498,7 @@ async fn process_network_stream(
             active_policy_list,
             delete_policy_ids,
             last_series_time_path,
+            recv_coordinator,
         )
         .await
     });
@@ -486,49 +513,73 @@ async fn receiver(
     active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     last_series_time_path: PathBuf,
+    coordinator: ShutdownCoordinator,
 ) -> Result<()> {
-    if let Ok(mut recv) = conn.accept_uni().await {
-        let Ok(id) = receive_time_series_generator_stream_start_message(&mut recv).await else {
-            connection_notify.notify_waiters();
-            warn!("Failed to receive stream id value");
-            bail!("Failed to receive stream id value");
-        };
+    let recv_result = tokio::select! {
+        biased;
+        () = coordinator.cancelled() => return Ok(()),
+        result = conn.accept_uni() => result,
+    };
+    let Ok(mut recv) = recv_result else {
+        return Ok(());
+    };
 
-        let policy = if let Some(policy) = active_policy_list.read().await.get(&id) {
-            policy.clone()
-        } else {
-            bail!("Failed to get runtime policy data");
-        };
-        info!("Raw event {:?} has been connected", policy.kind);
-
-        let mut series = TimeSeries::try_new(&policy).await?;
-
-        loop {
-            if delete_policy_ids.read().await.contains(&id) {
-                recv.stop(VarInt::default())?;
-                delete_last_timestamp(&last_series_time_path, id)?;
-                delete_policy_ids
-                    .write()
-                    .await
-                    .retain(|&delete_id| delete_id != id);
-                break;
-            }
-            if let Ok((raw_event, timestamp)) = receive_time_series_generator_data(&mut recv).await
-            {
-                let time = Utc.timestamp_nanos(timestamp);
-                let Ok(event) = Event::try_new(policy.kind, &raw_event) else {
-                    warn!(
-                        "Failed to deserialize raw_event for sampling kind: {:?}",
-                        policy.kind
-                    );
-                    continue;
-                };
-                if let Err(e) = series.fill(&policy, time, &event, &sender).await {
-                    warn!("Failed to generate time series: {}", e);
-                }
+    let id = tokio::select! {
+        biased;
+        () = coordinator.cancelled() => return Ok(()),
+        result = receive_time_series_generator_stream_start_message(&mut recv) => {
+            if let Ok(id) = result {
+                id
             } else {
                 connection_notify.notify_waiters();
+                warn!("Failed to receive stream id value");
+                bail!("Failed to receive stream id value");
+            }
+        }
+    };
+
+    let policy = if let Some(policy) = active_policy_list.read().await.get(&id) {
+        policy.clone()
+    } else {
+        bail!("Failed to get runtime policy data");
+    };
+    info!("Raw event {:?} has been connected", policy.kind);
+
+    let mut series = TimeSeries::try_new(&policy).await?;
+
+    loop {
+        if delete_policy_ids.read().await.contains(&id) {
+            recv.stop(VarInt::default())?;
+            delete_last_timestamp(&last_series_time_path, id)?;
+            delete_policy_ids
+                .write()
+                .await
+                .retain(|&delete_id| delete_id != id);
+            break;
+        }
+        tokio::select! {
+            biased;
+            () = coordinator.cancelled() => {
+                info!("Receiver for policy {id} shutting down");
                 break;
+            }
+            result = receive_time_series_generator_data(&mut recv) => {
+                if let Ok((raw_event, timestamp)) = result {
+                    let time = Utc.timestamp_nanos(timestamp);
+                    let Ok(event) = Event::try_new(policy.kind, &raw_event) else {
+                        warn!(
+                            "Failed to deserialize raw_event for sampling kind: {:?}",
+                            policy.kind
+                        );
+                        continue;
+                    };
+                    if let Err(e) = series.fill(&policy, time, &event, &sender).await {
+                        warn!("Failed to generate time series: {}", e);
+                    }
+                } else {
+                    connection_notify.notify_waiters();
+                    break;
+                }
             }
         }
     }
@@ -576,13 +627,28 @@ async fn send_time_series(
         sampling_policy_id,
         time_sender,
         connection_notify,
+        coordinator.clone(),
     ));
 
     // Data transmission after the first time (only series data)
-    while let Ok(series) = recv_channel.recv().await {
-        let serde_series = bincode::serialize(&series)?;
-        let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
-        send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
+    loop {
+        tokio::select! {
+            biased;
+            () = coordinator.cancelled() => {
+                info!("send_time_series shutting down");
+                break;
+            }
+            result = recv_channel.recv() => {
+                match result {
+                    Ok(series) => {
+                        let serde_series = bincode::serialize(&series)?;
+                        let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
+                        send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -598,9 +664,18 @@ async fn receive_time_series_timestamp(
     sampling_policy_id: String,
     time_sender: Sender<(String, i64)>,
     connection_notify: Arc<Notify>,
+    coordinator: ShutdownCoordinator,
 ) -> Result<()> {
     loop {
-        match receive_ack_timestamp(&mut receiver).await {
+        let ack = tokio::select! {
+            biased;
+            () = coordinator.cancelled() => {
+                info!("receive_time_series_timestamp shutting down");
+                break;
+            }
+            result = receive_ack_timestamp(&mut receiver) => result,
+        };
+        match ack {
             Ok(timestamp) => {
                 debug!(
                     "The time of the timeseries last sent by {}. : {}",

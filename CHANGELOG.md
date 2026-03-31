@@ -30,6 +30,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   All spawned tasks are now tracked and drained before the
   process exits or restarts, preventing detached background
   work.
+- Scenario-level tests verifying that shutdown drains all
+  tasks, timestamp flush completes, and restart-time state
+  remains consistent.
 
 ### Changed
 
@@ -39,12 +42,30 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Timestamp file (`time_data.json`) writes are now atomic
   (write-to-temp then rename), preventing partial writes on
   crash.
+- Replaced `Arc<Mutex<SendStream>>` with a channel-based
+  actor task that owns the `SendStream`, fully eliminating the
+  lock-across-await pattern in the publish serialisation path.
+- Child tasks (`receiver`, `send_time_series`,
+  `write_last_timestamp`, `receive_time_series_timestamp`) now
+  observe the cancellation token and exit cooperatively,
+  guaranteeing deterministic drain on shutdown.
+- `write_last_timestamp` drains remaining channel items and
+  flushes to disk on cancellation, ensuring timestamp
+  persistence before exit.
+- `run()` now returns an error when drain times out, so the
+  top-level loop cannot report shutdown complete while child
+  tasks are still alive.
 
 ### Fixed
 
 - Fixed lock-across-await in `SendStream` serialisation path
-  (`subscribe.rs`) where a `Mutex` guard was held across an
-  `.await` point, risking deadlock under contention.
+  (`subscribe.rs`) by replacing the `Mutex`-guarded stream
+  with a channel-based actor, eliminating any `MutexGuard`
+  held across `.await` points.
+- Fixed lock-across-await in `publish_connection_control`
+  where the `active_policy_list` read guard was held across
+  `process_network_stream` await calls. Policies are now
+  collected into a `Vec` under a short-lived guard.
 
 - Automatically create `last_timestamp_data` file with an empty
   JSON object (`{}`) on startup when it does not exist, so
