@@ -590,6 +590,13 @@ pub(crate) fn ensure_time_data_exists(path: &Path) -> std::io::Result<()> {
     time_series::ensure_time_data_exists(path)
 }
 
+/// Clears all cached senders from the global ingest channel map.
+/// Should be called after top-level drain has completed to ensure no
+/// stale senders survive into a subsequent run.
+pub(crate) async fn clear_ingest_channel() {
+    INGEST_CHANNEL.write().await.clear();
+}
+
 pub(crate) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
     time_series::read_last_timestamp(last_series_time_path).await
 }
@@ -624,7 +631,7 @@ async fn send_time_series(
     // Receive start time of giganto last saved time series.
     coordinator.tracker().spawn(receive_time_series_timestamp(
         series_receiver,
-        sampling_policy_id,
+        sampling_policy_id.clone(),
         time_sender,
         connection_notify,
         coordinator.clone(),
@@ -650,6 +657,9 @@ async fn send_time_series(
             }
         }
     }
+    // Remove this task's sender from the global channel map so stale
+    // senders do not survive into subsequent runs.
+    INGEST_CHANNEL.write().await.remove(&sampling_policy_id);
     Ok(())
 }
 
@@ -658,6 +668,10 @@ async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -
     send_raw(send, &buf).await?;
     Ok(())
 }
+
+/// Short grace period for draining remaining ACK/timestamp messages
+/// after cancellation is signalled, so near-shutdown arrivals are not lost.
+const ACK_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 async fn receive_time_series_timestamp(
     mut receiver: RecvStream,
@@ -670,8 +684,39 @@ async fn receive_time_series_timestamp(
         let ack = tokio::select! {
             biased;
             () = coordinator.cancelled() => {
+                info!("receive_time_series_timestamp draining before shutdown");
+                // Drain any ACK/timestamp messages that arrived around
+                // cancellation so they are forwarded to
+                // write_last_timestamp before exit.
+                let drain_deadline = tokio::time::Instant::now() + ACK_DRAIN_TIMEOUT;
+                loop {
+                    let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, receive_ack_timestamp(&mut receiver)).await {
+                        Ok(Ok(timestamp)) => {
+                            debug!(
+                                "Drain: ACK timestamp for {}: {}",
+                                sampling_policy_id,
+                                Utc.timestamp_nanos(timestamp)
+                            );
+                            // Best-effort forward; if the channel is
+                            // closed we stop draining.
+                            if time_sender
+                                .send((sampling_policy_id.clone(), timestamp))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        // Stream finished or error — nothing left to drain.
+                        Ok(Err(_)) | Err(_) => break,
+                    }
+                }
                 info!("receive_time_series_timestamp shutting down");
-                break;
+                return Ok(());
             }
             result = receive_ack_timestamp(&mut receiver) => result,
         };

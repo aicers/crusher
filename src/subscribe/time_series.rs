@@ -104,7 +104,14 @@ impl TimeSeries {
         let period = i64::try_from(policy.period.as_secs())?;
 
         if time.timestamp() - self.start.timestamp() > period {
-            if let Some(sender) = INGEST_CHANNEL.read().await.get(&self.sampling_policy_id) {
+            // Clone the sender out of the lock to avoid holding the
+            // RwLock read guard across an await point.
+            let cached_sender = INGEST_CHANNEL
+                .read()
+                .await
+                .get(&self.sampling_policy_id)
+                .cloned();
+            if let Some(sender) = cached_sender {
                 sender.send(self.clone()).await?;
             } else {
                 send_channel.send(self.clone()).await?;
@@ -175,10 +182,26 @@ pub(super) async fn write_last_timestamp(
         let item = tokio::select! {
             biased;
             () = coordinator.cancelled() => {
-                // Drain any remaining items in the channel before
-                // exiting so timestamps are flushed to disk.
-                while let Ok((id, timestamp)) = time_receiver.try_recv() {
-                    LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
+                // Drain remaining items in the channel before exiting
+                // so timestamps are flushed to disk.  Use a short
+                // timeout to catch in-flight messages that
+                // receive_time_series_timestamp is still forwarding
+                // during its own post-cancellation drain window.
+                let drain_deadline = tokio::time::Instant::now()
+                    + tokio::time::Duration::from_millis(600);
+                loop {
+                    let remaining = drain_deadline
+                        .saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, time_receiver.recv()).await {
+                        Ok(Ok((id, timestamp))) => {
+                            LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
+                        }
+                        // Channel closed or timed out — done draining.
+                        Ok(Err(_)) | Err(_) => break,
+                    }
                 }
                 atomic_write_timestamp_file(
                     &last_series_time_path,

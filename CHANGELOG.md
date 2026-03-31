@@ -58,6 +58,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed lock-across-await in `TimeSeries::fill()` where the
+  `INGEST_CHANNEL` read guard was held across the
+  `sender.send().await` call. The sender is now cloned out of
+  the lock before awaiting.
 - Fixed lock-across-await in `SendStream` serialisation path
   (`subscribe.rs`) by replacing the `Mutex`-guarded stream
   with a channel-based actor, eliminating any `MutexGuard`
@@ -66,6 +70,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   where the `active_policy_list` read guard was held across
   `process_network_stream` await calls. Policies are now
   collected into a `Vec` under a short-lived guard.
+- Fixed `INGEST_CHANNEL` stale-sender leak: each
+  `send_time_series` task now removes its sender on exit, and
+  the global map is cleared after top-level drain completes so
+  no previous-run channels survive into subsequent runs.
+- Fixed `receive_time_series_timestamp` exiting immediately on
+  cancellation without draining in-flight ACK/timestamp
+  messages. A short post-cancellation drain window now
+  forwards remaining messages to `write_last_timestamp` before
+  exit. The `write_last_timestamp` drain was likewise
+  strengthened to use a timed receive loop instead of a
+  non-blocking `try_recv`, ensuring it captures in-flight
+  messages from the drain window.
 
 - Automatically create `last_timestamp_data` file with an empty
   JSON object (`{}`) on startup when it does not exist, so

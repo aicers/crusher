@@ -19,7 +19,7 @@ use logging::init_tracing;
 use review_protocol::types::SamplingPolicy;
 use settings::Settings;
 use shutdown::ShutdownCoordinator;
-use subscribe::{ensure_time_data_exists, read_last_timestamp};
+use subscribe::{clear_ingest_channel, ensure_time_data_exists, read_last_timestamp};
 use tokio::sync::Notify;
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -215,5 +215,8 @@ async fn run(
             "Shutdown drain timed out; child tasks may still be running"
         ));
     }
+    // Clear stale senders so no previous-run channels leak into a
+    // subsequent run (e.g. after a config-reload restart).
+    clear_ingest_channel().await;
     result
 }
