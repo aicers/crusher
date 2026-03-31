@@ -19,7 +19,7 @@ impl TaskTracker {
     }
 
     /// Spawns a tracked task. The task is registered so that
-    /// [`Self::wait`] can be used to wait for it to complete.
+    /// [`Self::close_and_wait`] can be used to wait for it to complete.
     pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
