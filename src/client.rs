@@ -580,6 +580,137 @@ mod tests {
         (client_bundle, cert_setup)
     }
 
+    /// A Bootroot-style certificate bundle with a 3-tier chain:
+    /// `leaf <- intermediate <- root`.
+    ///
+    /// The CA bundle is a **single file** containing both intermediate + root
+    /// PEM blocks, matching the Bootroot CA bundle format.
+    ///
+    /// This fixture is the primary acceptance test for Bootroot path coverage.
+    #[fixture]
+    fn tls_bundle_bootroot_ca_bundle() -> (TlsBundle, ServerCertsSetup) {
+        let (root_cert, root_key_pair) =
+            generate_key_pair_and_self_signed_cert("root-ca", &["root-ca"], 365);
+        let (intermediate_cert, intermediate_key_pair) =
+            generate_intermediate_key_pair_and_signed_cert_by_issuer(
+                "intermediate-ca",
+                &["intermediate-ca"],
+                365,
+                &root_cert,
+                &root_key_pair,
+            );
+        let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
+            "crusher@localhost",
+            &["localhost"],
+            365,
+            &intermediate_cert,
+            &intermediate_key_pair,
+        );
+
+        // CA bundle: intermediate + root in a single PEM file (Bootroot style)
+        let ca_bundle_pem = bundle_pem(&[
+            intermediate_cert.pem().into_bytes(),
+            root_cert.pem().into_bytes(),
+        ]);
+
+        let client_bundle = TlsBundle {
+            fullchain_cert_pem: bundle_pem(&[
+                leaf_cert.pem().into_bytes(),
+                intermediate_cert.pem().into_bytes(),
+            ]),
+            key_pem: leaf_key_pair.serialize_pem().into_bytes(),
+            ca_cert_pems: vec![ca_bundle_pem],
+        };
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: root_cert,
+            server_issuer_cert: intermediate_cert,
+            server_issuer_key: intermediate_key_pair,
+        };
+
+        (client_bundle, cert_setup)
+    }
+
+    /// A Bootroot-style 3-tier chain with CA certs provided as **separate files**
+    /// (split-file format): one file for intermediate, one for root.
+    ///
+    /// This is a backward-compatibility test, distinct from the Bootroot bundle
+    /// acceptance test above.
+    #[fixture]
+    fn tls_bundle_bootroot_split_ca_files() -> (TlsBundle, ServerCertsSetup) {
+        let (root_cert, root_key_pair) =
+            generate_key_pair_and_self_signed_cert("root-ca", &["root-ca"], 365);
+        let (intermediate_cert, intermediate_key_pair) =
+            generate_intermediate_key_pair_and_signed_cert_by_issuer(
+                "intermediate-ca",
+                &["intermediate-ca"],
+                365,
+                &root_cert,
+                &root_key_pair,
+            );
+        let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
+            "crusher@localhost",
+            &["localhost"],
+            365,
+            &intermediate_cert,
+            &intermediate_key_pair,
+        );
+
+        // CA certs as separate files (split-file compatibility)
+        let client_bundle = bundle(
+            [&leaf_cert, &intermediate_cert],
+            &leaf_key_pair,
+            [&intermediate_cert, &root_cert],
+        );
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: root_cert,
+            server_issuer_cert: intermediate_cert,
+            server_issuer_key: intermediate_key_pair,
+        };
+
+        (client_bundle, cert_setup)
+    }
+
+    /// A Bootroot-style 3-tier chain where the client sends **only the leaf**
+    /// in its fullchain (no intermediate) and the CA bundle has only root.
+    ///
+    /// The server cannot build the full trust chain from leaf to root because
+    /// the intermediate is missing from both the client's fullchain and the
+    /// server's verification path.
+    #[fixture]
+    fn tls_bundle_bootroot_missing_intermediate_in_ca() -> (TlsBundle, ServerCertsSetup) {
+        let (root_cert, root_key_pair) =
+            generate_key_pair_and_self_signed_cert("root-ca", &["root-ca"], 365);
+        let (intermediate_cert, intermediate_key_pair) =
+            generate_intermediate_key_pair_and_signed_cert_by_issuer(
+                "intermediate-ca",
+                &["intermediate-ca"],
+                365,
+                &root_cert,
+                &root_key_pair,
+            );
+        let (leaf_cert, leaf_key_pair) = generate_leaf_key_pair_and_signed_cert_by_issuer(
+            "crusher@localhost",
+            &["localhost"],
+            365,
+            &intermediate_cert,
+            &intermediate_key_pair,
+        );
+
+        // Fullchain: leaf only (no intermediate), CA bundle: root only
+        let client_bundle = TlsBundle {
+            fullchain_cert_pem: leaf_cert.pem().into_bytes(),
+            key_pem: leaf_key_pair.serialize_pem().into_bytes(),
+            ca_cert_pems: vec![root_cert.pem().into_bytes()],
+        };
+        let cert_setup = ServerCertsSetup {
+            client_trust_root: root_cert,
+            server_issuer_cert: intermediate_cert,
+            server_issuer_key: intermediate_key_pair,
+        };
+
+        (client_bundle, cert_setup)
+    }
+
     #[fixture]
     fn tls_bundle_valid_fullchain_different_ca_certs() -> (TlsBundle, ServerCertsSetup) {
         let (ca_cert, ca_key_pair) =
@@ -753,6 +884,8 @@ mod tests {
     #[case::various_san(tls_bundle_valid_fullchain_various_leaf_san().0.fullchain_cert_pem, 2)]
     #[case::diff_ca(tls_bundle_valid_fullchain_different_ca_certs().0.fullchain_cert_pem, 2)]
     #[case::short_days(tls_bundle_valid_fullchain_short_valid_days().0.fullchain_cert_pem, 2)]
+    #[case::bootroot_bundle(tls_bundle_bootroot_ca_bundle().0.fullchain_cert_pem, 2)]
+    #[case::bootroot_split(tls_bundle_bootroot_split_ca_files().0.fullchain_cert_pem, 2)]
     fn to_cert_chain_success(#[case] fullchain_cert_pem: Vec<u8>, #[case] expected_len: usize) {
         let certs =
             Certs::to_cert_chain(&fullchain_cert_pem).expect("Should parse test certificate");
@@ -788,6 +921,8 @@ mod tests {
     #[case::various_san(tls_bundle_valid_fullchain_various_leaf_san().0.key_pem)]
     #[case::diff_ca(tls_bundle_valid_fullchain_different_ca_certs().0.key_pem)]
     #[case::short_days(tls_bundle_valid_fullchain_short_valid_days().0.key_pem)]
+    #[case::bootroot_bundle(tls_bundle_bootroot_ca_bundle().0.key_pem)]
+    #[case::bootroot_split(tls_bundle_bootroot_split_ca_files().0.key_pem)]
     fn to_private_key_success(#[case] key_pem: Vec<u8>) {
         let key = Certs::to_private_key(&key_pem).expect("Should parse test private key");
         assert!(
@@ -821,6 +956,8 @@ mod tests {
     #[case::various_san(tls_bundle_valid_fullchain_various_leaf_san().0.ca_cert_pems, 1)]
     #[case::diff_ca(tls_bundle_valid_fullchain_different_ca_certs().0.ca_cert_pems, 3)]
     #[case::short_days(tls_bundle_valid_fullchain_short_valid_days().0.ca_cert_pems, 1)]
+    #[case::bootroot_bundle(tls_bundle_bootroot_ca_bundle().0.ca_cert_pems, 2)]
+    #[case::bootroot_split(tls_bundle_bootroot_split_ca_files().0.ca_cert_pems, 2)]
     fn to_ca_certs_success(#[case] ca_certs_pem: Vec<Vec<u8>>, #[case] expected_len: usize) {
         let root_store = Certs::to_ca_certs(
             &ca_certs_pem
@@ -876,6 +1013,8 @@ mod tests {
     #[case::various_san(tls_bundle_valid_fullchain_various_leaf_san(), 2, 1)]
     #[case::diff_ca(tls_bundle_valid_fullchain_different_ca_certs(), 2, 3)]
     #[case::short_days(tls_bundle_valid_fullchain_short_valid_days(), 2, 1)]
+    #[case::bootroot_bundle(tls_bundle_bootroot_ca_bundle(), 2, 2)]
+    #[case::bootroot_split(tls_bundle_bootroot_split_ca_files(), 2, 2)]
     fn try_new_success(
         #[case] (tls_bundle, _): (TlsBundle, ServerCertsSetup),
         #[case] expected_certs_len: usize,
@@ -915,6 +1054,8 @@ mod tests {
     #[case::various_san(tls_bundle_valid_fullchain_various_leaf_san())]
     #[case::diff_ca(tls_bundle_valid_fullchain_different_ca_certs())]
     #[case::short_days(tls_bundle_valid_fullchain_short_valid_days())]
+    #[case::bootroot_bundle(tls_bundle_bootroot_ca_bundle())]
+    #[case::bootroot_split(tls_bundle_bootroot_split_ca_files())]
     async fn config_creates_endpoint_success(
         #[case] (tls_bundle, _): (TlsBundle, ServerCertsSetup),
     ) {
@@ -942,6 +1083,8 @@ mod tests {
     #[case::various_san(tls_bundle_valid_fullchain_various_leaf_san())]
     #[case::diff_ca(tls_bundle_valid_fullchain_different_ca_certs())]
     #[case::short_days(tls_bundle_valid_fullchain_short_valid_days())]
+    #[case::bootroot_bundle(tls_bundle_bootroot_ca_bundle())]
+    #[case::bootroot_split(tls_bundle_bootroot_split_ca_files())]
     async fn handshake_success(#[case] (client_bundle, cert_setup): (TlsBundle, ServerCertsSetup)) {
         let result = handshake(client_bundle, cert_setup).await;
         assert!(result.is_ok(), "Handshake result should be successful");
@@ -954,8 +1097,139 @@ mod tests {
     #[case::empty_ca(tls_bundle_empty_ca_certs())]
     #[case::wrong_order(tls_bundle_wrong_chain_order())]
     #[case::key_mismatch(tls_bundle_leaf_key_not_matching_cert())]
+    #[case::bootroot_missing_intermediate(tls_bundle_bootroot_missing_intermediate_in_ca())]
     async fn handshake_failure(#[case] (client_bundle, cert_setup): (TlsBundle, ServerCertsSetup)) {
         let result = handshake(client_bundle, cert_setup).await;
         assert!(result.is_err(), "Handshake result should be an error");
+    }
+
+    // =========================================================================
+    // Bootroot Acceptance Tests
+    //
+    // These tests verify Bootroot-style CA bundle handling: a single file
+    // containing intermediate + root PEM blocks. They are designed to catch
+    // regressions to first-PEM-only parsing.
+    // =========================================================================
+
+    /// Acceptance test: a single CA bundle file with intermediate + root must
+    /// produce exactly 2 CA certificates. A first-PEM-only parser would yield
+    /// only 1, causing this test to fail.
+    #[test]
+    fn bootroot_ca_bundle_loads_all_pem_blocks() {
+        let (bundle, _) = tls_bundle_bootroot_ca_bundle();
+
+        // The CA bundle is a single file; verify exactly 1 entry in the list
+        assert_eq!(
+            bundle.ca_cert_pems.len(),
+            1,
+            "Bootroot CA bundle should be a single file"
+        );
+
+        let root_store =
+            Certs::to_ca_certs(&bundle.ca_certs()).expect("Should parse Bootroot CA bundle");
+
+        // This is the key assertion: must be 2 (intermediate + root), not 1
+        assert_eq!(
+            root_store.len(),
+            2,
+            "Bootroot CA bundle must contain both intermediate and root; \
+             a first-PEM-only parser would return 1"
+        );
+    }
+
+    /// Acceptance test: the full Bootroot chain (leaf <- intermediate <- root)
+    /// with a combined CA bundle must complete a TLS handshake successfully.
+    #[tokio::test]
+    async fn bootroot_ca_bundle_handshake_succeeds() {
+        let (client_bundle, cert_setup) = tls_bundle_bootroot_ca_bundle();
+        let result = handshake(client_bundle, cert_setup).await;
+        assert!(
+            result.is_ok(),
+            "Bootroot CA bundle handshake should succeed: {result:?}"
+        );
+    }
+
+    /// Negative test: a CA bundle missing the intermediate (root only) must
+    /// fail the handshake because the trust chain is incomplete.
+    #[tokio::test]
+    async fn bootroot_missing_intermediate_handshake_fails() {
+        let (client_bundle, cert_setup) = tls_bundle_bootroot_missing_intermediate_in_ca();
+        let result = handshake(client_bundle, cert_setup).await;
+        assert!(
+            result.is_err(),
+            "Handshake should fail when intermediate is missing from CA bundle"
+        );
+    }
+
+    // =========================================================================
+    // Disk-based Integration Tests
+    //
+    // These tests exercise the runtime loading path by writing PEM fixtures
+    // to disk and reading them back through the same code paths used by main().
+    // =========================================================================
+
+    /// Integration test: write Bootroot-style cert/key/CA bundle to temp files,
+    /// read them back via `fs::read`, and construct `Certs` through the same
+    /// path used by the application entrypoint.
+    #[test]
+    fn bootroot_disk_round_trip_ca_bundle() {
+        let (bundle, _) = tls_bundle_bootroot_ca_bundle();
+        let dir = tempfile::tempdir().expect("Should create temp dir");
+
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let ca_bundle_path = dir.path().join("ca_bundle.pem");
+
+        std::fs::write(&cert_path, bundle.fullchain_cert()).expect("write cert");
+        std::fs::write(&key_path, bundle.key()).expect("write key");
+        std::fs::write(&ca_bundle_path, &bundle.ca_cert_pems[0]).expect("write CA bundle");
+
+        // Read back from disk (same as main.rs entrypoint)
+        let cert_pem = std::fs::read(&cert_path).expect("read cert");
+        let key_pem = std::fs::read(&key_path).expect("read key");
+        let ca_pem = std::fs::read(&ca_bundle_path).expect("read CA bundle");
+        let ca_slices: Vec<&[u8]> = vec![ca_pem.as_slice()];
+
+        let certs = Certs::try_new(&cert_pem, &key_pem, &ca_slices)
+            .expect("Should parse Bootroot certs from disk");
+
+        assert_eq!(certs.certs.len(), 2, "leaf + intermediate in cert chain");
+        assert_eq!(certs.ca_certs.len(), 2, "intermediate + root in CA store");
+    }
+
+    /// Integration test: write split CA files to disk and read them back.
+    #[test]
+    fn bootroot_disk_round_trip_split_ca_files() {
+        let (bundle, _) = tls_bundle_bootroot_split_ca_files();
+        let dir = tempfile::tempdir().expect("Should create temp dir");
+
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+
+        std::fs::write(&cert_path, bundle.fullchain_cert()).expect("write cert");
+        std::fs::write(&key_path, bundle.key()).expect("write key");
+
+        // Write each CA cert to a separate file (split-file format)
+        let mut ca_paths = Vec::new();
+        for (i, ca_pem) in bundle.ca_cert_pems.iter().enumerate() {
+            let path = dir.path().join(format!("ca_{i}.pem"));
+            std::fs::write(&path, ca_pem).expect("write CA cert");
+            ca_paths.push(path);
+        }
+
+        // Read back from disk
+        let cert_pem = std::fs::read(&cert_path).expect("read cert");
+        let key_pem = std::fs::read(&key_path).expect("read key");
+        let ca_pems: Vec<Vec<u8>> = ca_paths
+            .iter()
+            .map(|p| std::fs::read(p).expect("read CA cert"))
+            .collect();
+        let ca_slices: Vec<&[u8]> = ca_pems.iter().map(Vec::as_slice).collect();
+
+        let certs = Certs::try_new(&cert_pem, &key_pem, &ca_slices)
+            .expect("Should parse split CA certs from disk");
+
+        assert_eq!(certs.certs.len(), 2, "leaf + intermediate in cert chain");
+        assert_eq!(certs.ca_certs.len(), 2, "two separate CA certs loaded");
     }
 }

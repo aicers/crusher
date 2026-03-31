@@ -16,6 +16,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 
 - Updated `review-protocol` dependency to rev `c284fa6`.
+- Bootroot-style integration tests for the data-store TLS
+  path covering a 3-tier chain (`leaf <- intermediate <- root`)
+  with combined and split CA bundle formats, disk round-trip
+  verification, and a regression guard against first-PEM-only
+  parsing.
 
 ### Fixed
 
