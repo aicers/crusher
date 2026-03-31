@@ -1149,10 +1149,14 @@ mod tests {
             if let Some(conn) = server_endpoint.accept().await {
                 let connection = conn.await.expect("accept connection");
                 let addr = connection.remote_address();
-                let _agent_info =
-                    review_protocol::server::handshake(&connection, addr, ">=0", "0.47.0")
-                        .await
-                        .expect("handshake");
+                let _agent_info = review_protocol::server::handshake(
+                    &connection,
+                    addr,
+                    ">=0",
+                    REQUIRED_MANAGER_VERSION,
+                )
+                .await
+                .expect("handshake");
 
                 let mut handler = TestManagerHandler;
                 while let Ok((mut send, mut recv)) = connection.accept_bi().await {
