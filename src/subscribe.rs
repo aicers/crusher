@@ -670,10 +670,10 @@ async fn send_time_series(
     // registered by a reconnect).
     send_channel_token.close();
     let mut map = INGEST_CHANNEL.write().await;
-    if let Some(existing) = map.get(&sampling_policy_id) {
-        if existing.is_closed() {
-            map.remove(&sampling_policy_id);
-        }
+    if let Some(existing) = map.get(&sampling_policy_id)
+        && existing.is_closed()
+    {
+        map.remove(&sampling_policy_id);
     }
     drop(map);
 
