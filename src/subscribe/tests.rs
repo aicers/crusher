@@ -786,6 +786,85 @@ async fn shutdown_flushes_timestamps() {
     }
 }
 
+/// Test: In-flight ACK/timestamp messages sent near the shutdown
+/// boundary are captured by the drain window and flushed to disk.
+///
+/// The publish server sends 3 ACKs with 200ms gaps. We shut down
+/// immediately after the first ACK notification, so the remaining
+/// ACKs arrive while `receive_time_series_timestamp` and
+/// `write_last_timestamp` are draining.  The final timestamp on disk
+/// must be >= the pre-shutdown value, proving the drain captured
+/// in-flight messages.
+#[serial]
+#[tokio::test]
+async fn shutdown_drain_captures_inflight_acks() {
+    reset_last_transfer_time().await;
+    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
+
+    let certs = cert_key();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
+        setup_request_client(1);
+    let policy = new_policy(DEFAULT_POLICY_ID);
+
+    request_client
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+
+    let (client_handle, coordinator) = spawn_subscribe_client(
+        &certs,
+        request_recv,
+        &last_time_series_path,
+        ingest_addr,
+        publish_addr,
+        &request_client,
+    );
+
+    // Wait for the first ACK only — more may still be in-flight.
+    let _ = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        .await
+        .expect("First ingest ACK should arrive within 5s");
+
+    // Record the timestamp that the first ACK produced.
+    let _ = timeout(
+        Duration::from_secs(5),
+        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
+    )
+    .await
+    .expect("Policy ID written to time_data.json");
+    let ts_before = read_time_data_map(&last_time_series_path)
+        .get(&policy.id.to_string())
+        .copied()
+        .expect("timestamp must exist for policy");
+
+    // Shut down immediately — remaining ACKs are in-flight.
+    coordinator.request_shutdown("inflight-ack drain test");
+    server_handles.ingest_shutdown.notify_one();
+    server_handles.publish_shutdown.notify_one();
+
+    let drained = coordinator.wait_for_drain(Duration::from_secs(10)).await;
+    assert!(drained, "Drain should complete within timeout");
+
+    let _ = tokio::join!(
+        client_handle,
+        server_handles.ingest_handle,
+        server_handles.publish_handle,
+    );
+    INGEST_CHANNEL.write().await.clear();
+
+    // The final timestamp on disk must be >= the pre-shutdown value,
+    // confirming that in-flight ACKs were captured by the drain.
+    let ts_after = read_time_data_map(&last_time_series_path)
+        .get(&policy.id.to_string())
+        .copied()
+        .expect("timestamp must survive shutdown");
+    assert!(
+        ts_after >= ts_before,
+        "Final timestamp ({ts_after}) must be >= pre-shutdown ({ts_before}); \
+         drain should not lose in-flight ACKs"
+    );
+}
+
 /// Test: After shutdown + simulated restart, time data is consistent
 /// and readable.
 #[serial]

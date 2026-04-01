@@ -183,23 +183,30 @@ pub(super) async fn write_last_timestamp(
             biased;
             () = coordinator.cancelled() => {
                 // Drain remaining items in the channel before exiting
-                // so timestamps are flushed to disk.  Use a short
-                // timeout to catch in-flight messages that
-                // receive_time_series_timestamp is still forwarding
-                // during its own post-cancellation drain window.
-                let drain_deadline = tokio::time::Instant::now()
-                    + tokio::time::Duration::from_millis(600);
+                // so timestamps are flushed to disk.  Wait for channel
+                // closure (all `receive_time_series_timestamp` senders
+                // dropped after their own drain) with a safety timeout
+                // to guarantee the writer outlasts the ACK receivers.
+                const WRITER_DRAIN_TIMEOUT: tokio::time::Duration =
+                    tokio::time::Duration::from_secs(2);
+                let drain_deadline =
+                    tokio::time::Instant::now() + WRITER_DRAIN_TIMEOUT;
                 loop {
                     let remaining = drain_deadline
                         .saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
+                        tracing::warn!(
+                            "write_last_timestamp drain timed out; \
+                             flushing what was collected"
+                        );
                         break;
                     }
                     match tokio::time::timeout(remaining, time_receiver.recv()).await {
                         Ok(Ok((id, timestamp))) => {
                             LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
                         }
-                        // Channel closed or timed out — done draining.
+                        // Channel closed (all senders dropped) — drain
+                        // complete.  Timeout — safety net exhausted.
                         Ok(Err(_)) | Err(_) => break,
                     }
                 }

@@ -612,55 +612,72 @@ async fn send_time_series(
     let sampling_policy_id = series.sampling_policy_id.clone();
     let (send_channel, recv_channel) =
         async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
+    // Keep a clone so we can identify our channel instance during cleanup.
+    let send_channel_token = send_channel.clone();
     INGEST_CHANNEL
         .write()
         .await
         .insert(sampling_policy_id.clone(), send_channel);
 
-    let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else {
-        bail!("Failed to open bi-direction QUIC channel");
-    };
+    let result = async {
+        let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else {
+            bail!("Failed to open bi-direction QUIC channel");
+        };
 
-    // First data transmission (record type + series data)
-    send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
+        // First data transmission (record type + series data)
+        send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
 
-    let serde_series = bincode::serialize(&series)?;
-    let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
-    send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
+        let serde_series = bincode::serialize(&series)?;
+        let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
+        send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
 
-    // Receive start time of giganto last saved time series.
-    coordinator.tracker().spawn(receive_time_series_timestamp(
-        series_receiver,
-        sampling_policy_id.clone(),
-        time_sender,
-        connection_notify,
-        coordinator.clone(),
-    ));
+        // Receive start time of giganto last saved time series.
+        coordinator.tracker().spawn(receive_time_series_timestamp(
+            series_receiver,
+            sampling_policy_id.clone(),
+            time_sender,
+            connection_notify,
+            coordinator.clone(),
+        ));
 
-    // Data transmission after the first time (only series data)
-    loop {
-        tokio::select! {
-            biased;
-            () = coordinator.cancelled() => {
-                info!("send_time_series shutting down");
-                break;
-            }
-            result = recv_channel.recv() => {
-                match result {
-                    Ok(series) => {
-                        let serde_series = bincode::serialize(&series)?;
-                        let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
-                        send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
+        // Data transmission after the first time (only series data)
+        loop {
+            tokio::select! {
+                biased;
+                () = coordinator.cancelled() => {
+                    info!("send_time_series shutting down");
+                    break;
+                }
+                result = recv_channel.recv() => {
+                    match result {
+                        Ok(series) => {
+                            let serde_series = bincode::serialize(&series)?;
+                            let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
+                            send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
+                        }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
             }
         }
+        Ok(())
     }
-    // Remove this task's sender from the global channel map so stale
-    // senders do not survive into subsequent runs.
-    INGEST_CHANNEL.write().await.remove(&sampling_policy_id);
-    Ok(())
+    .await;
+
+    // Always clean up on both success and error paths.
+    // Close our token to mark our channel instance, then only remove
+    // the entry if it is still our channel (not a newer sender
+    // registered by a reconnect).
+    send_channel_token.close();
+    let mut map = INGEST_CHANNEL.write().await;
+    if let Some(existing) = map.get(&sampling_policy_id) {
+        if existing.is_closed() {
+            map.remove(&sampling_policy_id);
+        }
+    }
+    drop(map);
+
+    result
 }
 
 async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -> Result<()> {
