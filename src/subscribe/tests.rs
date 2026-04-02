@@ -903,14 +903,68 @@ async fn restart_state_consistency() {
     .await
     .expect("Policy ID written to time_data.json");
 
-    // Shutdown
+    // Capture the timestamp written during the first run.
+    let first_run_map = read_time_data_map(&last_time_series_path);
+    let first_ts = *first_run_map
+        .get(&policy.id.to_string())
+        .expect("policy timestamp must exist after first run");
+
+    // Shutdown the first run.
     cleanup_test_resources(coordinator, client_handle, server_handles).await;
 
-    // Simulate restart: clear in-memory state and re-read from file.
-    reset_last_transfer_time().await;
+    // Verify the persisted file is readable after shutdown.
     let read_result = crate::subscribe::read_last_timestamp(&last_time_series_path).await;
     assert!(
         read_result.is_ok(),
         "Timestamp file must be readable after shutdown: {read_result:?}"
     );
+
+    // --- Second run: start fresh servers, rebuild in-memory state from the
+    // persisted timestamp file, and verify the policy/stream state survives. ---
+    reset_last_transfer_time().await;
+
+    let (ingest_ack_recv2, server_handles2, ingest_addr2, publish_addr2) = start_servers();
+
+    let (mut request_client2, request_recv2, _, _keep_dir) = setup_request_client(1);
+    // Re-use the same last_time_series_path so the second run picks up the
+    // persisted timestamps from the first run.
+
+    request_client2
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+
+    let (client_handle2, coordinator2) = spawn_subscribe_client(
+        &certs,
+        request_recv2,
+        &last_time_series_path,
+        ingest_addr2,
+        publish_addr2,
+        &request_client2,
+    );
+
+    let _ = timeout(Duration::from_secs(5), ingest_ack_recv2.recv())
+        .await
+        .expect("Ingest ACK should arrive within 5s on second run");
+
+    let _ = timeout(
+        Duration::from_secs(5),
+        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
+    )
+    .await
+    .expect("Policy ID present in time_data.json on second run");
+
+    // The second run must have loaded the timestamp from the first run;
+    // verify it is at least as large (time only moves forward).
+    let second_run_map = read_time_data_map(&last_time_series_path);
+    let second_ts = *second_run_map
+        .get(&policy.id.to_string())
+        .expect("policy timestamp must exist after second run");
+    assert!(
+        second_ts >= first_ts,
+        "Second-run timestamp ({second_ts}) must be >= first-run ({first_ts}); \
+         restart must not lose persisted state"
+    );
+
+    cleanup_test_resources(coordinator2, client_handle2, server_handles2).await;
 }

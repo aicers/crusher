@@ -211,6 +211,9 @@ async fn run(
     };
 
     if !coordinator.wait_for_drain(SHUTDOWN_DRAIN_TIMEOUT).await {
+        // Clear stale senders even on timeout so no previous-run channels
+        // leak into a subsequent run (e.g. after a config-reload restart).
+        clear_ingest_channel().await;
         return Err(anyhow::anyhow!(
             "Shutdown drain timed out; child tasks may still be running"
         ));

@@ -33,12 +33,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Scenario-level tests verifying that shutdown drains all
   tasks, timestamp flush completes, and restart-time state
   remains consistent.
-
-### Changed
-
-- Applied cancellation safety improvements for shutdown.
-  All spawned async tasks are now tracked, cooperatively
-  cancelled, and drained before the process exits or restarts.
 - Timestamp file writes are now atomic (write-to-temp then
   rename), preventing partial writes on crash.
 
@@ -46,8 +40,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Fixed lock-across-await patterns in `TimeSeries::fill()`,
   `SendStream` serialisation, and `publish_connection_control`.
-- Fixed `INGEST_CHANNEL` stale-sender cleanup on early exit
-  and reconnect.
+- Fixed `INGEST_CHANNEL` stale-sender cleanup on early exit,
+  reconnect, and shutdown-drain timeout.
 - Fixed in-flight ACK/timestamp messages being lost on
   shutdown.
 - Automatically create timestamp data file on startup when
