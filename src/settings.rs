@@ -5,18 +5,16 @@ use anyhow::{Context, Result};
 use config::{Config as cfg, ConfigBuilder, File, builder::DefaultState};
 use serde::{Deserialize, Deserializer, de::Error};
 
-const DEFAULT_GIGANTO_NAME: &str = "localhost";
 const DEFAULT_GIGANTO_INGEST_SRV_ADDR: &str = "[::]:38370";
-const DEFAULT_GIGANTO_PUBLISH_SRV_ADDR: &str = "[::]:38371";
 
 /// The application settings.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Settings {
-    pub(crate) giganto_name: String, // hostname of Giganto
+    pub(crate) giganto_name: Option<String>, // hostname of Giganto
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub(crate) giganto_ingest_srv_addr: SocketAddr, // IP address & port to giganto
-    #[serde(deserialize_with = "deserialize_socket_addr")]
-    pub(crate) giganto_publish_srv_addr: SocketAddr, // IP address & port to giganto
+    #[serde(default, deserialize_with = "deserialize_optional_socket_addr")]
+    pub(crate) giganto_publish_srv_addr: Option<SocketAddr>, // IP address & port to giganto
     pub(crate) last_timestamp_data: PathBuf, // Path to the last series timestamp data file
     pub(crate) log_path: Option<PathBuf>,
 }
@@ -38,6 +36,45 @@ impl Settings {
         s.try_deserialize()
             .context("failed to parse configuration file")
     }
+
+    /// Resolves the Giganto connection target name.
+    ///
+    /// If `giganto_name` is present (non-empty), it is used. Otherwise,
+    /// the IP from `giganto_publish_srv_addr` is used. If both are
+    /// absent, an error is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither `giganto_name` nor
+    /// `giganto_publish_srv_addr` is provided.
+    pub(crate) fn resolve_giganto_name(&self) -> Result<String> {
+        if let Some(name) = &self.giganto_name
+            && !name.trim().is_empty()
+        {
+            return Ok(name.clone());
+        }
+        if let Some(addr) = &self.giganto_publish_srv_addr {
+            return Ok(addr.ip().to_string());
+        }
+        anyhow::bail!(
+            "either `giganto_name` or `giganto_publish_srv_addr` must \
+             be provided in the configuration"
+        )
+    }
+
+    /// Returns the publish server address, if configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `giganto_publish_srv_addr` is not provided.
+    pub(crate) fn giganto_publish_srv_addr(&self) -> Result<SocketAddr> {
+        self.giganto_publish_srv_addr.ok_or_else(|| {
+            anyhow::anyhow!(
+                "`giganto_publish_srv_addr` must be provided in the \
+                 configuration"
+            )
+        })
+    }
 }
 
 impl FromStr for Settings {
@@ -58,12 +95,8 @@ impl FromStr for Settings {
 /// Creates a new `ConfigBuilder` instance with the default configuration.
 fn default_config_builder() -> ConfigBuilder<DefaultState> {
     cfg::builder()
-        .set_default("giganto_name", DEFAULT_GIGANTO_NAME)
-        .expect("verified by const data store's name")
         .set_default("giganto_ingest_srv_addr", DEFAULT_GIGANTO_INGEST_SRV_ADDR)
         .expect("verified by const data store's ingest server address")
-        .set_default("giganto_publish_srv_addr", DEFAULT_GIGANTO_PUBLISH_SRV_ADDR)
-        .expect("verified by const data store's publish server address")
 }
 
 /// Deserializes a socket address.
@@ -80,6 +113,26 @@ where
         .map_err(|e| D::Error::custom(format!("invalid address \"{addr}\": {e}")))
 }
 
+/// Deserializes an optional socket address.
+///
+/// # Errors
+///
+/// Returns an error if the address is present but not in the form of
+/// 'IP:PORT'.
+fn deserialize_optional_socket_addr<'de, D>(deserializer: D) -> Result<Option<SocketAddr>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let addr = Option::<String>::deserialize(deserializer)?;
+    match addr {
+        Some(a) => a
+            .parse()
+            .map(Some)
+            .map_err(|e| D::Error::custom(format!("invalid address \"{a}\": {e}"))),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -88,8 +141,9 @@ mod tests {
 
     use super::*;
 
-    /// Minimal TOML config with only the required field (`last_timestamp_data`).
-    /// All other fields should get their default values.
+    /// Minimal TOML config with only the required field
+    /// (`last_timestamp_data`). `giganto_name` and
+    /// `giganto_publish_srv_addr` are both absent.
     const MINIMAL_CONFIG: &str = r#"
 last_timestamp_data = "/tmp/timestamp.dat"
 "#;
@@ -116,20 +170,15 @@ last_timestamp_data = "/tmp/timestamp.dat"
         // Test that default values are injected when fields are omitted.
         let settings: Settings = MINIMAL_CONFIG.parse().expect("should parse minimal config");
 
-        // Check that defaults were injected
-        assert_eq!(settings.giganto_name, DEFAULT_GIGANTO_NAME);
+        // giganto_name and giganto_publish_srv_addr have no defaults
+        assert!(settings.giganto_name.is_none());
         assert_eq!(
             settings.giganto_ingest_srv_addr,
             DEFAULT_GIGANTO_INGEST_SRV_ADDR
                 .parse::<SocketAddr>()
                 .expect("valid default address")
         );
-        assert_eq!(
-            settings.giganto_publish_srv_addr,
-            DEFAULT_GIGANTO_PUBLISH_SRV_ADDR
-                .parse::<SocketAddr>()
-                .expect("valid default address")
-        );
+        assert!(settings.giganto_publish_srv_addr.is_none());
 
         // Check required field was parsed
         assert_eq!(
@@ -146,7 +195,7 @@ last_timestamp_data = "/tmp/timestamp.dat"
         // Test parsing a complete configuration with all fields specified.
         let settings: Settings = FULL_CONFIG.parse().expect("should parse full config");
 
-        assert_eq!(settings.giganto_name, "custom-host");
+        assert_eq!(settings.giganto_name.as_deref(), Some("custom-host"));
         assert_eq!(
             settings.giganto_ingest_srv_addr,
             "192.168.1.100:38370"
@@ -155,9 +204,11 @@ last_timestamp_data = "/tmp/timestamp.dat"
         );
         assert_eq!(
             settings.giganto_publish_srv_addr,
-            "192.168.1.100:38371"
-                .parse::<SocketAddr>()
-                .expect("valid address")
+            Some(
+                "192.168.1.100:38371"
+                    .parse::<SocketAddr>()
+                    .expect("valid address")
+            )
         );
         assert_eq!(
             settings.last_timestamp_data,
@@ -186,7 +237,7 @@ last_timestamp_data = "/tmp/timestamp.dat"
         let path = temp_file.path().to_str().expect("valid path");
         let settings = Settings::from_file(path).expect("should parse config from file");
 
-        assert_eq!(settings.giganto_name, "custom-host");
+        assert_eq!(settings.giganto_name.as_deref(), Some("custom-host"));
         assert_eq!(
             settings.giganto_ingest_srv_addr,
             "192.168.1.100:38370"
@@ -195,9 +246,11 @@ last_timestamp_data = "/tmp/timestamp.dat"
         );
         assert_eq!(
             settings.giganto_publish_srv_addr,
-            "192.168.1.100:38371"
-                .parse::<SocketAddr>()
-                .expect("valid address")
+            Some(
+                "192.168.1.100:38371"
+                    .parse::<SocketAddr>()
+                    .expect("valid address")
+            )
         );
         assert_eq!(
             settings.last_timestamp_data,
@@ -217,7 +270,8 @@ last_timestamp_data = "/tmp/timestamp.dat"
         let path = temp_file.path().to_str().expect("valid path");
         let settings = Settings::from_file(path).expect("should parse config from file");
 
-        assert_eq!(settings.giganto_name, DEFAULT_GIGANTO_NAME);
+        assert!(settings.giganto_name.is_none());
+        assert!(settings.giganto_publish_srv_addr.is_none());
         assert_eq!(
             settings.giganto_ingest_srv_addr,
             DEFAULT_GIGANTO_INGEST_SRV_ADDR
@@ -252,9 +306,11 @@ last_timestamp_data = "/tmp/ts.dat"
         );
         assert_eq!(
             settings.giganto_publish_srv_addr,
-            "10.0.0.1:9090"
-                .parse::<SocketAddr>()
-                .expect("valid address")
+            Some(
+                "10.0.0.1:9090"
+                    .parse::<SocketAddr>()
+                    .expect("valid address")
+            )
         );
     }
 
@@ -269,9 +325,11 @@ last_timestamp_data = "/tmp/ts.dat"
         );
         assert_eq!(
             settings.giganto_publish_srv_addr,
-            "[2001:db8::1]:38371"
-                .parse::<SocketAddr>()
-                .expect("valid address")
+            Some(
+                "[2001:db8::1]:38371"
+                    .parse::<SocketAddr>()
+                    .expect("valid address")
+            )
         );
     }
 
@@ -291,7 +349,7 @@ last_timestamp_data = "/tmp/ts.dat"
         );
         assert_eq!(
             settings.giganto_publish_srv_addr,
-            "[::]:38371".parse::<SocketAddr>().expect("valid address")
+            Some("[::]:38371".parse::<SocketAddr>().expect("valid address"))
         );
     }
 
@@ -487,6 +545,54 @@ giganto_name = "test"
         assert!(
             err_str.contains("last_timestamp_data") || err_str.contains("missing"),
             "error should mention missing field: {err_str}"
+        );
+    }
+
+    #[test]
+    fn resolve_giganto_name_only() {
+        let config = r#"
+giganto_name = "my-giganto"
+last_timestamp_data = "/tmp/ts.dat"
+"#;
+        let settings: Settings = config.parse().expect("valid config");
+        assert_eq!(settings.resolve_giganto_name().unwrap(), "my-giganto");
+    }
+
+    #[test]
+    fn resolve_giganto_publish_srv_addr_only() {
+        let config = r#"
+giganto_publish_srv_addr = "10.0.0.5:38371"
+last_timestamp_data = "/tmp/ts.dat"
+"#;
+        let settings: Settings = config.parse().expect("valid config");
+        assert_eq!(settings.resolve_giganto_name().unwrap(), "10.0.0.5");
+    }
+
+    #[test]
+    fn resolve_giganto_name_preferred_over_addr() {
+        let config = r#"
+giganto_name = "preferred-name"
+giganto_publish_srv_addr = "10.0.0.5:38371"
+last_timestamp_data = "/tmp/ts.dat"
+"#;
+        let settings: Settings = config.parse().expect("valid config");
+        assert_eq!(settings.resolve_giganto_name().unwrap(), "preferred-name");
+    }
+
+    #[test]
+    fn resolve_giganto_neither_set_returns_error() {
+        let config = r#"
+last_timestamp_data = "/tmp/ts.dat"
+"#;
+        let settings: Settings = config.parse().expect("valid config");
+        let err = settings.resolve_giganto_name().unwrap_err();
+        assert!(
+            err.to_string().contains("giganto_name"),
+            "error should mention giganto_name: {err}"
+        );
+        assert!(
+            err.to_string().contains("giganto_publish_srv_addr"),
+            "error should mention giganto_publish_srv_addr: {err}"
         );
     }
 }
