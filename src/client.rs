@@ -1097,7 +1097,7 @@ mod tests {
     #[case::empty_ca(tls_bundle_empty_ca_certs())]
     #[case::wrong_order(tls_bundle_wrong_chain_order())]
     #[case::key_mismatch(tls_bundle_leaf_key_not_matching_cert())]
-    #[case::bootroot_missing_intermediate(tls_bundle_bootroot_missing_intermediate_in_ca())]
+    #[case::bootroot_leaf_only_vs_root(tls_bundle_bootroot_missing_intermediate_in_ca())]
     async fn handshake_failure(#[case] (client_bundle, cert_setup): (TlsBundle, ServerCertsSetup)) {
         let result = handshake(client_bundle, cert_setup).await;
         assert!(result.is_err(), "Handshake result should be an error");
@@ -1149,15 +1149,17 @@ mod tests {
         );
     }
 
-    /// Negative test: a CA bundle missing the intermediate (root only) must
-    /// fail the handshake because the trust chain is incomplete.
+    /// Negative test: the client presents only the leaf certificate (no
+    /// intermediate) while the verifier trusts only the root. The handshake
+    /// must fail because the verifier cannot build a path from leaf to root
+    /// without the intermediate.
     #[tokio::test]
-    async fn bootroot_missing_intermediate_handshake_fails() {
+    async fn bootroot_leaf_only_fails_when_verifier_trusts_root() {
         let (client_bundle, cert_setup) = tls_bundle_bootroot_missing_intermediate_in_ca();
         let result = handshake(client_bundle, cert_setup).await;
         assert!(
             result.is_err(),
-            "Handshake should fail when intermediate is missing from CA bundle"
+            "Handshake should fail when client presents leaf-only and verifier trusts only root"
         );
     }
 
