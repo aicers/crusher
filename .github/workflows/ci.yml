@@ -27,7 +27,7 @@ jobs:
       - name: Detect Cargo.lock changes
         run: git diff-index --quiet HEAD --
       - name: markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@v18
+        uses: DavidAnson/markdownlint-cli2-action@v23
         with:
           globs: '**/*.md'
 
@@ -60,7 +60,7 @@ jobs:
       - name: Generate coverage report
         run: cargo tarpaulin --out xml
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         with:
