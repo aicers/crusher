@@ -165,11 +165,10 @@ async fn run(
         .context("Failed to initialize last timestamp data file")?;
     read_last_timestamp(&settings.last_timestamp_data).await?;
 
-    let giganto_name = settings.resolve_giganto_name()?;
-    let giganto_publish_srv_addr = settings.giganto_publish_srv_addr()?;
+    let giganto_name = settings.resolve_giganto_name();
     let subscribe_client = subscribe::Client::new(
         settings.giganto_ingest_srv_addr,
-        giganto_publish_srv_addr,
+        settings.giganto_publish_srv_addr,
         giganto_name,
         settings.last_timestamp_data,
         certs,

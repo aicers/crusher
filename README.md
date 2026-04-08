@@ -79,30 +79,21 @@ In the configuration file, you can specify the following options:
 | -------------------------- | ------------------------------------------------------------------------------- | -------- | ---------- |
 | `giganto_name`             | Name of the Giganto server                                                      | No       | -          |
 | `giganto_ingest_srv_addr`  | Giganto's ingest IP address and port number                                     | Yes      | [::]:38370 |
-| `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                    | No       | -          |
+| `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                    | Yes      | -          |
 | `last_timestamp_data`      | JSON file that stores the timestamp of the last time series per sampling policy | Yes      | -          |
 | `log_path`                 | Log file path                                                                   | No       | -          |
 
 <!-- markdownlint-enable MD013 -->
 
-- At least one of `giganto_name` or `giganto_publish_srv_addr` must be
-  provided. When both are present, `giganto_name` takes precedence
-  for the Giganto connection name.
+- `giganto_publish_srv_addr` is required. `giganto_name` is optional;
+  when present, it takes precedence for the Giganto connection name.
+  Otherwise, the IP from `giganto_publish_srv_addr` is used.
 - `giganto_name`: This must match with the DNS name in the certificate.
 - `log_path`: If not provided, logs are printed to stdout.
 
 ## Configuration Examples
 
-Using `giganto_name` only:
-
-```toml
-giganto_name = "localhost"
-giganto_ingest_srv_addr = "127.0.0.1:38370"
-giganto_publish_srv_addr = "127.0.0.1:38371"
-last_timestamp_data = "path/to/time_data.json"
-```
-
-Using `giganto_publish_srv_addr` only (the IP from the address is
+Without `giganto_name` (the IP from `giganto_publish_srv_addr` is
 used as the connection name):
 
 ```toml
@@ -111,7 +102,7 @@ giganto_publish_srv_addr = "127.0.0.1:38371"
 last_timestamp_data = "path/to/time_data.json"
 ```
 
-Using both (the `giganto_name` value is preferred):
+With `giganto_name` (takes precedence over the address IP):
 
 ```toml
 giganto_name = "my-giganto"
