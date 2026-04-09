@@ -12,7 +12,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'tests/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
+
   check:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Install Rust
@@ -32,6 +52,8 @@ jobs:
           globs: '**/*.md'
 
   test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

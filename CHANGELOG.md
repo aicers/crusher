@@ -8,6 +8,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Set up MkDocs documentation skeleton with the shared
+  `aicers/docs-theme`, including build scripts, CI workflow,
+  and markdown linting configuration.
 - On startup, previously registered `sampling_policy` entries
   are now automatically synchronized from the Manager using
   `get_sampling_policy_list`, allowing data collection to

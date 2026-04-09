@@ -114,6 +114,29 @@ last_timestamp_data = "path/to/time_data.json"
 log_path = "path/to/time_series_generator.log"
 ```
 
+## Documentation
+
+This project uses [MkDocs](https://www.mkdocs.org/) with the shared
+[aicers/docs-theme](https://github.com/aicers/docs-theme). To build
+the documentation locally:
+
+1. Install the [GitHub CLI](https://cli.github.com/) (`gh`) and
+   ensure `GH_TOKEN` is set or `gh auth login` has been completed.
+2. Fetch the shared theme:
+
+   ```sh
+   ./scripts/fetch-theme.sh
+   ```
+
+3. Install Python dependencies and build:
+
+   ```sh
+   pip install mkdocs-material
+   mkdocs build --strict
+   ```
+
+The generated site is written to `site/` (git-ignored).
+
 ## Copyright
 
 - Copyright 2023-2025 ClumL Inc.

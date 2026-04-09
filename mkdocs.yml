@@ -1,0 +1,24 @@
+site_name: Crusher
+site_description: Crusher documentation
+repo_url: https://github.com/aicers/crusher
+site_url: https://example.invalid/crusher
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.tracking
+    - search.highlight
+    - search.suggest
+
+plugins:
+  - search
+
+nav:
+  - Overview: index.md
+
+extra_css:
+  - .theme/styles/lists.css
+  - .theme/styles/pdf.css
