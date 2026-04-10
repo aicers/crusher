@@ -1,5 +1,6 @@
 mod client;
 mod logging;
+mod policy;
 mod request;
 mod settings;
 mod shutdown;
@@ -21,7 +22,7 @@ use settings::Settings;
 use shutdown::ShutdownCoordinator;
 use subscribe::{clear_ingest_channel, ensure_time_data_exists, read_last_timestamp};
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
 
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -110,7 +111,6 @@ async fn main() -> Result<()> {
     let mut request_client = request::Client::new(
         args.manager_server.rpc_srv_addr,
         args.manager_server.name.clone(),
-        request_send,
         cert_pem,
         key_pem,
         ca_certs_pem,
@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
             &args,
             &certs,
             request_client.clone(),
+            request_send.clone(),
             request_recv.clone(),
             config_reload.clone(),
             &mut guard,
@@ -146,6 +147,7 @@ async fn run(
     args: &CmdLineArgs,
     certs: &Certs,
     mut request_client: request::Client,
+    request_send: async_channel::Sender<SamplingPolicy>,
     request_recv: async_channel::Receiver<SamplingPolicy>,
     config_reload: Arc<Notify>,
     guard: &mut Option<WorkerGuard>,
@@ -182,26 +184,40 @@ async fn run(
 
     info!("Time series generate started");
     let coordinator = ShutdownCoordinator::new();
-    let tracker = coordinator.tracker().clone();
 
-    let subscribe_handle = tracker.spawn(subscribe_client.run(
-        request_client.active_policy_list.clone(),
-        request_client.delete_policy_ids.clone(),
-        coordinator.clone(),
-    ));
+    // Spawn the policy actor. All policy state mutations go through
+    // this handle, ensuring atomicity and cancellation safety.
+    let policy_handle = policy::spawn_policy_actor(request_send, &coordinator);
+    request_client.set_policy_handle(policy_handle.clone());
+
+    // Spawn top-level tasks with tokio::spawn (NOT tracker.spawn).
+    // run() explicitly owns these handles and drives them to
+    // completion, while TaskTracker is reserved for child/background
+    // tasks spawned inside subscribe and request.
+    let mut subscribe_handle =
+        tokio::spawn(subscribe_client.run(policy_handle, coordinator.clone()));
 
     let request_coordinator = coordinator.clone();
-    let request_handle =
-        tracker.spawn(async move { request_client.run(request_coordinator).await });
+    let mut request_handle =
+        tokio::spawn(async move { request_client.run(request_coordinator).await });
 
     let result = tokio::select! {
-        Ok(Err(e)) = subscribe_handle => {
-            coordinator.request_shutdown("subscribe error");
-            Err(e)
+        biased;
+        res = &mut subscribe_handle => {
+            coordinator.request_shutdown("subscribe exit");
+            match res {
+                Ok(Err(e)) => Err(e),
+                Ok(Ok(())) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!("subscribe task panicked: {e}")),
+            }
         }
-        Ok(Err(e)) = request_handle => {
-            coordinator.request_shutdown("request error");
-            Err(e)
+        res = &mut request_handle => {
+            coordinator.request_shutdown("request exit");
+            match res {
+                Ok(Err(e)) => Err(e),
+                Ok(Ok(())) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!("request task panicked: {e}")),
+            }
         }
         () = config_reload.notified(), if args.is_remote_mode() => {
             coordinator.request_shutdown("config reload");
@@ -210,14 +226,23 @@ async fn run(
         },
     };
 
+    // Explicitly drive the remaining top-level tasks to completion.
+    // The completed one aborts as a no-op; the live one will see
+    // cancelled() and exit cooperatively.
+    subscribe_handle.abort();
+    request_handle.abort();
+    let _ = tokio::join!(subscribe_handle, request_handle);
+
+    // Wait for child/background tasks (tracked by TaskTracker).
     if !coordinator.wait_for_drain(SHUTDOWN_DRAIN_TIMEOUT).await {
-        // Clear stale senders even on timeout so no previous-run channels
-        // leak into a subsequent run (e.g. after a config-reload restart).
+        error!(
+            "Shutdown drain timed out; aborting to prevent \
+             overlapping generations"
+        );
         clear_ingest_channel().await;
-        return Err(anyhow::anyhow!(
-            "Shutdown drain timed out; child tasks may still be running"
-        ));
+        std::process::exit(1);
     }
+
     // Clear stale senders so no previous-run channels leak into a
     // subsequent run (e.g. after a config-reload restart).
     clear_ingest_channel().await;

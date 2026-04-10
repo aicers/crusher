@@ -34,6 +34,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
+use crate::policy::PolicyHandle;
 use crate::shutdown::ShutdownCoordinator;
 
 pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.26.0";
@@ -149,8 +150,7 @@ impl Client {
 
     pub(crate) async fn run(
         self,
-        active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
-        delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+        policy_handle: PolicyHandle,
         coordinator: ShutdownCoordinator,
     ) -> Result<()> {
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
@@ -174,8 +174,7 @@ impl Client {
                     &self.endpoint,
                     REQUIRED_GIGANTO_VERSION,
                     &self.request_recv,
-                    active_policy_list,
-                    delete_policy_ids,
+                    policy_handle,
                     &self.last_series_time_path,
                     connection_notify.clone(),
                     coordinator.clone(),
@@ -279,8 +278,7 @@ async fn publish_connection_control(
     endpoint: &Endpoint,
     version: &str,
     request_recv: &Receiver<SamplingPolicy>,
-    active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
-    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    policy_handle: PolicyHandle,
     last_series_time_path: &Path,
     connection_notify: Arc<Notify>,
     coordinator: ShutdownCoordinator,
@@ -302,10 +300,7 @@ async fn publish_connection_control(
                     }
                 });
 
-                // Collect policies under a short-lived read guard to
-                // avoid holding the RwLock across await points.
-                let policies: Vec<SamplingPolicy> =
-                    active_policy_list.read().await.values().cloned().collect();
+                let policies = policy_handle.get_all_policies().await;
                 for policy in policies {
                     if let Err(e) = process_network_stream(
                         conn.clone(),
@@ -313,8 +308,7 @@ async fn publish_connection_control(
                         policy,
                         stream_tx.clone(),
                         connection_notify.clone(),
-                        active_policy_list.clone(),
-                        delete_policy_ids.clone(),
+                        policy_handle.clone(),
                         last_series_time_path.to_path_buf(),
                         coordinator.clone(),
                     )
@@ -370,8 +364,7 @@ async fn publish_connection_control(
                                 policy,
                                 stream_tx.clone(),
                                 connection_notify.clone(),
-                                active_policy_list.clone(),
-                                delete_policy_ids.clone(),
+                                policy_handle.clone(),
                                 last_series_time_path.to_path_buf(),
                                 coordinator.clone(),
                             ).await
@@ -461,8 +454,7 @@ async fn process_network_stream(
     policy: SamplingPolicy,
     stream_tx: tokio::sync::mpsc::Sender<StreamSendRequest>,
     connection_notify: Arc<Notify>,
-    active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
-    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    policy_handle: PolicyHandle,
     last_series_time_path: PathBuf,
     coordinator: ShutdownCoordinator,
 ) -> Result<()> {
@@ -495,8 +487,7 @@ async fn process_network_stream(
             conn,
             sender,
             connection_notify,
-            active_policy_list,
-            delete_policy_ids,
+            policy_handle,
             last_series_time_path,
             recv_coordinator,
         )
@@ -510,8 +501,7 @@ async fn receiver(
     conn: Connection,
     sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
-    active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
-    delete_policy_ids: Arc<RwLock<Vec<u32>>>,
+    policy_handle: PolicyHandle,
     last_series_time_path: PathBuf,
     coordinator: ShutdownCoordinator,
 ) -> Result<()> {
@@ -538,9 +528,7 @@ async fn receiver(
         }
     };
 
-    let policy = if let Some(policy) = active_policy_list.read().await.get(&id) {
-        policy.clone()
-    } else {
+    let Some(policy) = policy_handle.get_policy(id).await else {
         bail!("Failed to get runtime policy data");
     };
     info!("Raw event {:?} has been connected", policy.kind);
@@ -548,13 +536,10 @@ async fn receiver(
     let mut series = TimeSeries::try_new(&policy).await?;
 
     loop {
-        if delete_policy_ids.read().await.contains(&id) {
+        if policy_handle.is_pending_delete(id).await {
             recv.stop(VarInt::default())?;
             delete_last_timestamp(&last_series_time_path, id)?;
-            delete_policy_ids
-                .write()
-                .await
-                .retain(|&delete_id| delete_id != id);
+            policy_handle.consume_delete(id).await;
             break;
         }
         tokio::select! {

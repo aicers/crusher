@@ -28,6 +28,7 @@ use tokio::time::{sleep, timeout};
 use super::time_series::clear_last_transfer_time;
 use super::*;
 use crate::client::Certs;
+use crate::policy::{PolicyHandle, spawn_policy_actor};
 use crate::shutdown::ShutdownCoordinator;
 
 const CERT_PATH: &str = "tests/cert.pem";
@@ -260,29 +261,33 @@ fn start_servers() -> (
 
 fn setup_request_client(
     buffer: usize,
+    coordinator: &ShutdownCoordinator,
 ) -> (
     crate::request::Client,
     async_channel::Receiver<SamplingPolicy>,
     PathBuf,
     TempDir,
+    PolicyHandle,
 ) {
     let (request_send, request_recv) = async_channel::bounded::<SamplingPolicy>(buffer);
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let last_time_series_path = temp_dir.path().join("time_data.json");
-    let request_client = crate::request::Client::new(
+    let policy_handle = spawn_policy_actor(request_send, coordinator);
+    let mut request_client = crate::request::Client::new(
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
         HOST.to_string(),
-        request_send,
         fs::read(CERT_PATH).unwrap(),
         fs::read(KEY_PATH).unwrap(),
         vec![fs::read(CA_CERT_PATH).unwrap()],
         Arc::new(Notify::new()),
     );
+    request_client.set_policy_handle(policy_handle.clone());
     (
         request_client,
         request_recv,
         last_time_series_path,
         temp_dir,
+        policy_handle,
     )
 }
 
@@ -306,8 +311,9 @@ fn spawn_subscribe_client(
     last_time_series_path: &Path,
     ingest_addr: SocketAddr,
     publish_addr: SocketAddr,
-    request_client: &crate::request::Client,
-) -> (tokio::task::JoinHandle<()>, ShutdownCoordinator) {
+    policy_handle: PolicyHandle,
+    coordinator: ShutdownCoordinator,
+) -> tokio::task::JoinHandle<()> {
     let client = Client::new(
         ingest_addr,
         publish_addr,
@@ -317,18 +323,9 @@ fn spawn_subscribe_client(
         request_recv,
     );
 
-    let coordinator = ShutdownCoordinator::new();
-    let coordinator_clone = coordinator.clone();
-    let active_policy_list = request_client.active_policy_list.clone();
-    let delete_policy_ids = request_client.delete_policy_ids.clone();
-
-    let client_handle = tokio::spawn(async move {
-        let _ = client
-            .run(active_policy_list, delete_policy_ids, coordinator_clone)
-            .await;
-    });
-
-    (client_handle, coordinator)
+    tokio::spawn(async move {
+        let _ = client.run(policy_handle, coordinator).await;
+    })
 }
 
 async fn reset_last_transfer_time() {
@@ -449,8 +446,9 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
     let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
-        setup_request_client(1);
+    let coordinator = ShutdownCoordinator::new();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
+        setup_request_client(1, &coordinator);
 
     let policy = new_policy(DEFAULT_POLICY_ID);
 
@@ -461,22 +459,18 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
         .unwrap();
 
     // Assert: policy is tracked in the active list.
-    assert!(
-        request_client
-            .active_policy_list
-            .read()
-            .await
-            .contains_key(&policy.id)
-    );
+    assert!(policy_handle.get_policy(policy.id).await.is_some());
 
-    let (client_handle, client_shutdown) = spawn_subscribe_client(
+    let client_handle = spawn_subscribe_client(
         &certs,
         request_recv,
         &last_time_series_path,
         ingest_addr,
         publish_addr,
-        &request_client,
+        policy_handle,
+        coordinator.clone(),
     );
+    let client_shutdown = coordinator;
 
     // Act/Assert: wait for ingest ACK and timestamp file creation.
     let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
@@ -511,8 +505,9 @@ async fn sampling_policy_notify_flow_with_delete() {
     let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
-        setup_request_client(1);
+    let coordinator = ShutdownCoordinator::new();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
+        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
 
     // Act: insert policy.
@@ -522,22 +517,18 @@ async fn sampling_policy_notify_flow_with_delete() {
         .unwrap();
 
     // Assert: policy is tracked in the active list.
-    assert!(
-        request_client
-            .active_policy_list
-            .read()
-            .await
-            .contains_key(&policy.id)
-    );
+    assert!(policy_handle.get_policy(policy.id).await.is_some());
 
-    let (client_handle, client_shutdown) = spawn_subscribe_client(
+    let client_handle = spawn_subscribe_client(
         &certs,
         request_recv,
         &last_time_series_path,
         ingest_addr,
         publish_addr,
-        &request_client,
+        policy_handle,
+        coordinator.clone(),
     );
+    let client_shutdown = coordinator;
 
     // Act/Assert: wait for ingest ACK and timestamp file creation.
     let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
@@ -588,8 +579,9 @@ async fn sampling_policy_multiple_streams() {
     let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
-        setup_request_client(2);
+    let coordinator = ShutdownCoordinator::new();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
+        setup_request_client(2, &coordinator);
     let policy_a = new_policy(1);
     let policy_b = new_policy(2);
 
@@ -600,29 +592,19 @@ async fn sampling_policy_multiple_streams() {
         .unwrap();
 
     // Assert: both policies are active.
-    assert!(
-        request_client
-            .active_policy_list
-            .read()
-            .await
-            .contains_key(&policy_a.id)
-    );
-    assert!(
-        request_client
-            .active_policy_list
-            .read()
-            .await
-            .contains_key(&policy_b.id)
-    );
+    assert!(policy_handle.get_policy(policy_a.id).await.is_some());
+    assert!(policy_handle.get_policy(policy_b.id).await.is_some());
 
-    let (client_handle, client_shutdown) = spawn_subscribe_client(
+    let client_handle = spawn_subscribe_client(
         &certs,
         request_recv,
         &last_time_series_path,
         ingest_addr,
         publish_addr,
-        &request_client,
+        policy_handle,
+        coordinator.clone(),
     );
+    let client_shutdown = coordinator;
 
     // Act/Assert: receive policy IDs for both streams.
     let mut expected_ids = vec![policy_a.id, policy_b.id];
@@ -667,8 +649,9 @@ async fn shutdown_drains_all_tasks() {
     let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
-        setup_request_client(1);
+    let coordinator = ShutdownCoordinator::new();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
+        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
 
     request_client
@@ -676,13 +659,14 @@ async fn shutdown_drains_all_tasks() {
         .await
         .unwrap();
 
-    let (client_handle, coordinator) = spawn_subscribe_client(
+    let client_handle = spawn_subscribe_client(
         &certs,
         request_recv,
         &last_time_series_path,
         ingest_addr,
         publish_addr,
-        &request_client,
+        policy_handle,
+        coordinator.clone(),
     );
 
     // Wait for the stream to be fully established.
@@ -723,8 +707,9 @@ async fn shutdown_flushes_timestamps() {
     let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
-        setup_request_client(1);
+    let coordinator = ShutdownCoordinator::new();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
+        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
 
     request_client
@@ -732,13 +717,14 @@ async fn shutdown_flushes_timestamps() {
         .await
         .unwrap();
 
-    let (client_handle, coordinator) = spawn_subscribe_client(
+    let client_handle = spawn_subscribe_client(
         &certs,
         request_recv,
         &last_time_series_path,
         ingest_addr,
         publish_addr,
-        &request_client,
+        policy_handle,
+        coordinator.clone(),
     );
 
     // Wait for timestamp to be written.
@@ -802,8 +788,9 @@ async fn shutdown_drain_captures_inflight_acks() {
     let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
-        setup_request_client(1);
+    let coordinator = ShutdownCoordinator::new();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
+        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
 
     request_client
@@ -811,13 +798,14 @@ async fn shutdown_drain_captures_inflight_acks() {
         .await
         .unwrap();
 
-    let (client_handle, coordinator) = spawn_subscribe_client(
+    let client_handle = spawn_subscribe_client(
         &certs,
         request_recv,
         &last_time_series_path,
         ingest_addr,
         publish_addr,
-        &request_client,
+        policy_handle,
+        coordinator.clone(),
     );
 
     // Wait for the first ACK only — more may still be in-flight.
@@ -874,8 +862,9 @@ async fn restart_state_consistency() {
     let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
 
     let certs = cert_key();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
-        setup_request_client(1);
+    let coordinator = ShutdownCoordinator::new();
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
+        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
 
     request_client
@@ -883,13 +872,14 @@ async fn restart_state_consistency() {
         .await
         .unwrap();
 
-    let (client_handle, coordinator) = spawn_subscribe_client(
+    let client_handle = spawn_subscribe_client(
         &certs,
         request_recv,
         &last_time_series_path,
         ingest_addr,
         publish_addr,
-        &request_client,
+        policy_handle,
+        coordinator.clone(),
     );
 
     let _ = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
@@ -925,7 +915,9 @@ async fn restart_state_consistency() {
 
     let (ingest_ack_recv2, server_handles2, ingest_addr2, publish_addr2) = start_servers();
 
-    let (mut request_client2, request_recv2, _, _keep_dir) = setup_request_client(1);
+    let coordinator2 = ShutdownCoordinator::new();
+    let (mut request_client2, request_recv2, _, _keep_dir, policy_handle2) =
+        setup_request_client(1, &coordinator2);
     // Re-use the same last_time_series_path so the second run picks up the
     // persisted timestamps from the first run.
 
@@ -934,13 +926,14 @@ async fn restart_state_consistency() {
         .await
         .unwrap();
 
-    let (client_handle2, coordinator2) = spawn_subscribe_client(
+    let client_handle2 = spawn_subscribe_client(
         &certs,
         request_recv2,
         &last_time_series_path,
         ingest_addr2,
         publish_addr2,
-        &request_client2,
+        policy_handle2,
+        coordinator2.clone(),
     );
 
     let _ = timeout(Duration::from_secs(5), ingest_ack_recv2.recv())

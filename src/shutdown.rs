@@ -231,4 +231,32 @@ mod tests {
         assert!(coord.is_cancelled());
         assert_eq!(coord.phase(), ShutdownPhase::Draining);
     }
+
+    /// Drain timeout must leave the coordinator in `Draining` phase,
+    /// proving the state is not clean enough for a new generation.
+    /// The caller (`run()` in main.rs) treats this as fatal by calling
+    /// `process::exit(1)`, preventing re-entry into a new run cycle.
+    #[tokio::test]
+    async fn drain_timeout_prevents_reentry() {
+        let coord = ShutdownCoordinator::new();
+        let tracker = coord.tracker().clone();
+
+        // Spawn a task that never finishes.
+        tracker.spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        coord.request_shutdown("reentry test");
+        let completed = coord.wait_for_drain(Duration::from_millis(50)).await;
+
+        // Drain timed out — phase must NOT be Completed.
+        assert!(!completed);
+        assert_eq!(coord.phase(), ShutdownPhase::Draining);
+        // Active tasks are still alive — a new generation must not
+        // start because it would overlap with stuck tasks.
+        assert!(
+            coord.tracker().active_count() > 0,
+            "stuck tasks must still be tracked"
+        );
+    }
 }

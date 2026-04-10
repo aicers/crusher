@@ -30,6 +30,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   All spawned tasks are now tracked and drained before the
   process exits or restarts, preventing detached background
   work.
+- Top-level `request`/`subscribe` tasks are now explicitly
+  owned by `run()` with `abort + join`, while `TaskTracker`
+  is reserved for child/background tasks. Drain timeout is
+  treated as fatal (`process::exit`) to prevent overlapping
+  generations.
+- Policy state (`active_policy_list`, `delete_policy_ids`)
+  moved behind a single-owner actor task (`PolicyHandle`),
+  eliminating shared `RwLock` mutation mixed with `.await`
+  points and ensuring cancellation-safe policy updates.
 - Scenario-level tests verifying that shutdown drains all
   tasks, timestamp flush completes, and restart-time state
   remains consistent.
@@ -44,6 +53,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reconnect, and shutdown-drain timeout.
 - Fixed in-flight ACK/timestamp messages being lost on
   shutdown.
+- Fixed request-side partial-state update problem where
+  cancellation during `sampling_policy_list` or
+  `delete_sampling_policy` could leave `active_policy_list`,
+  `delete_policy_ids`, and subscribe-side state out of sync.
 - Automatically create timestamp data file on startup when
   missing.
 - Replaced `process::exit` calls with proper error propagation.
