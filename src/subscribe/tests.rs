@@ -267,7 +267,7 @@ struct TestHarness {
     server_handles: TestServerHandlers,
     ingest_ack_recv: async_channel::Receiver<u32>,
     last_time_series_path: PathBuf,
-    _temp_dir: TempDir,
+    temp_dir: TempDir,
 }
 
 impl TestHarness {
@@ -300,7 +300,7 @@ impl TestHarness {
             server_handles,
             ingest_ack_recv,
             last_time_series_path,
-            _temp_dir: temp_dir,
+            temp_dir,
         }
     }
 
@@ -517,7 +517,7 @@ fn gen_conn() -> Conn {
 #[tokio::test]
 async fn sampling_policy_flow_with_fake_giganto_server() {
     let policy = new_policy(DEFAULT_POLICY_ID);
-    let harness = TestHarness::new(&[policy.clone()]).await;
+    let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
     assert!(harness.policy_handle.get_policy(policy.id).await.is_some());
 
@@ -539,7 +539,7 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
 #[tokio::test]
 async fn sampling_policy_notify_flow_with_delete() {
     let policy = new_policy(DEFAULT_POLICY_ID);
-    let mut harness = TestHarness::new(&[policy.clone()]).await;
+    let mut harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
     assert!(harness.policy_handle.get_policy(policy.id).await.is_some());
 
@@ -606,7 +606,7 @@ async fn shutdown_drains_all_tasks() {
     use crate::shutdown::ShutdownPhase;
 
     let policy = new_policy(DEFAULT_POLICY_ID);
-    let harness = TestHarness::new(&[policy.clone()]).await;
+    let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
     let _ = harness.wait_for_ack().await;
     let _ = harness.wait_for_timestamp(&[policy.id]).await;
@@ -636,7 +636,7 @@ async fn shutdown_drains_all_tasks() {
 #[tokio::test]
 async fn shutdown_flushes_timestamps() {
     let policy = new_policy(DEFAULT_POLICY_ID);
-    let harness = TestHarness::new(&[policy.clone()]).await;
+    let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
     let _ = harness.wait_for_ack().await;
     let map_before = harness.wait_for_timestamp(&[policy.id]).await;
@@ -685,7 +685,7 @@ async fn shutdown_flushes_timestamps() {
 #[tokio::test]
 async fn shutdown_drain_captures_inflight_acks() {
     let policy = new_policy(DEFAULT_POLICY_ID);
-    let harness = TestHarness::new(&[policy.clone()]).await;
+    let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
     let _ = harness.wait_for_ack().await;
     let _ = harness.wait_for_timestamp(&[policy.id]).await;
@@ -732,7 +732,7 @@ async fn restart_state_consistency() {
     let policy = new_policy(DEFAULT_POLICY_ID);
 
     // --- First run ---
-    let harness = TestHarness::new(&[policy.clone()]).await;
+    let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
     let _ = harness.wait_for_ack().await;
     let _ = harness.wait_for_timestamp(&[policy.id]).await;
 
@@ -741,7 +741,7 @@ async fn restart_state_consistency() {
         .get(&policy.id.to_string())
         .expect("policy timestamp must exist after first run");
     let last_time_series_path = harness.last_time_series_path.clone();
-    let _keep_temp = harness._temp_dir;
+    let _keep_temp = harness.temp_dir;
     cleanup_test_resources(harness.coordinator, harness.client_handle, harness.server_handles)
         .await;
 
