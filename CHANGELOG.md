@@ -15,12 +15,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
-- Changed how `giganto_name` and `giganto_publish_srv_addr`
-  are handled. Both fields no longer have default values and
-  must be explicitly provided. `giganto_name` is optional;
-  `giganto_publish_srv_addr` is required. If `giganto_name`
-  is provided it is used for the Giganto connection; otherwise
-  the IP from `giganto_publish_srv_addr` is used.
+- Changed how `giganto_name`, `giganto_publish_srv_addr`, and
+  `giganto_ingest_srv_addr` are handled. All three fields no
+  longer have default values. `giganto_name` is optional;
+  `giganto_publish_srv_addr` and `giganto_ingest_srv_addr` are
+  required. If `giganto_name` is provided it is used for the
+  Giganto connection; otherwise the IP from the addresses is
+  used only when both point to the same IP. If the IPs differ
+  and `giganto_name` is absent, a configuration error is
+  returned.
 - Updated `review-protocol` dependency to rev `c284fa6`.
 
 ### Fixed
