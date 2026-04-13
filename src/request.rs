@@ -667,10 +667,10 @@ mod tests {
             .await
             .expect("Success to delete policy");
 
-        // Verify deleted IDs are pending
-        assert!(policy_handle.is_pending_delete(1).await);
-        assert!(policy_handle.is_pending_delete(2).await);
-        assert!(policy_handle.is_pending_delete(3).await);
+        // Verify deleted policies are no longer active
+        assert!(policy_handle.get_policy(1).await.is_none());
+        assert!(policy_handle.get_policy(2).await.is_none());
+        assert!(policy_handle.get_policy(3).await.is_none());
 
         // Verify active list only has remaining policies
         assert_eq!(policy_handle.get_all_policies().await.len(), 2);
@@ -702,12 +702,12 @@ mod tests {
             .await
             .expect("Success to delete policies");
 
-        // Verify all deleted IDs are pending
-        assert!(policy_handle.is_pending_delete(1).await);
-        assert!(policy_handle.is_pending_delete(3).await);
-        assert!(policy_handle.is_pending_delete(5).await);
-        assert!(!policy_handle.is_pending_delete(2).await);
-        assert!(!policy_handle.is_pending_delete(4).await);
+        // Verify deleted policies are gone, others remain active
+        assert!(policy_handle.get_policy(1).await.is_none());
+        assert!(policy_handle.get_policy(3).await.is_none());
+        assert!(policy_handle.get_policy(5).await.is_none());
+        assert!(policy_handle.get_policy(2).await.is_some());
+        assert!(policy_handle.get_policy(4).await.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -728,8 +728,8 @@ mod tests {
         let result = client.delete_sampling_policy(&[999]).await;
         assert!(result.is_ok());
 
-        // Non-existent policy should not be pending
-        assert!(!policy_handle.is_pending_delete(999).await);
+        // Non-existent policy should not appear
+        assert!(policy_handle.get_policy(999).await.is_none());
 
         // Active list should still have the original policy
         assert_eq!(policy_handle.get_all_policies().await.len(), 1);
@@ -757,9 +757,9 @@ mod tests {
         assert!(result.is_ok());
 
         for id in [1, 2, 3, 4, 5] {
-            assert!(policy_handle.is_pending_delete(id).await);
+            assert!(policy_handle.get_policy(id).await.is_none());
         }
-        assert!(!policy_handle.is_pending_delete(999).await);
+        assert!(policy_handle.get_policy(999).await.is_none());
 
         assert_eq!(policy_handle.get_all_policies().await.len(), 2);
         assert!(policy_handle.get_policy(6).await.is_some());
@@ -801,13 +801,15 @@ mod tests {
             .await
             .expect("No error or failure");
 
-        // Policy should be pending delete
-        assert!(policy_handle.is_pending_delete(1).await);
+        // Policy should no longer be active
+        assert!(policy_handle.get_policy(1).await.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn delete_policy_rapid_add_remove_same_id() {
-        // Test: Rapid add/remove cycles of the same ID
+        // Test: Rapid add/remove cycles of the same ID.
+        // With per-policy CancellationTokens, re-add after delete
+        // creates a fresh token — no consume step needed.
         let (mut client, rx, policy_handle) = create_test_client();
 
         for _ in 0..3 {
@@ -819,14 +821,16 @@ mod tests {
             let received = rx.try_recv().expect("Success to receive policy");
             assert_eq!(received.id, 1);
 
+            let token = policy_handle.get_policy_token(1).await.unwrap();
+            assert!(!token.is_cancelled());
+
             client
                 .delete_sampling_policy(&[1])
                 .await
                 .expect("Success to delete policy");
 
-            assert!(policy_handle.is_pending_delete(1).await);
-            // Consume the pending delete so it can be re-added next cycle
-            policy_handle.consume_delete(1).await;
+            assert!(policy_handle.get_policy(1).await.is_none());
+            assert!(token.is_cancelled());
         }
 
         // Final state: empty active list
@@ -856,8 +860,8 @@ mod tests {
             .await
             .expect("Success to delete policy");
 
-        // Final state: empty active list, pending delete
-        assert!(policy_handle.is_pending_delete(1).await);
+        // Final state: empty active list, policy deleted
+        assert!(policy_handle.get_policy(1).await.is_none());
         assert!(policy_handle.get_all_policies().await.is_empty());
     }
 

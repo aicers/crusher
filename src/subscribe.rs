@@ -481,6 +481,11 @@ async fn process_network_stream(
         .await
         .map_err(|_| anyhow::anyhow!("SendStream actor dropped reply"))??;
 
+    let policy_token = policy_handle
+        .get_policy_token(policy.id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no cancellation token for policy {}", policy.id))?;
+
     let recv_coordinator = coordinator.clone();
     coordinator.tracker().spawn(async move {
         receiver(
@@ -488,6 +493,7 @@ async fn process_network_stream(
             sender,
             connection_notify,
             policy_handle,
+            policy_token,
             last_series_time_path,
             recv_coordinator,
         )
@@ -502,6 +508,7 @@ async fn receiver(
     sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
     policy_handle: PolicyHandle,
+    policy_token: tokio_util::sync::CancellationToken,
     last_series_time_path: PathBuf,
     coordinator: ShutdownCoordinator,
 ) -> Result<()> {
@@ -536,16 +543,16 @@ async fn receiver(
     let mut series = TimeSeries::try_new(&policy).await?;
 
     loop {
-        if policy_handle.is_pending_delete(id).await {
-            recv.stop(VarInt::default())?;
-            delete_last_timestamp(&last_series_time_path, id)?;
-            policy_handle.consume_delete(id).await;
-            break;
-        }
         tokio::select! {
             biased;
             () = coordinator.cancelled() => {
                 info!("Receiver for policy {id} shutting down");
+                break;
+            }
+            () = policy_token.cancelled() => {
+                info!("Policy {id} deleted, stopping receiver");
+                recv.stop(VarInt::default())?;
+                delete_last_timestamp(&last_series_time_path, id)?;
                 break;
             }
             result = receive_time_series_generator_data(&mut recv) => {

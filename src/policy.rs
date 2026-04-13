@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use async_channel::Sender;
 use review_protocol::types::SamplingPolicy;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::shutdown::ShutdownCoordinator;
@@ -25,12 +26,9 @@ enum PolicyCommand {
     GetAllPolicies {
         reply: oneshot::Sender<Vec<SamplingPolicy>>,
     },
-    IsPendingDelete {
+    GetPolicyToken {
         id: u32,
-        reply: oneshot::Sender<bool>,
-    },
-    ConsumeDelete {
-        id: u32,
+        reply: oneshot::Sender<Option<CancellationToken>>,
     },
 }
 
@@ -97,23 +95,19 @@ impl PolicyHandle {
         reply_rx.await.unwrap_or_default()
     }
 
-    /// Returns `true` if the given policy ID is pending deletion.
-    pub(crate) async fn is_pending_delete(&self, id: u32) -> bool {
+    /// Returns the `CancellationToken` for the given policy ID.
+    /// The receiver watches this token to detect when its specific
+    /// policy is deleted, eliminating the delete/re-add race condition.
+    pub(crate) async fn get_policy_token(&self, id: u32) -> Option<CancellationToken> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self
             .tx
-            .send(PolicyCommand::IsPendingDelete {
+            .send(PolicyCommand::GetPolicyToken {
                 id,
                 reply: reply_tx,
             })
             .await;
-        reply_rx.await.unwrap_or(false)
-    }
-
-    /// Removes the given policy ID from the pending-delete list.
-    /// Called by the subscribe side after it has acted on the deletion.
-    pub(crate) async fn consume_delete(&self, id: u32) {
-        let _ = self.tx.send(PolicyCommand::ConsumeDelete { id }).await;
+        reply_rx.await.ok().flatten()
     }
 }
 
@@ -132,7 +126,7 @@ pub(crate) fn spawn_policy_actor(
 
     coordinator.tracker().spawn(async move {
         let mut active_policies: HashMap<u32, SamplingPolicy> = HashMap::new();
-        let mut pending_deletes: Vec<u32> = Vec::new();
+        let mut policy_tokens: HashMap<u32, CancellationToken> = HashMap::new();
 
         loop {
             let cmd = tokio::select! {
@@ -155,10 +149,11 @@ pub(crate) fn spawn_policy_actor(
                         }
                         let id = policy.id;
                         active_policies.insert(id, policy.clone());
+                        policy_tokens.insert(id, CancellationToken::new());
                         info!("Received request to update time series policy list");
                         if let Err(e) = policy_send.send(policy).await {
-                            // Roll back the insertion so state stays consistent.
                             active_policies.remove(&id);
+                            policy_tokens.remove(&id);
                             result = Err(format!("send fail: {e}"));
                             break;
                         }
@@ -172,7 +167,9 @@ pub(crate) fn spawn_policy_actor(
                                 "Received request to delete time series policy {}",
                                 deleted.id
                             );
-                            pending_deletes.push(id);
+                            if let Some(token) = policy_tokens.remove(&id) {
+                                token.cancel();
+                            }
                         }
                     }
                     let _ = reply.send(Ok(()));
@@ -183,11 +180,8 @@ pub(crate) fn spawn_policy_actor(
                 PolicyCommand::GetAllPolicies { reply } => {
                     let _ = reply.send(active_policies.values().cloned().collect());
                 }
-                PolicyCommand::IsPendingDelete { id, reply } => {
-                    let _ = reply.send(pending_deletes.contains(&id));
-                }
-                PolicyCommand::ConsumeDelete { id } => {
-                    pending_deletes.retain(|&d| d != id);
+                PolicyCommand::GetPolicyToken { id, reply } => {
+                    let _ = reply.send(policy_tokens.get(&id).cloned());
                 }
             }
         }
@@ -256,7 +250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_and_consume() {
+    async fn delete_cancels_token() {
         let coordinator = ShutdownCoordinator::new();
         let (policy_tx, _policy_rx) = async_channel::bounded::<SamplingPolicy>(10);
         let handle = spawn_policy_actor(policy_tx, &coordinator);
@@ -264,14 +258,13 @@ mod tests {
         handle.add_policies(vec![test_policy(1)]).await.unwrap();
         assert!(handle.get_policy(1).await.is_some());
 
-        handle.delete_policies(vec![1]).await.unwrap();
-        // Removed from active set.
-        assert!(handle.get_policy(1).await.is_none());
-        // Pending delete is visible.
-        assert!(handle.is_pending_delete(1).await);
+        let token = handle.get_policy_token(1).await.unwrap();
+        assert!(!token.is_cancelled());
 
-        handle.consume_delete(1).await;
-        assert!(!handle.is_pending_delete(1).await);
+        handle.delete_policies(vec![1]).await.unwrap();
+        assert!(handle.get_policy(1).await.is_none());
+        assert!(token.is_cancelled());
+        assert!(handle.get_policy_token(1).await.is_none());
     }
 
     /// Cancelling the caller of `add_policies` must not leave the
@@ -316,8 +309,8 @@ mod tests {
     }
 
     /// Cancelling the caller of `delete_policies` must not leave
-    /// partial state (e.g., removed from active but not in pending
-    /// deletes).
+    /// partial state (e.g., removed from active but token not
+    /// cancelled).
     #[tokio::test]
     async fn cancel_caller_during_delete_is_safe() {
         let coordinator = ShutdownCoordinator::new();
@@ -329,24 +322,22 @@ mod tests {
             .await
             .unwrap();
 
+        let token1 = handle.get_policy_token(1).await.unwrap();
+        let token2 = handle.get_policy_token(2).await.unwrap();
+
         let handle_clone = handle.clone();
         let delete_task =
             tokio::spawn(async move { handle_clone.delete_policies(vec![1, 2]).await });
 
-        // Cancel immediately.
         delete_task.abort();
         let _ = delete_task.await;
 
-        // For each policy, it's either still active or properly in
-        // pending-delete — never removed from active without being
-        // in pending-delete.
-        for id in [1, 2] {
+        for (id, token) in [(1, &token1), (2, &token2)] {
             let active = handle.get_policy(id).await.is_some();
-            let pending = handle.is_pending_delete(id).await;
-            // Either still active (command not processed) or properly deleted.
+            let cancelled = token.is_cancelled();
             assert!(
-                active || pending,
-                "policy {id} must be in active set or pending-delete, not neither"
+                active || cancelled,
+                "policy {id} must be active or have its token cancelled"
             );
         }
     }

@@ -259,6 +259,81 @@ fn start_servers() -> (
     )
 }
 
+struct TestHarness {
+    coordinator: ShutdownCoordinator,
+    request_client: crate::request::Client,
+    policy_handle: PolicyHandle,
+    client_handle: tokio::task::JoinHandle<()>,
+    server_handles: TestServerHandlers,
+    ingest_ack_recv: async_channel::Receiver<u32>,
+    last_time_series_path: PathBuf,
+    _temp_dir: TempDir,
+}
+
+impl TestHarness {
+    async fn new(policies: &[SamplingPolicy]) -> Self {
+        reset_last_transfer_time().await;
+        let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
+        let certs = cert_key();
+        let coordinator = ShutdownCoordinator::new();
+        let (request_client, request_recv, last_time_series_path, temp_dir, policy_handle) =
+            setup_request_client(policies.len().max(1), &coordinator);
+
+        let mut rc = request_client;
+        rc.sampling_policy_list(policies).await.unwrap();
+
+        let client_handle = spawn_subscribe_client(
+            &certs,
+            request_recv,
+            &last_time_series_path,
+            ingest_addr,
+            publish_addr,
+            policy_handle.clone(),
+            coordinator.clone(),
+        );
+
+        Self {
+            coordinator,
+            request_client: rc,
+            policy_handle,
+            client_handle,
+            server_handles,
+            ingest_ack_recv,
+            last_time_series_path,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    async fn wait_for_ack(&self) -> u32 {
+        timeout(Duration::from_secs(5), self.ingest_ack_recv.recv())
+            .await
+            .expect("Ingest ACK should arrive within 5s")
+            .expect("Ingest ACK channel should remain open")
+    }
+
+    async fn wait_for_timestamp(&self, ids: &[u32]) -> HashMap<String, i64> {
+        timeout(
+            Duration::from_secs(5),
+            wait_for_policy_ids(&self.last_time_series_path, ids, true),
+        )
+        .await
+        .expect("Expected policy IDs to appear in time_data.json")
+    }
+
+    async fn wait_for_timestamp_removed(&self, ids: &[u32]) -> HashMap<String, i64> {
+        timeout(
+            Duration::from_secs(5),
+            wait_for_policy_ids(&self.last_time_series_path, ids, false),
+        )
+        .await
+        .expect("Expected policy IDs to be removed from time_data.json")
+    }
+
+    async fn cleanup(self) {
+        cleanup_test_resources(self.coordinator, self.client_handle, self.server_handles).await;
+    }
+}
+
 fn setup_request_client(
     buffer: usize,
     coordinator: &ShutdownCoordinator,
@@ -441,57 +516,20 @@ fn gen_conn() -> Conn {
 #[serial]
 #[tokio::test]
 async fn sampling_policy_flow_with_fake_giganto_server() {
-    reset_last_transfer_time().await;
-    // Arrange: start fake servers and a request client.
-    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
-
-    let certs = cert_key();
-    let coordinator = ShutdownCoordinator::new();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
-        setup_request_client(1, &coordinator);
-
     let policy = new_policy(DEFAULT_POLICY_ID);
+    let harness = TestHarness::new(&[policy.clone()]).await;
 
-    // Act: insert policy into request client.
-    request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
-        .await
-        .unwrap();
+    assert!(harness.policy_handle.get_policy(policy.id).await.is_some());
 
-    // Assert: policy is tracked in the active list.
-    assert!(policy_handle.get_policy(policy.id).await.is_some());
-
-    let client_handle = spawn_subscribe_client(
-        &certs,
-        request_recv,
-        &last_time_series_path,
-        ingest_addr,
-        publish_addr,
-        policy_handle,
-        coordinator.clone(),
-    );
-    let client_shutdown = coordinator;
-
-    // Act/Assert: wait for ingest ACK and timestamp file creation.
-    let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
-        .await
-        .expect("Ingest ACK should arrive within 5s after adding sampling policy")
-        .expect("Ingest ACK channel should remain open until ACK is received after adding sampling policy");
+    let id = harness.wait_for_ack().await;
     assert_eq!(id, policy.id);
 
-    let map = timeout(
-        Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
-    )
-    .await
-    .expect("No timeout: expected policy ID was written to time_data.json");
-
-    assert!(last_time_series_path.exists());
+    let map = harness.wait_for_timestamp(&[policy.id]).await;
+    assert!(harness.last_time_series_path.exists());
     let expected: HashMap<String, i64> = [(policy.id.to_string(), 0)].into_iter().collect();
     assert_eq!(map, expected);
 
-    // Cleanup: stop client and servers.
-    cleanup_test_resources(client_shutdown, client_handle, server_handles).await;
+    harness.cleanup().await;
 }
 
 /// Test: Validates notify flow - when a policy is added, the client sends a stream
@@ -500,119 +538,46 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
 #[serial]
 #[tokio::test]
 async fn sampling_policy_notify_flow_with_delete() {
-    reset_last_transfer_time().await;
-    // Arrange: start servers and request client.
-    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
-
-    let certs = cert_key();
-    let coordinator = ShutdownCoordinator::new();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
-        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
+    let mut harness = TestHarness::new(&[policy.clone()]).await;
 
-    // Act: insert policy.
-    request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
-        .await
-        .unwrap();
+    assert!(harness.policy_handle.get_policy(policy.id).await.is_some());
 
-    // Assert: policy is tracked in the active list.
-    assert!(policy_handle.get_policy(policy.id).await.is_some());
-
-    let client_handle = spawn_subscribe_client(
-        &certs,
-        request_recv,
-        &last_time_series_path,
-        ingest_addr,
-        publish_addr,
-        policy_handle,
-        coordinator.clone(),
-    );
-    let client_shutdown = coordinator;
-
-    // Act/Assert: wait for ingest ACK and timestamp file creation.
-    let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
-        .await
-        .expect("Ingest ACK should arrive within 5s after adding sampling policy")
-        .expect("Ingest ACK channel should remain open until ACK is received after adding sampling policy");
+    let id = harness.wait_for_ack().await;
     assert_eq!(id, policy.id);
 
-    let map = timeout(
-        Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
-    )
-    .await
-    .expect("No timeout: expected policy ID was written to time_data.json");
-
-    assert!(last_time_series_path.exists());
+    let map = harness.wait_for_timestamp(&[policy.id]).await;
+    assert!(harness.last_time_series_path.exists());
     let expected: HashMap<String, i64> = [(policy.id.to_string(), 0)].into_iter().collect();
     assert_eq!(map, expected);
 
-    // Act: delete policy.
-    request_client
+    harness
+        .request_client
         .delete_sampling_policy(&[policy.id])
         .await
         .unwrap();
 
-    // Assert: timestamp entry is removed after deletion.
-    let map = timeout(
-        Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy.id], false),
-    )
-    .await
-    .expect("No timeout: expected policy ID was removed from time_data.json");
+    let map = harness.wait_for_timestamp_removed(&[policy.id]).await;
+    assert!(harness.last_time_series_path.exists());
+    assert_eq!(map, HashMap::new());
 
-    assert!(last_time_series_path.exists());
-    let expected: HashMap<String, i64> = HashMap::new();
-    assert_eq!(map, expected);
-
-    // Cleanup: stop client and servers.
-    cleanup_test_resources(client_shutdown, client_handle, server_handles).await;
+    harness.cleanup().await;
 }
 
 /// Test: Adding multiple policies should create multiple concurrent streams.
 #[serial]
 #[tokio::test]
 async fn sampling_policy_multiple_streams() {
-    reset_last_transfer_time().await;
-    // Arrange: start servers and request client with two policies.
-    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
-
-    let certs = cert_key();
-    let coordinator = ShutdownCoordinator::new();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
-        setup_request_client(2, &coordinator);
     let policy_a = new_policy(1);
     let policy_b = new_policy(2);
+    let harness = TestHarness::new(&[policy_a.clone(), policy_b.clone()]).await;
 
-    // Act: insert two policies.
-    request_client
-        .sampling_policy_list(&[policy_a.clone(), policy_b.clone()])
-        .await
-        .unwrap();
+    assert!(harness.policy_handle.get_policy(policy_a.id).await.is_some());
+    assert!(harness.policy_handle.get_policy(policy_b.id).await.is_some());
 
-    // Assert: both policies are active.
-    assert!(policy_handle.get_policy(policy_a.id).await.is_some());
-    assert!(policy_handle.get_policy(policy_b.id).await.is_some());
-
-    let client_handle = spawn_subscribe_client(
-        &certs,
-        request_recv,
-        &last_time_series_path,
-        ingest_addr,
-        publish_addr,
-        policy_handle,
-        coordinator.clone(),
-    );
-    let client_shutdown = coordinator;
-
-    // Act/Assert: receive policy IDs for both streams.
     let mut expected_ids = vec![policy_a.id, policy_b.id];
     for _ in 0..2 {
-        let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
-            .await
-            .expect("Ingest ACKs for all sampling policies should arrive within 5s")
-            .expect("Ingest ACK channel should remain open until ACKs for all sampling policies are received");
+        let id = harness.wait_for_ack().await;
         expected_ids.retain(|expected| *expected != id);
     }
     assert!(
@@ -620,22 +585,17 @@ async fn sampling_policy_multiple_streams() {
         "Not all policy IDs produced streams: {expected_ids:?}"
     );
 
-    let map = timeout(
-        Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy_a.id, policy_b.id], true),
-    )
-    .await
-    .expect("No timeout: expected policy IDs were written to time_data.json");
-
-    assert!(last_time_series_path.exists());
+    let map = harness
+        .wait_for_timestamp(&[policy_a.id, policy_b.id])
+        .await;
+    assert!(harness.last_time_series_path.exists());
     let expected: HashMap<String, i64> =
         [(policy_a.id.to_string(), 0), (policy_b.id.to_string(), 0)]
             .into_iter()
             .collect();
     assert_eq!(map, expected);
 
-    // Cleanup: stop client and servers.
-    cleanup_test_resources(client_shutdown, client_handle, server_handles).await;
+    harness.cleanup().await;
 }
 
 /// Test: After shutdown, all tracked tasks must drain within the
@@ -645,56 +605,28 @@ async fn sampling_policy_multiple_streams() {
 async fn shutdown_drains_all_tasks() {
     use crate::shutdown::ShutdownPhase;
 
-    reset_last_transfer_time().await;
-    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
-
-    let certs = cert_key();
-    let coordinator = ShutdownCoordinator::new();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
-        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
+    let harness = TestHarness::new(&[policy.clone()]).await;
 
-    request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
-        .await
-        .unwrap();
+    let _ = harness.wait_for_ack().await;
+    let _ = harness.wait_for_timestamp(&[policy.id]).await;
 
-    let client_handle = spawn_subscribe_client(
-        &certs,
-        request_recv,
-        &last_time_series_path,
-        ingest_addr,
-        publish_addr,
-        policy_handle,
-        coordinator.clone(),
-    );
+    harness.coordinator.request_shutdown("drain test");
+    harness.server_handles.ingest_shutdown.notify_one();
+    harness.server_handles.publish_shutdown.notify_one();
 
-    // Wait for the stream to be fully established.
-    let _ = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
-        .await
-        .expect("Ingest ACK should arrive within 5s");
-
-    let _ = timeout(
-        Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
-    )
-    .await
-    .expect("Policy ID written to time_data.json");
-
-    // Request shutdown and verify drain completes.
-    coordinator.request_shutdown("drain test");
-    server_handles.ingest_shutdown.notify_one();
-    server_handles.publish_shutdown.notify_one();
-
-    let drained = coordinator.wait_for_drain(Duration::from_secs(10)).await;
+    let drained = harness
+        .coordinator
+        .wait_for_drain(Duration::from_secs(10))
+        .await;
     assert!(drained, "Drain should complete within timeout");
-    assert_eq!(coordinator.phase(), ShutdownPhase::Completed);
-    assert_eq!(coordinator.tracker().active_count(), 0);
+    assert_eq!(harness.coordinator.phase(), ShutdownPhase::Completed);
+    assert_eq!(harness.coordinator.tracker().active_count(), 0);
 
     let _ = tokio::join!(
-        client_handle,
-        server_handles.ingest_handle,
-        server_handles.publish_handle,
+        harness.client_handle,
+        harness.server_handles.ingest_handle,
+        harness.server_handles.publish_handle,
     );
     INGEST_CHANNEL.write().await.clear();
 }
@@ -703,66 +635,34 @@ async fn shutdown_drains_all_tasks() {
 #[serial]
 #[tokio::test]
 async fn shutdown_flushes_timestamps() {
-    reset_last_transfer_time().await;
-    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
-
-    let certs = cert_key();
-    let coordinator = ShutdownCoordinator::new();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
-        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
+    let harness = TestHarness::new(&[policy.clone()]).await;
 
-    request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
-        .await
-        .unwrap();
+    let _ = harness.wait_for_ack().await;
+    let map_before = harness.wait_for_timestamp(&[policy.id]).await;
 
-    let client_handle = spawn_subscribe_client(
-        &certs,
-        request_recv,
-        &last_time_series_path,
-        ingest_addr,
-        publish_addr,
-        policy_handle,
-        coordinator.clone(),
-    );
+    harness.coordinator.request_shutdown("flush test");
+    harness.server_handles.ingest_shutdown.notify_one();
+    harness.server_handles.publish_shutdown.notify_one();
 
-    // Wait for timestamp to be written.
-    let _ = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
-        .await
-        .expect("Ingest ACK should arrive within 5s");
-
-    let map_before = timeout(
-        Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
-    )
-    .await
-    .expect("Policy ID written to time_data.json");
-
-    // Shutdown and drain.
-    coordinator.request_shutdown("flush test");
-    server_handles.ingest_shutdown.notify_one();
-    server_handles.publish_shutdown.notify_one();
-
-    let drained = coordinator.wait_for_drain(Duration::from_secs(10)).await;
+    let drained = harness
+        .coordinator
+        .wait_for_drain(Duration::from_secs(10))
+        .await;
     assert!(drained, "Drain should complete");
 
     let _ = tokio::join!(
-        client_handle,
-        server_handles.ingest_handle,
-        server_handles.publish_handle,
+        harness.client_handle,
+        harness.server_handles.ingest_handle,
+        harness.server_handles.publish_handle,
     );
     INGEST_CHANNEL.write().await.clear();
 
-    // After drain, the timestamp file must still exist and be valid
-    // JSON parseable as a HashMap.
     assert!(
-        last_time_series_path.exists(),
+        harness.last_time_series_path.exists(),
         "Timestamp file must survive shutdown"
     );
-    let map_after = read_time_data_map(&last_time_series_path);
-    // The map should be at least as complete as before shutdown
-    // (the flush may have added entries, but must not have lost any).
+    let map_after = read_time_data_map(&harness.last_time_series_path);
     for (k, v) in &map_before {
         assert_eq!(
             map_after.get(k),
@@ -784,65 +684,36 @@ async fn shutdown_flushes_timestamps() {
 #[serial]
 #[tokio::test]
 async fn shutdown_drain_captures_inflight_acks() {
-    reset_last_transfer_time().await;
-    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
-
-    let certs = cert_key();
-    let coordinator = ShutdownCoordinator::new();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
-        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
+    let harness = TestHarness::new(&[policy.clone()]).await;
 
-    request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
-        .await
-        .unwrap();
-
-    let client_handle = spawn_subscribe_client(
-        &certs,
-        request_recv,
-        &last_time_series_path,
-        ingest_addr,
-        publish_addr,
-        policy_handle,
-        coordinator.clone(),
-    );
-
-    // Wait for the first ACK only — more may still be in-flight.
-    let _ = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
-        .await
-        .expect("First ingest ACK should arrive within 5s");
-
-    // Record the timestamp that the first ACK produced.
-    let _ = timeout(
-        Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
-    )
-    .await
-    .expect("Policy ID written to time_data.json");
-    let ts_before = read_time_data_map(&last_time_series_path)
+    let _ = harness.wait_for_ack().await;
+    let _ = harness.wait_for_timestamp(&[policy.id]).await;
+    let ts_before = read_time_data_map(&harness.last_time_series_path)
         .get(&policy.id.to_string())
         .copied()
         .expect("timestamp must exist for policy");
 
-    // Shut down immediately — remaining ACKs are in-flight.
-    coordinator.request_shutdown("inflight-ack drain test");
-    server_handles.ingest_shutdown.notify_one();
-    server_handles.publish_shutdown.notify_one();
+    harness
+        .coordinator
+        .request_shutdown("inflight-ack drain test");
+    harness.server_handles.ingest_shutdown.notify_one();
+    harness.server_handles.publish_shutdown.notify_one();
 
-    let drained = coordinator.wait_for_drain(Duration::from_secs(10)).await;
+    let drained = harness
+        .coordinator
+        .wait_for_drain(Duration::from_secs(10))
+        .await;
     assert!(drained, "Drain should complete within timeout");
 
     let _ = tokio::join!(
-        client_handle,
-        server_handles.ingest_handle,
-        server_handles.publish_handle,
+        harness.client_handle,
+        harness.server_handles.ingest_handle,
+        harness.server_handles.publish_handle,
     );
     INGEST_CHANNEL.write().await.clear();
 
-    // The final timestamp on disk must be >= the pre-shutdown value,
-    // confirming that in-flight ACKs were captured by the drain.
-    let ts_after = read_time_data_map(&last_time_series_path)
+    let ts_after = read_time_data_map(&harness.last_time_series_path)
         .get(&policy.id.to_string())
         .copied()
         .expect("timestamp must survive shutdown");
@@ -858,68 +729,36 @@ async fn shutdown_drain_captures_inflight_acks() {
 #[serial]
 #[tokio::test]
 async fn restart_state_consistency() {
-    reset_last_transfer_time().await;
-    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
-
-    let certs = cert_key();
-    let coordinator = ShutdownCoordinator::new();
-    let (mut request_client, request_recv, last_time_series_path, _temp_dir, policy_handle) =
-        setup_request_client(1, &coordinator);
     let policy = new_policy(DEFAULT_POLICY_ID);
 
-    request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
-        .await
-        .unwrap();
+    // --- First run ---
+    let harness = TestHarness::new(&[policy.clone()]).await;
+    let _ = harness.wait_for_ack().await;
+    let _ = harness.wait_for_timestamp(&[policy.id]).await;
 
-    let client_handle = spawn_subscribe_client(
-        &certs,
-        request_recv,
-        &last_time_series_path,
-        ingest_addr,
-        publish_addr,
-        policy_handle,
-        coordinator.clone(),
-    );
-
-    let _ = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
-        .await
-        .expect("Ingest ACK should arrive within 5s");
-
-    let _ = timeout(
-        Duration::from_secs(5),
-        wait_for_policy_ids(&last_time_series_path, &[policy.id], true),
-    )
-    .await
-    .expect("Policy ID written to time_data.json");
-
-    // Capture the timestamp written during the first run.
-    let first_run_map = read_time_data_map(&last_time_series_path);
+    let first_run_map = read_time_data_map(&harness.last_time_series_path);
     let first_ts = *first_run_map
         .get(&policy.id.to_string())
         .expect("policy timestamp must exist after first run");
+    let last_time_series_path = harness.last_time_series_path.clone();
+    let _keep_temp = harness._temp_dir;
+    cleanup_test_resources(harness.coordinator, harness.client_handle, harness.server_handles)
+        .await;
 
-    // Shutdown the first run.
-    cleanup_test_resources(coordinator, client_handle, server_handles).await;
-
-    // Verify the persisted file is readable after shutdown.
     let read_result = crate::subscribe::read_last_timestamp(&last_time_series_path).await;
     assert!(
         read_result.is_ok(),
         "Timestamp file must be readable after shutdown: {read_result:?}"
     );
 
-    // --- Second run: start fresh servers, rebuild in-memory state from the
-    // persisted timestamp file, and verify the policy/stream state survives. ---
+    // --- Second run: re-use persisted timestamp file ---
     reset_last_transfer_time().await;
 
     let (ingest_ack_recv2, server_handles2, ingest_addr2, publish_addr2) = start_servers();
-
+    let certs = cert_key();
     let coordinator2 = ShutdownCoordinator::new();
     let (mut request_client2, request_recv2, _, _keep_dir, policy_handle2) =
         setup_request_client(1, &coordinator2);
-    // Re-use the same last_time_series_path so the second run picks up the
-    // persisted timestamps from the first run.
 
     request_client2
         .sampling_policy_list(std::slice::from_ref(&policy))
@@ -947,8 +786,6 @@ async fn restart_state_consistency() {
     .await
     .expect("Policy ID present in time_data.json on second run");
 
-    // The second run must have loaded the timestamp from the first run;
-    // verify it is at least as large (time only moves forward).
     let second_run_map = read_time_data_map(&last_time_series_path);
     let second_ts = *second_run_map
         .get(&policy.id.to_string())

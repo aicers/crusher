@@ -6,13 +6,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Added
-
-- On startup, previously registered `sampling_policy` entries
-  are now automatically synchronized from the Manager using
-  `get_sampling_policy_list`, allowing data collection to
-  resume after a restart.
-
 ### Changed
 
 - Changed how `giganto_name`, `giganto_publish_srv_addr`, and
@@ -60,6 +53,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Automatically create timestamp data file on startup when
   missing.
 - Replaced `process::exit` calls with proper error propagation.
+- Added cancellation safety to prevent partial state corruption during shutdown
+  and config reload.
 
 ## [0.7.1] - 2026-02-11
 
