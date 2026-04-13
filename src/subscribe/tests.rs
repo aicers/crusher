@@ -572,8 +572,20 @@ async fn sampling_policy_multiple_streams() {
     let policy_b = new_policy(2);
     let harness = TestHarness::new(&[policy_a.clone(), policy_b.clone()]).await;
 
-    assert!(harness.policy_handle.get_policy(policy_a.id).await.is_some());
-    assert!(harness.policy_handle.get_policy(policy_b.id).await.is_some());
+    assert!(
+        harness
+            .policy_handle
+            .get_policy(policy_a.id)
+            .await
+            .is_some()
+    );
+    assert!(
+        harness
+            .policy_handle
+            .get_policy(policy_b.id)
+            .await
+            .is_some()
+    );
 
     let mut expected_ids = vec![policy_a.id, policy_b.id];
     for _ in 0..2 {
@@ -742,8 +754,12 @@ async fn restart_state_consistency() {
         .expect("policy timestamp must exist after first run");
     let last_time_series_path = harness.last_time_series_path.clone();
     let _keep_temp = harness.temp_dir;
-    cleanup_test_resources(harness.coordinator, harness.client_handle, harness.server_handles)
-        .await;
+    cleanup_test_resources(
+        harness.coordinator,
+        harness.client_handle,
+        harness.server_handles,
+    )
+    .await;
 
     let read_result = crate::subscribe::read_last_timestamp(&last_time_series_path).await;
     assert!(
