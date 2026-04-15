@@ -538,7 +538,10 @@ async fn receiver(
         }
     };
 
-    debug_assert_eq!(id, policy.id, "stream id must match the policy passed by the caller");
+    debug_assert_eq!(
+        id, policy.id,
+        "stream id must match the policy passed by the caller"
+    );
     info!("Raw event {:?} has been connected", policy.kind);
 
     let mut series = TimeSeries::try_new(&policy).await?;

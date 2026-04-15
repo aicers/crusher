@@ -389,9 +389,9 @@ mod tests {
     use rustls::server::WebPkiClientVerifier;
 
     use super::*;
+    use crate::cancellation::CancellationCoordinator;
     use crate::client::Certs;
     use crate::policy::PolicyHandle;
-    use crate::cancellation::CancellationCoordinator;
 
     const CERT_PATH: &str = "tests/cert.pem";
     const KEY_PATH: &str = "tests/key.pem";

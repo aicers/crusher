@@ -109,10 +109,7 @@ impl CancellationCoordinator {
             *phase = CancellationPhase::Completed;
             info!("Drain completed");
         } else {
-            warn!(
-                remaining = self.tracker.active_count(),
-                "Drain timed out"
-            );
+            warn!(remaining = self.tracker.active_count(), "Drain timed out");
         }
         completed
     }

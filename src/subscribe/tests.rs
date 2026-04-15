@@ -27,9 +27,9 @@ use tokio::time::{sleep, timeout};
 
 use super::time_series::clear_last_transfer_time;
 use super::*;
+use crate::cancellation::CancellationCoordinator;
 use crate::client::Certs;
 use crate::policy::{PolicyHandle, spawn_policy_actor};
-use crate::cancellation::CancellationCoordinator;
 
 const CERT_PATH: &str = "tests/cert.pem";
 const KEY_PATH: &str = "tests/key.pem";
