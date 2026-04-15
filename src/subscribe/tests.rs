@@ -29,7 +29,7 @@ use super::time_series::clear_last_transfer_time;
 use super::*;
 use crate::client::Certs;
 use crate::policy::{PolicyHandle, spawn_policy_actor};
-use crate::shutdown::ShutdownCoordinator;
+use crate::cancellation::CancellationCoordinator;
 
 const CERT_PATH: &str = "tests/cert.pem";
 const KEY_PATH: &str = "tests/key.pem";
@@ -260,7 +260,7 @@ fn start_servers() -> (
 }
 
 struct TestHarness {
-    coordinator: ShutdownCoordinator,
+    coordinator: CancellationCoordinator,
     request_client: crate::request::Client,
     policy_handle: PolicyHandle,
     client_handle: tokio::task::JoinHandle<()>,
@@ -275,7 +275,7 @@ impl TestHarness {
         reset_last_transfer_time().await;
         let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
         let certs = cert_key();
-        let coordinator = ShutdownCoordinator::new();
+        let coordinator = CancellationCoordinator::new();
         let (request_client, request_recv, last_time_series_path, temp_dir, policy_handle) =
             setup_request_client(policies.len().max(1), &coordinator);
 
@@ -336,7 +336,7 @@ impl TestHarness {
 
 fn setup_request_client(
     buffer: usize,
-    coordinator: &ShutdownCoordinator,
+    coordinator: &CancellationCoordinator,
 ) -> (
     crate::request::Client,
     async_channel::Receiver<SamplingPolicy>,
@@ -387,7 +387,7 @@ fn spawn_subscribe_client(
     ingest_addr: SocketAddr,
     publish_addr: SocketAddr,
     policy_handle: PolicyHandle,
-    coordinator: ShutdownCoordinator,
+    coordinator: CancellationCoordinator,
 ) -> tokio::task::JoinHandle<()> {
     let client = Client::new(
         ingest_addr,
@@ -427,11 +427,11 @@ async fn wait_for_policy_ids(
 }
 
 async fn cleanup_test_resources(
-    coordinator: ShutdownCoordinator,
+    coordinator: CancellationCoordinator,
     client_handle: tokio::task::JoinHandle<()>,
     server_handles: TestServerHandlers,
 ) {
-    coordinator.request_shutdown("test cleanup");
+    coordinator.request_cancellation("test cleanup");
     server_handles.ingest_shutdown.notify_one();
     server_handles.publish_shutdown.notify_one();
 
@@ -610,12 +610,12 @@ async fn sampling_policy_multiple_streams() {
     harness.cleanup().await;
 }
 
-/// Test: After shutdown, all tracked tasks must drain within the
+/// Test: After cancellation, all tracked tasks must drain within the
 /// timeout and no tasks remain alive.
 #[serial]
 #[tokio::test]
-async fn shutdown_drains_all_tasks() {
-    use crate::shutdown::ShutdownPhase;
+async fn cancellation_drains_all_tasks() {
+    use crate::cancellation::CancellationPhase;
 
     let policy = new_policy(DEFAULT_POLICY_ID);
     let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
@@ -623,7 +623,7 @@ async fn shutdown_drains_all_tasks() {
     let _ = harness.wait_for_ack().await;
     let _ = harness.wait_for_timestamp(&[policy.id]).await;
 
-    harness.coordinator.request_shutdown("drain test");
+    harness.coordinator.request_cancellation("drain test");
     harness.server_handles.ingest_shutdown.notify_one();
     harness.server_handles.publish_shutdown.notify_one();
 
@@ -632,7 +632,7 @@ async fn shutdown_drains_all_tasks() {
         .wait_for_drain(Duration::from_secs(10))
         .await;
     assert!(drained, "Drain should complete within timeout");
-    assert_eq!(harness.coordinator.phase(), ShutdownPhase::Completed);
+    assert_eq!(harness.coordinator.phase(), CancellationPhase::Completed);
     assert_eq!(harness.coordinator.tracker().active_count(), 0);
 
     let _ = tokio::join!(
@@ -643,17 +643,17 @@ async fn shutdown_drains_all_tasks() {
     INGEST_CHANNEL.write().await.clear();
 }
 
-/// Test: Timestamp file is flushed and consistent after shutdown.
+/// Test: Timestamp file is flushed and consistent after cancellation.
 #[serial]
 #[tokio::test]
-async fn shutdown_flushes_timestamps() {
+async fn cancellation_flushes_timestamps() {
     let policy = new_policy(DEFAULT_POLICY_ID);
     let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
     let _ = harness.wait_for_ack().await;
     let map_before = harness.wait_for_timestamp(&[policy.id]).await;
 
-    harness.coordinator.request_shutdown("flush test");
+    harness.coordinator.request_cancellation("flush test");
     harness.server_handles.ingest_shutdown.notify_one();
     harness.server_handles.publish_shutdown.notify_one();
 
@@ -672,30 +672,30 @@ async fn shutdown_flushes_timestamps() {
 
     assert!(
         harness.last_time_series_path.exists(),
-        "Timestamp file must survive shutdown"
+        "Timestamp file must survive cancellation"
     );
     let map_after = read_time_data_map(&harness.last_time_series_path);
     for (k, v) in &map_before {
         assert_eq!(
             map_after.get(k),
             Some(v),
-            "Timestamp for policy {k} must be preserved after shutdown"
+            "Timestamp for policy {k} must be preserved after cancellation"
         );
     }
 }
 
-/// Test: In-flight ACK/timestamp messages sent near the shutdown
+/// Test: In-flight ACK/timestamp messages sent near the cancellation
 /// boundary are captured by the drain window and flushed to disk.
 ///
-/// The publish server sends 3 ACKs with 200ms gaps. We shut down
+/// The publish server sends 3 ACKs with 200ms gaps. We cancel
 /// immediately after the first ACK notification, so the remaining
 /// ACKs arrive while `receive_time_series_timestamp` and
 /// `write_last_timestamp` are draining.  The final timestamp on disk
-/// must be >= the pre-shutdown value, proving the drain captured
+/// must be >= the pre-cancellation value, proving the drain captured
 /// in-flight messages.
 #[serial]
 #[tokio::test]
-async fn shutdown_drain_captures_inflight_acks() {
+async fn cancellation_drain_captures_inflight_acks() {
     let policy = new_policy(DEFAULT_POLICY_ID);
     let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
@@ -708,7 +708,7 @@ async fn shutdown_drain_captures_inflight_acks() {
 
     harness
         .coordinator
-        .request_shutdown("inflight-ack drain test");
+        .request_cancellation("inflight-ack drain test");
     harness.server_handles.ingest_shutdown.notify_one();
     harness.server_handles.publish_shutdown.notify_one();
 
@@ -728,15 +728,15 @@ async fn shutdown_drain_captures_inflight_acks() {
     let ts_after = read_time_data_map(&harness.last_time_series_path)
         .get(&policy.id.to_string())
         .copied()
-        .expect("timestamp must survive shutdown");
+        .expect("timestamp must survive cancellation");
     assert!(
         ts_after >= ts_before,
-        "Final timestamp ({ts_after}) must be >= pre-shutdown ({ts_before}); \
+        "Final timestamp ({ts_after}) must be >= pre-cancellation ({ts_before}); \
          drain should not lose in-flight ACKs"
     );
 }
 
-/// Test: After shutdown + simulated restart, time data is consistent
+/// Test: After cancellation + simulated restart, time data is consistent
 /// and readable.
 #[serial]
 #[tokio::test]
@@ -764,7 +764,7 @@ async fn restart_state_consistency() {
     let read_result = crate::subscribe::read_last_timestamp(&last_time_series_path).await;
     assert!(
         read_result.is_ok(),
-        "Timestamp file must be readable after shutdown: {read_result:?}"
+        "Timestamp file must be readable after cancellation: {read_result:?}"
     );
 
     // --- Second run: re-use persisted timestamp file ---
@@ -772,7 +772,7 @@ async fn restart_state_consistency() {
 
     let (ingest_ack_recv2, server_handles2, ingest_addr2, publish_addr2) = start_servers();
     let certs = cert_key();
-    let coordinator2 = ShutdownCoordinator::new();
+    let coordinator2 = CancellationCoordinator::new();
     let (mut request_client2, request_recv2, _, _keep_dir, policy_handle2) =
         setup_request_client(1, &coordinator2);
 

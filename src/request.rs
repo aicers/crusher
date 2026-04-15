@@ -15,10 +15,10 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
+use crate::cancellation::CancellationCoordinator;
 use crate::client::SERVER_RETRY_INTERVAL;
 use crate::info_or_print;
 use crate::policy::PolicyHandle;
-use crate::shutdown::ShutdownCoordinator;
 
 const REQUIRED_MANAGER_VERSION: &str = "0.47.0";
 const MAX_RETRIES: u8 = 3;
@@ -83,7 +83,7 @@ impl Client {
         self.policy_handle = Some(handle);
     }
 
-    pub(crate) async fn run(&mut self, coordinator: ShutdownCoordinator) -> Result<()> {
+    pub(crate) async fn run(&mut self, coordinator: CancellationCoordinator) -> Result<()> {
         tokio::select! {
             biased;
             () = coordinator.cancelled() => {
@@ -391,7 +391,7 @@ mod tests {
     use super::*;
     use crate::client::Certs;
     use crate::policy::PolicyHandle;
-    use crate::shutdown::ShutdownCoordinator;
+    use crate::cancellation::CancellationCoordinator;
 
     const CERT_PATH: &str = "tests/cert.pem";
     const KEY_PATH: &str = "tests/key.pem";
@@ -406,7 +406,7 @@ mod tests {
     ) {
         let (tx, rx) = async_channel::unbounded();
         let config_reload = Arc::new(Notify::new());
-        let coordinator = ShutdownCoordinator::new();
+        let coordinator = CancellationCoordinator::new();
         let policy_handle = crate::policy::spawn_policy_actor(tx, &coordinator);
 
         let client = Client {
@@ -1037,14 +1037,14 @@ mod tests {
     // =========================================================================
 
     #[tokio::test(flavor = "current_thread")]
-    async fn run_exits_on_shutdown() {
-        // Test: run() should exit cleanly when shutdown is requested.
+    async fn run_exits_on_cancellation() {
+        // Test: run() should exit cleanly when cancellation is requested.
         // Policy state is owned by the actor (spawned per-run), so
         // there is nothing to clear on the Client itself.
         let (mut client, _rx, _policy_handle) = create_test_client();
 
-        let coordinator = ShutdownCoordinator::new();
-        coordinator.request_shutdown("test");
+        let coordinator = CancellationCoordinator::new();
+        coordinator.request_cancellation("test");
 
         let result = client.run(coordinator).await;
         assert!(result.is_ok());
@@ -1101,7 +1101,7 @@ mod tests {
         });
 
         let (request_send, request_recv) = async_channel::unbounded::<SamplingPolicy>();
-        let coordinator = ShutdownCoordinator::new();
+        let coordinator = CancellationCoordinator::new();
         let policy_handle = crate::policy::spawn_policy_actor(request_send, &coordinator);
         let mut client = Client::new(
             server_addr,

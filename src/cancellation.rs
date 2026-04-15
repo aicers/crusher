@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Tracks active child tasks and allows waiting for all of them to
-/// complete during shutdown drain.
+/// complete during drain.
 #[derive(Clone)]
 pub(crate) struct TaskTracker {
     inner: tokio_util::task::TaskTracker,
@@ -41,30 +41,30 @@ impl TaskTracker {
     }
 }
 
-/// Shutdown phases.
+/// Cancellation phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShutdownPhase {
+pub(crate) enum CancellationPhase {
     Running,
     Draining,
     Completed,
 }
 
-/// Coordinates shutdown across the application. Owns a
+/// Coordinates async task cancellation across the application. Owns a
 /// [`CancellationToken`] and a [`TaskTracker`].
 #[derive(Clone)]
-pub(crate) struct ShutdownCoordinator {
+pub(crate) struct CancellationCoordinator {
     token: CancellationToken,
     tracker: TaskTracker,
-    phase: Arc<std::sync::Mutex<ShutdownPhase>>,
+    phase: Arc<std::sync::Mutex<CancellationPhase>>,
 }
 
-impl ShutdownCoordinator {
+impl CancellationCoordinator {
     /// Creates a new coordinator in the `Running` phase.
     pub(crate) fn new() -> Self {
         Self {
             token: CancellationToken::new(),
             tracker: TaskTracker::new(),
-            phase: Arc::new(std::sync::Mutex::new(ShutdownPhase::Running)),
+            phase: Arc::new(std::sync::Mutex::new(CancellationPhase::Running)),
         }
     }
 
@@ -73,17 +73,17 @@ impl ShutdownCoordinator {
         &self.tracker
     }
 
-    /// Requests shutdown by cancelling the token.
-    pub(crate) fn request_shutdown(&self, reason: &str) {
+    /// Requests cancellation by cancelling the token.
+    pub(crate) fn request_cancellation(&self, reason: &str) {
         let mut phase = self.phase.lock().expect("phase lock poisoned");
-        if *phase == ShutdownPhase::Running {
-            info!(%reason, "Shutdown requested");
-            *phase = ShutdownPhase::Draining;
+        if *phase == CancellationPhase::Running {
+            info!(%reason, "Cancellation requested");
+            *phase = CancellationPhase::Draining;
             self.token.cancel();
         }
     }
 
-    /// Returns `true` if shutdown has been requested.
+    /// Returns `true` if cancellation has been requested.
     #[cfg(test)]
     pub(crate) fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
@@ -94,8 +94,8 @@ impl ShutdownCoordinator {
         self.token.cancelled().await;
     }
 
-    /// Waits for all tracked tasks to complete after shutdown has been
-    /// requested. Returns `true` if drain completed within the
+    /// Waits for all tracked tasks to complete after cancellation has
+    /// been requested. Returns `true` if drain completed within the
     /// timeout, `false` if timed out.
     ///
     /// # Errors
@@ -106,20 +106,20 @@ impl ShutdownCoordinator {
         let completed = tokio::time::timeout(timeout, drain).await.is_ok();
         let mut phase = self.phase.lock().expect("phase lock poisoned");
         if completed {
-            *phase = ShutdownPhase::Completed;
-            info!("Shutdown drain completed");
+            *phase = CancellationPhase::Completed;
+            info!("Drain completed");
         } else {
             warn!(
                 remaining = self.tracker.active_count(),
-                "Shutdown drain timed out"
+                "Drain timed out"
             );
         }
         completed
     }
 
-    /// Returns the current shutdown phase.
+    /// Returns the current cancellation phase.
     #[cfg(test)]
-    pub(crate) fn phase(&self) -> ShutdownPhase {
+    pub(crate) fn phase(&self) -> CancellationPhase {
         *self.phase.lock().expect("phase lock poisoned")
     }
 }
@@ -134,18 +134,18 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_token_propagates() {
-        let coord = ShutdownCoordinator::new();
+        let coord = CancellationCoordinator::new();
         assert!(!coord.is_cancelled());
-        assert_eq!(coord.phase(), ShutdownPhase::Running);
+        assert_eq!(coord.phase(), CancellationPhase::Running);
 
-        coord.request_shutdown("test");
+        coord.request_cancellation("test");
         assert!(coord.is_cancelled());
-        assert_eq!(coord.phase(), ShutdownPhase::Draining);
+        assert_eq!(coord.phase(), CancellationPhase::Draining);
     }
 
     #[tokio::test]
     async fn task_tracker_counts_tasks() {
-        let coord = ShutdownCoordinator::new();
+        let coord = CancellationCoordinator::new();
         let tracker = coord.tracker().clone();
 
         let notify = Arc::new(Notify::new());
@@ -169,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_completes_when_tasks_finish() {
-        let coord = ShutdownCoordinator::new();
+        let coord = CancellationCoordinator::new();
         let tracker = coord.tracker().clone();
         let notify = Arc::new(Notify::new());
         let n = notify.clone();
@@ -178,20 +178,20 @@ mod tests {
             n.notified().await;
         });
 
-        coord.request_shutdown("test drain");
+        coord.request_cancellation("test drain");
 
         // Release the blocked task.
         notify.notify_one();
 
         let completed = coord.wait_for_drain(Duration::from_secs(5)).await;
         assert!(completed);
-        assert_eq!(coord.phase(), ShutdownPhase::Completed);
+        assert_eq!(coord.phase(), CancellationPhase::Completed);
         assert_eq!(tracker.active_count(), 0);
     }
 
     #[tokio::test]
     async fn drain_times_out_with_stuck_task() {
-        let coord = ShutdownCoordinator::new();
+        let coord = CancellationCoordinator::new();
         let tracker = coord.tracker().clone();
 
         tracker.spawn(async {
@@ -199,15 +199,15 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        coord.request_shutdown("timeout test");
+        coord.request_cancellation("timeout test");
         let completed = coord.wait_for_drain(Duration::from_millis(50)).await;
         assert!(!completed);
-        assert_eq!(coord.phase(), ShutdownPhase::Draining);
+        assert_eq!(coord.phase(), CancellationPhase::Draining);
     }
 
     #[tokio::test]
     async fn panicking_task_is_tracked_correctly() {
-        let coord = ShutdownCoordinator::new();
+        let coord = CancellationCoordinator::new();
         let tracker = coord.tracker().clone();
 
         let h = tracker.spawn(async {
@@ -218,18 +218,18 @@ mod tests {
         let _ = h.await;
         assert_eq!(tracker.active_count(), 0);
 
-        coord.request_shutdown("panic test");
+        coord.request_cancellation("panic test");
         let completed = coord.wait_for_drain(Duration::from_secs(1)).await;
         assert!(completed);
     }
 
     #[tokio::test]
-    async fn multiple_shutdown_requests_are_idempotent() {
-        let coord = ShutdownCoordinator::new();
-        coord.request_shutdown("first");
-        coord.request_shutdown("second");
+    async fn multiple_cancellation_requests_are_idempotent() {
+        let coord = CancellationCoordinator::new();
+        coord.request_cancellation("first");
+        coord.request_cancellation("second");
         assert!(coord.is_cancelled());
-        assert_eq!(coord.phase(), ShutdownPhase::Draining);
+        assert_eq!(coord.phase(), CancellationPhase::Draining);
     }
 
     /// Drain timeout must leave the coordinator in `Draining` phase,
@@ -238,7 +238,7 @@ mod tests {
     /// `process::exit(1)`, preventing re-entry into a new run cycle.
     #[tokio::test]
     async fn drain_timeout_prevents_reentry() {
-        let coord = ShutdownCoordinator::new();
+        let coord = CancellationCoordinator::new();
         let tracker = coord.tracker().clone();
 
         // Spawn a task that never finishes.
@@ -246,12 +246,12 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        coord.request_shutdown("reentry test");
+        coord.request_cancellation("reentry test");
         let completed = coord.wait_for_drain(Duration::from_millis(50)).await;
 
         // Drain timed out — phase must NOT be Completed.
         assert!(!completed);
-        assert_eq!(coord.phase(), ShutdownPhase::Draining);
+        assert_eq!(coord.phase(), CancellationPhase::Draining);
         // Active tasks are still alive — a new generation must not
         // start because it would overlap with stuck tasks.
         assert!(

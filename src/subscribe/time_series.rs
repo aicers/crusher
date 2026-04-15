@@ -176,7 +176,7 @@ fn start_time(policy: &SamplingPolicy, time: DateTime<Utc>) -> Result<DateTime<U
 pub(super) async fn write_last_timestamp(
     last_series_time_path: PathBuf,
     time_receiver: Receiver<(String, i64)>,
-    coordinator: crate::shutdown::ShutdownCoordinator,
+    coordinator: crate::cancellation::CancellationCoordinator,
 ) -> Result<()> {
     loop {
         let item = tokio::select! {
@@ -610,7 +610,7 @@ mod tests {
         let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
 
         // Start the writer task
-        let coord = crate::shutdown::ShutdownCoordinator::new();
+        let coord = crate::cancellation::CancellationCoordinator::new();
         let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver, coord));
 
         // Send some timestamps
@@ -665,7 +665,7 @@ mod tests {
         let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
 
         let path_clone = file_path.clone();
-        let coord = crate::shutdown::ShutdownCoordinator::new();
+        let coord = crate::cancellation::CancellationCoordinator::new();
         let writer_handle =
             tokio::spawn(async move { write_last_timestamp(path_clone, receiver, coord).await });
 

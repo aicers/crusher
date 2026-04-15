@@ -1,9 +1,9 @@
+mod cancellation;
 mod client;
 mod logging;
 mod policy;
 mod request;
 mod settings;
-mod shutdown;
 mod subscribe;
 
 use std::fs;
@@ -14,18 +14,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use cancellation::CancellationCoordinator;
 use clap::Parser;
 use client::Certs;
 use logging::init_tracing;
 use review_protocol::types::SamplingPolicy;
 use settings::Settings;
-use shutdown::ShutdownCoordinator;
 use subscribe::{clear_ingest_channel, ensure_time_data_exists, read_last_timestamp};
 use tokio::sync::Notify;
 use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
 
-const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 
@@ -183,7 +183,7 @@ async fn run(
     );
 
     info!("Time series generate started");
-    let coordinator = ShutdownCoordinator::new();
+    let coordinator = CancellationCoordinator::new();
 
     // Spawn the policy actor. All policy state mutations go through
     // this handle, ensuring atomicity and cancellation safety.
@@ -204,7 +204,7 @@ async fn run(
     let result = tokio::select! {
         biased;
         res = &mut subscribe_handle => {
-            coordinator.request_shutdown("subscribe exit");
+            coordinator.request_cancellation("subscribe exit");
             match res {
                 Ok(Err(e)) => Err(e),
                 Ok(Ok(())) => Ok(()),
@@ -212,7 +212,7 @@ async fn run(
             }
         }
         res = &mut request_handle => {
-            coordinator.request_shutdown("request exit");
+            coordinator.request_cancellation("request exit");
             match res {
                 Ok(Err(e)) => Err(e),
                 Ok(Ok(())) => Ok(()),
@@ -220,23 +220,20 @@ async fn run(
             }
         }
         () = config_reload.notified(), if args.is_remote_mode() => {
-            coordinator.request_shutdown("config reload");
+            coordinator.request_cancellation("config reload");
             info!("Reloading the configuration");
             Ok(())
         },
     };
 
-    // Explicitly drive the remaining top-level tasks to completion.
-    // The completed one aborts as a no-op; the live one will see
-    // cancelled() and exit cooperatively.
-    subscribe_handle.abort();
-    request_handle.abort();
+    // Wait for the remaining top-level task to exit cooperatively
+    // via its `coordinator.cancelled()` check — no hard abort.
     let _ = tokio::join!(subscribe_handle, request_handle);
 
     // Wait for child/background tasks (tracked by TaskTracker).
-    if !coordinator.wait_for_drain(SHUTDOWN_DRAIN_TIMEOUT).await {
+    if !coordinator.wait_for_drain(DRAIN_TIMEOUT).await {
         error!(
-            "Shutdown drain timed out; aborting to prevent \
+            "Drain timed out; aborting to prevent \
              overlapping generations"
         );
         clear_ingest_channel().await;

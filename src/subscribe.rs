@@ -31,11 +31,11 @@ use tokio::{
     sync::{Notify, RwLock, oneshot},
     time::{Duration, sleep},
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
+use crate::cancellation::CancellationCoordinator;
 use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
 use crate::policy::PolicyHandle;
-use crate::shutdown::ShutdownCoordinator;
 
 pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.26.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
@@ -151,7 +151,7 @@ impl Client {
     pub(crate) async fn run(
         self,
         policy_handle: PolicyHandle,
-        coordinator: ShutdownCoordinator,
+        coordinator: CancellationCoordinator,
     ) -> Result<()> {
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
         let connection_notify = Arc::new(Notify::new());
@@ -201,7 +201,7 @@ async fn ingest_connection_control(
     last_series_time_path: &Path,
     version: &str,
     connection_notify: Arc<Notify>,
-    coordinator: ShutdownCoordinator,
+    coordinator: CancellationCoordinator,
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = connection_notify.clone();
@@ -281,7 +281,7 @@ async fn publish_connection_control(
     policy_handle: PolicyHandle,
     last_series_time_path: &Path,
     connection_notify: Arc<Notify>,
-    coordinator: ShutdownCoordinator,
+    coordinator: CancellationCoordinator,
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = connection_notify.clone();
@@ -456,8 +456,16 @@ async fn process_network_stream(
     connection_notify: Arc<Notify>,
     policy_handle: PolicyHandle,
     last_series_time_path: PathBuf,
-    coordinator: ShutdownCoordinator,
+    coordinator: CancellationCoordinator,
 ) -> Result<()> {
+    // Fetch the policy token BEFORE sending the stream request so
+    // that a concurrent delete cannot slip between send and token
+    // acquisition.
+    let policy_token = policy_handle
+        .get_policy_token(policy.id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no cancellation token for policy {}", policy.id))?;
+
     let start = policy.start_timestamp().await?;
     let req_msg = RequestTimeSeriesGeneratorStream {
         start,
@@ -481,18 +489,13 @@ async fn process_network_stream(
         .await
         .map_err(|_| anyhow::anyhow!("SendStream actor dropped reply"))??;
 
-    let policy_token = policy_handle
-        .get_policy_token(policy.id)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no cancellation token for policy {}", policy.id))?;
-
     let recv_coordinator = coordinator.clone();
     coordinator.tracker().spawn(async move {
         receiver(
             conn,
             sender,
             connection_notify,
-            policy_handle,
+            policy,
             policy_token,
             last_series_time_path,
             recv_coordinator,
@@ -507,10 +510,10 @@ async fn receiver(
     conn: Connection,
     sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
-    policy_handle: PolicyHandle,
+    policy: SamplingPolicy,
     policy_token: tokio_util::sync::CancellationToken,
     last_series_time_path: PathBuf,
-    coordinator: ShutdownCoordinator,
+    coordinator: CancellationCoordinator,
 ) -> Result<()> {
     let recv_result = tokio::select! {
         biased;
@@ -535,9 +538,7 @@ async fn receiver(
         }
     };
 
-    let Some(policy) = policy_handle.get_policy(id).await else {
-        bail!("Failed to get runtime policy data");
-    };
+    debug_assert_eq!(id, policy.id, "stream id must match the policy passed by the caller");
     info!("Raw event {:?} has been connected", policy.kind);
 
     let mut series = TimeSeries::try_new(&policy).await?;
@@ -598,7 +599,7 @@ async fn send_time_series(
     series: TimeSeries,
     time_sender: Sender<(String, i64)>,
     connection_notify: Arc<Notify>,
-    coordinator: ShutdownCoordinator,
+    coordinator: CancellationCoordinator,
 ) -> Result<()> {
     // Store sender channel (Channel for receiving the next time_series after the first transmission)
     let sampling_policy_id = series.sampling_policy_id.clone();
@@ -683,69 +684,62 @@ async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -
 const ACK_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 async fn receive_time_series_timestamp(
-    mut receiver: RecvStream,
+    mut series_receiver: RecvStream,
     sampling_policy_id: String,
     time_sender: Sender<(String, i64)>,
     connection_notify: Arc<Notify>,
-    coordinator: ShutdownCoordinator,
+    coordinator: CancellationCoordinator,
 ) -> Result<()> {
     loop {
-        let ack = tokio::select! {
+        let result = tokio::select! {
             biased;
             () = coordinator.cancelled() => {
-                info!("receive_time_series_timestamp draining before shutdown");
-                // Drain any ACK/timestamp messages that arrived around
-                // cancellation so they are forwarded to
-                // write_last_timestamp before exit.
-                let drain_deadline = tokio::time::Instant::now() + ACK_DRAIN_TIMEOUT;
+                info!(
+                    %sampling_policy_id,
+                    "receive_time_series_timestamp draining"
+                );
+                let drain_deadline =
+                    tokio::time::Instant::now() + ACK_DRAIN_TIMEOUT;
                 loop {
-                    let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining = drain_deadline
+                        .saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         break;
                     }
-                    match tokio::time::timeout(remaining, receive_ack_timestamp(&mut receiver)).await {
-                        Ok(Ok(timestamp)) => {
-                            debug!(
-                                "Drain: ACK timestamp for {}: {}",
-                                sampling_policy_id,
-                                Utc.timestamp_nanos(timestamp)
-                            );
-                            // Best-effort forward; if the channel is
-                            // closed we stop draining.
-                            if time_sender
-                                .send((sampling_policy_id.clone(), timestamp))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
+                    match tokio::time::timeout(
+                        remaining,
+                        receive_ack_timestamp(&mut series_receiver),
+                    )
+                    .await
+                    {
+                        Ok(Ok(ts)) => {
+                            let _ = time_sender
+                                .send((sampling_policy_id.clone(), ts))
+                                .await;
                         }
-                        // Stream finished or error — nothing left to drain.
-                        Ok(Err(_)) | Err(_) => break,
+                        _ => break,
                     }
                 }
-                info!("receive_time_series_timestamp shutting down");
                 return Ok(());
             }
-            result = receive_ack_timestamp(&mut receiver) => result,
+            result = receive_ack_timestamp(&mut series_receiver) => result,
         };
-        match ack {
+        match result {
             Ok(timestamp) => {
-                debug!(
-                    "The time of the timeseries last sent by {}. : {}",
-                    sampling_policy_id,
-                    Utc.timestamp_nanos(timestamp)
-                );
-                time_sender
+                let _ = time_sender
                     .send((sampling_policy_id.clone(), timestamp))
-                    .await?;
+                    .await;
             }
             Err(RecvError::ReadError(quinn::ReadExactError::FinishedEarly(_))) => {
                 break;
             }
             Err(e) => {
+                warn!(
+                    %sampling_policy_id,
+                    "receive_time_series_timestamp error: {e}"
+                );
                 connection_notify.notify_waiters();
-                bail!("Last series times error: {e}");
+                break;
             }
         }
     }

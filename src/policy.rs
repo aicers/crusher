@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::shutdown::ShutdownCoordinator;
+use crate::cancellation::CancellationCoordinator;
 
 const POLICY_COMMAND_CHANNEL_SIZE: usize = 32;
 
@@ -19,6 +19,7 @@ enum PolicyCommand {
         ids: Vec<u32>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    #[cfg(test)]
     GetPolicy {
         id: u32,
         reply: oneshot::Sender<Option<SamplingPolicy>>,
@@ -42,6 +43,8 @@ pub(crate) struct PolicyHandle {
 impl PolicyHandle {
     /// Adds policies to the active set and notifies the subscribe side
     /// for each new policy. Duplicate policy IDs are silently skipped.
+    /// The batch is all-or-nothing: if forwarding any policy fails, all
+    /// newly inserted policies in this batch are rolled back.
     pub(crate) async fn add_policies(&self, policies: Vec<SamplingPolicy>) -> Result<(), String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -73,6 +76,7 @@ impl PolicyHandle {
     }
 
     /// Returns a clone of the policy with the given ID, if it exists.
+    #[cfg(test)]
     pub(crate) async fn get_policy(&self, id: u32) -> Option<SamplingPolicy> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self
@@ -116,10 +120,10 @@ impl PolicyHandle {
 /// partial-state updates on cancellation.
 ///
 /// The actor exits when all [`PolicyHandle`] clones are dropped
-/// (the command channel closes) or when shutdown is requested.
+/// (the command channel closes) or when cancellation is requested.
 pub(crate) fn spawn_policy_actor(
     policy_send: Sender<SamplingPolicy>,
-    coordinator: &ShutdownCoordinator,
+    coordinator: &CancellationCoordinator,
 ) -> PolicyHandle {
     let (tx, mut rx) = mpsc::channel::<PolicyCommand>(POLICY_COMMAND_CHANNEL_SIZE);
     let coord = coordinator.clone();
@@ -141,6 +145,7 @@ pub(crate) fn spawn_policy_actor(
             };
             match cmd {
                 PolicyCommand::AddPolicies { policies, reply } => {
+                    let mut inserted_ids = Vec::new();
                     let mut result = Ok(());
                     for policy in policies {
                         if active_policies.contains_key(&policy.id) {
@@ -150,10 +155,13 @@ pub(crate) fn spawn_policy_actor(
                         let id = policy.id;
                         active_policies.insert(id, policy.clone());
                         policy_tokens.insert(id, CancellationToken::new());
+                        inserted_ids.push(id);
                         info!("Received request to update time series policy list");
                         if let Err(e) = policy_send.send(policy).await {
-                            active_policies.remove(&id);
-                            policy_tokens.remove(&id);
+                            for rollback_id in &inserted_ids {
+                                active_policies.remove(rollback_id);
+                                policy_tokens.remove(rollback_id);
+                            }
                             result = Err(format!("send fail: {e}"));
                             break;
                         }
@@ -174,6 +182,7 @@ pub(crate) fn spawn_policy_actor(
                     }
                     let _ = reply.send(Ok(()));
                 }
+                #[cfg(test)]
                 PolicyCommand::GetPolicy { id, reply } => {
                     let _ = reply.send(active_policies.get(&id).cloned());
                 }
@@ -197,7 +206,7 @@ mod tests {
     use review_protocol::types::{SamplingKind, SamplingPolicy};
 
     use super::*;
-    use crate::shutdown::ShutdownCoordinator;
+    use crate::cancellation::CancellationCoordinator;
 
     fn test_policy(id: u32) -> SamplingPolicy {
         SamplingPolicy {
@@ -215,7 +224,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_and_get_policies() {
-        let coordinator = ShutdownCoordinator::new();
+        let coordinator = CancellationCoordinator::new();
         let (policy_tx, policy_rx) = async_channel::bounded::<SamplingPolicy>(10);
         let handle = spawn_policy_actor(policy_tx, &coordinator);
 
@@ -236,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_policies_are_skipped() {
-        let coordinator = ShutdownCoordinator::new();
+        let coordinator = CancellationCoordinator::new();
         let (policy_tx, policy_rx) = async_channel::bounded::<SamplingPolicy>(10);
         let handle = spawn_policy_actor(policy_tx, &coordinator);
 
@@ -251,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_cancels_token() {
-        let coordinator = ShutdownCoordinator::new();
+        let coordinator = CancellationCoordinator::new();
         let (policy_tx, _policy_rx) = async_channel::bounded::<SamplingPolicy>(10);
         let handle = spawn_policy_actor(policy_tx, &coordinator);
 
@@ -273,7 +282,7 @@ mod tests {
     /// happens (the command was never received).
     #[tokio::test]
     async fn cancel_caller_during_add_does_not_corrupt_state() {
-        let coordinator = ShutdownCoordinator::new();
+        let coordinator = CancellationCoordinator::new();
         let (policy_tx, _policy_rx) = async_channel::bounded::<SamplingPolicy>(10);
         let handle = spawn_policy_actor(policy_tx, &coordinator);
 
@@ -313,7 +322,7 @@ mod tests {
     /// cancelled).
     #[tokio::test]
     async fn cancel_caller_during_delete_is_safe() {
-        let coordinator = ShutdownCoordinator::new();
+        let coordinator = CancellationCoordinator::new();
         let (policy_tx, _policy_rx) = async_channel::bounded::<SamplingPolicy>(10);
         let handle = spawn_policy_actor(policy_tx, &coordinator);
 
@@ -340,5 +349,30 @@ mod tests {
                 "policy {id} must be active or have its token cancelled"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn add_policies_batch_rollback_on_failure() {
+        let coordinator = CancellationCoordinator::new();
+        let (policy_tx, policy_rx) = async_channel::bounded::<SamplingPolicy>(1);
+        let handle = spawn_policy_actor(policy_tx, &coordinator);
+
+        // Fill the channel so that the second policy send will fail.
+        handle.add_policies(vec![test_policy(1)]).await.unwrap();
+        assert!(handle.get_policy(1).await.is_some());
+
+        // Close the channel receiver so sends fail.
+        policy_rx.close();
+
+        let result = handle
+            .add_policies(vec![test_policy(2), test_policy(3)])
+            .await;
+        assert!(result.is_err());
+
+        // Both policies from the failed batch must be rolled back.
+        assert!(handle.get_policy(2).await.is_none());
+        assert!(handle.get_policy(3).await.is_none());
+        // The original policy is untouched.
+        assert!(handle.get_policy(1).await.is_some());
     }
 }

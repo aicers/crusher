@@ -55,6 +55,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Replaced `process::exit` calls with proper error propagation.
 - Added cancellation safety to prevent partial state corruption during shutdown
   and config reload.
+- Renamed `ShutdownCoordinator` to `CancellationCoordinator` (module
+  `shutdown` → `cancellation`) to better distinguish async task cancellation
+  from system shutdown.
+- Replaced hard abort of top-level tasks with cooperative cancellation via
+  `CancellationCoordinator`, removing the mixed abort/cooperative model.
+- Fixed race in `process_network_stream()` where the stream request was sent
+  before acquiring the per-policy `CancellationToken`.
+- Passed `SamplingPolicy` directly into `receiver()` instead of re-reading
+  from the actor, eliminating a gap where a concurrent delete could cause the
+  receiver to exit before reaching its cleanup path.
+- Made `AddPolicies` batch fully atomic: all newly inserted policies are
+  rolled back on send failure.
 
 ## [0.7.1] - 2026-02-11
 
