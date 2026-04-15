@@ -116,26 +116,54 @@ log_path = "path/to/time_series_generator.log"
 
 ## Documentation
 
-This project uses [MkDocs](https://www.mkdocs.org/) with the shared
-[aicers/docs-theme](https://github.com/aicers/docs-theme). To build
-the documentation locally:
+- Manual entry point: [`docs/en/index.md`](docs/en/index.md) (English)
+- 매뉴얼 시작점: [`docs/ko/index.md`](docs/ko/index.md) (한국어)
 
-1. Install the [GitHub CLI](https://cli.github.com/) (`gh`) and
-   ensure `GH_TOKEN` is set or `gh auth login` has been completed.
-2. Fetch the shared theme:
+Build locally:
 
-   ```sh
-   ./scripts/fetch-theme.sh
-   ```
+```bash
+brew install python gh
+python3 -m venv .venv
+# zsh/bash:
+source .venv/bin/activate
+# fish:
+source .venv/bin/activate.fish
+pip install mkdocs-material mkdocs-static-i18n mkdocs-with-pdf PyYAML
+./scripts/fetch-theme.sh
+mkdocs serve -a 127.0.0.1:8000 --livereload --dirtyreload
+```
 
-3. Install Python dependencies and build:
+Command notes:
 
-   ```sh
-   pip install mkdocs-material
-   mkdocs build --strict
-   ```
+- `brew install python gh`: installs Python and GitHub CLI (one-time per
+  machine). `gh` is required to fetch the shared docs theme.
+- `python3 -m venv .venv`: creates a local virtualenv for this repo.
+- `source .venv/bin/activate`: activates the virtualenv for the current shell.
+- `pip install ...`: installs MkDocs tooling into the virtualenv.
+- Run the `pip install ...` step once after creating the virtualenv (per clone).
+- `./scripts/fetch-theme.sh`: fetches the shared docs theme from
+  [aicers/docs-theme](https://github.com/aicers/docs-theme). The version and
+  template are declared in `docs/theme.toml`. Subsequent runs skip the download
+  if the installed version already matches.
+- `mkdocs serve -a 127.0.0.1:8000 --livereload --dirtyreload`: runs a local docs
+  server.
+- `mkdocs build`: builds static files into `site/`.
 
-The generated site is written to `site/` (git-ignored).
+### PDF Generation
+
+Native dependencies (macOS):
+
+```bash
+brew install cairo pango gdk-pixbuf libffi
+```
+
+Build a PDF manual:
+
+```bash
+./scripts/build-docs-pdf.sh en|ko
+```
+
+The script produces `site/pdf/crusher-manual.{locale}.pdf`.
 
 ## Copyright
 

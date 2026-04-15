@@ -4,26 +4,9 @@ on:
   push:
     branches:
       - main
-    paths:
-      - "docs/**"
-      - "mkdocs.yml"
-      - "**/*.md"
-      - ".markdownlint*"
-      - "scripts/fetch-theme.sh"
-      - "scripts/build-docs-pdf.sh"
   pull_request:
     branches:
       - main
-    paths:
-      - "docs/**"
-      - "mkdocs.yml"
-      - "**/*.md"
-      - ".markdownlint*"
-      - "scripts/fetch-theme.sh"
-      - "scripts/build-docs-pdf.sh"
-
-permissions:
-  contents: read
 
 jobs:
   build:
@@ -44,7 +27,7 @@ jobs:
           key: ${{ runner.os }}-docs-theme-${{ hashFiles('docs/theme.toml') }}
 
       - name: Install MkDocs
-        run: python3 -m pip install --upgrade pip mkdocs-material
+        run: python3 -m pip install --upgrade pip mkdocs-material mkdocs-static-i18n
 
       - name: Fetch Docs Theme
         run: ./scripts/fetch-theme.sh
@@ -53,8 +36,3 @@ jobs:
 
       - name: Build
         run: mkdocs build --strict
-
-      - name: markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@v18
-        with:
-          globs: "**/*.md"

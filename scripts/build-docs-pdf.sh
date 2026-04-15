@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $0 <en|ko>" >&2
+  exit 1
+fi
+
+locale="$1"
 python_bin="python3"
 mkdocs_bin="mkdocs"
 
@@ -12,6 +18,14 @@ if [[ -x ".venv/bin/mkdocs" ]]; then
   mkdocs_bin=".venv/bin/mkdocs"
 fi
 
+case "$locale" in
+  en|ko) ;;
+  *)
+    echo "Unsupported locale: $locale" >&2
+    exit 1
+    ;;
+esac
+
 if [[ ! -d "docs/.theme" ]]; then
   echo "Error: docs/.theme not found. Run ./scripts/fetch-theme.sh first." >&2
   exit 1
@@ -19,13 +33,18 @@ fi
 
 trap 'rm -f mkdocs.tmp.yml; if [[ "${CRUSHER_PDF_DEBUG:-0}" != "1" ]]; then rm -rf .pdf-tmp; fi' EXIT
 
-"$python_bin" - <<'PY'
+CRUSHER_LOCALE="$locale" "$python_bin" - <<'PY'
 import copy
 import os
 import sys
 from datetime import datetime
 import shutil
 import yaml
+
+locale = os.environ.get("CRUSHER_LOCALE")
+if not locale:
+    print("CRUSHER_LOCALE is required", file=sys.stderr)
+    sys.exit(1)
 
 with open("mkdocs.yml", "r", encoding="utf-8") as f:
     data = yaml.safe_load(f)
@@ -55,27 +74,40 @@ with open(styles_path, "w", encoding="utf-8") as f:
     f.write(styles)
 
 data["strict"] = False
-data["site_dir"] = "site-pdf"
+data["site_dir"] = f"site-pdf-{locale}"
 
 theme = data.get("theme")
 if isinstance(theme, dict):
     theme["font"] = False
+
+for plugin in data.get("plugins", []):
+    if isinstance(plugin, dict) and "i18n" in plugin:
+        plugin["i18n"]["build_only_locale"] = locale
 
 now = datetime.now()
 
 pdf_plugin = {
     "with-pdf": {
         "enabled_if_env": "CRUSHER_PDF_EXPORT",
-        "output_path": os.path.join(root, "site", "pdf", "crusher-manual.pdf"),
+        "output_path": os.path.join(root, "site", "pdf", f"crusher-manual.{locale}.pdf"),
         "custom_template_path": tmp_pdf_dir,
-        "author": f"Crusher\n{now.strftime('%B %-d, %Y')}",
-        "copyright": "\u00a9 2026 ClumL Inc.",
+        "author": now.strftime('%B %-d, %Y'),
+        "copyright": "© 2026 ClumL Inc.",
         "cover_logo": "docs/.theme/brand.svg",
-        "cover_title": "Crusher",
-        "cover_subtitle": "User Manual",
-        "toc_title": "Table of Contents",
     }
 }
+
+if locale == "ko":
+    pdf_plugin["with-pdf"]["cover_title"] = "Crusher"
+    pdf_plugin["with-pdf"]["cover_subtitle"] = "사용자 매뉴얼"
+    pdf_plugin["with-pdf"]["toc_title"] = "목차"
+    pdf_plugin["with-pdf"]["author"] = now.strftime('%Y년 %-m월 %-d일')
+    data.setdefault("extra", {})["cover_tagline"] = "기술 설치 및 운영 매뉴얼"
+else:
+    pdf_plugin["with-pdf"]["cover_title"] = "Crusher"
+    pdf_plugin["with-pdf"]["cover_subtitle"] = "User Manual"
+    pdf_plugin["with-pdf"]["toc_title"] = "Table of Contents"
+    data.setdefault("extra", {})["cover_tagline"] = "Technical Installation and Operations Manual"
 
 data.setdefault("plugins", []).append(pdf_plugin)
 

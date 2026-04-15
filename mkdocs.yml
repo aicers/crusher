@@ -1,5 +1,5 @@
 site_name: Crusher
-site_description: Crusher documentation
+site_description: Crusher documentation (EN/KR)
 repo_url: https://github.com/aicers/crusher
 site_url: https://example.invalid/crusher
 
@@ -15,9 +15,22 @@ theme:
 
 plugins:
   - search
-
-nav:
-  - Overview: index.md
+  - i18n:
+      docs_structure: folder
+      languages:
+        - locale: en
+          name: English
+          build: true
+          default: true
+          nav:
+            - Overview: index.md
+        - locale: ko
+          name: 한국어
+          build: true
+          nav:
+            - Overview: index.md
+          nav_translations:
+            Overview: 개요
 
 extra_css:
   - .theme/styles/lists.css
