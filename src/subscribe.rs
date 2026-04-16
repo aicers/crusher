@@ -460,11 +460,15 @@ async fn process_network_stream(
 ) -> Result<()> {
     // Fetch the policy token BEFORE sending the stream request so
     // that a concurrent delete cannot slip between send and token
-    // acquisition.
-    let policy_token = policy_handle
-        .get_policy_token(policy.id)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no cancellation token for policy {}", policy.id))?;
+    // acquisition.  If the token is gone the policy was already
+    // deleted — this is a normal add/delete race, not an error.
+    let Some(policy_token) = policy_handle.get_policy_token(policy.id).await else {
+        info!(
+            "Stale queued policy {}; already deleted, skipping stream open",
+            policy.id
+        );
+        return Ok(());
+    };
 
     let start = policy.start_timestamp().await?;
     let req_msg = RequestTimeSeriesGeneratorStream {
