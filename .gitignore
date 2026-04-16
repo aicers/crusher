@@ -8,3 +8,4 @@
 # MkDocs
 docs/.theme/
 site/
+site-pdf-*/

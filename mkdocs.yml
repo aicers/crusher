@@ -1,7 +1,7 @@
-site_name: Crusher
-site_description: Crusher documentation (EN/KR)
+site_name: Crusher Manual
+site_description: Crusher user manual (EN/KR)
 repo_url: https://github.com/aicers/crusher
-site_url: https://example.invalid/crusher
+site_url: ""
 
 theme:
   name: material

@@ -32,8 +32,8 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'tests/**'
-              - '.github/workflows/ci.yml'
-              - '.github/workflows/release.yml'
+              - ".github/workflows/**"
+              - "scripts/**"
       - id: derive
         run: |
           if [[ "${{ steps.filter.outputs.docs }}" == "true" && "${{ steps.filter.outputs.code }}" != "true" ]]; then
