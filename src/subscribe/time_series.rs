@@ -1348,8 +1348,8 @@ mod tests {
         let policy = SamplingPolicy {
             id: policy_id,
             kind: SamplingKind::Conn,
-            interval: Duration::from_secs(60),
-            period: Duration::from_secs(3600),
+            interval: Duration::from_mins(1),
+            period: Duration::from_hours(1),
             offset: 0,
             src_ip: None,
             dst_ip: None,
@@ -1379,8 +1379,8 @@ mod tests {
         let policy = SamplingPolicy {
             id: policy_id,
             kind: SamplingKind::Conn,
-            interval: Duration::from_secs(60),
-            period: Duration::from_secs(3600), // 1 hour
+            interval: Duration::from_mins(1),
+            period: Duration::from_hours(1), // 1 hour
             offset: 0,
             src_ip: None,
             dst_ip: None,
@@ -1419,7 +1419,7 @@ mod tests {
         let policy = SamplingPolicy {
             id: policy_id,
             kind: SamplingKind::Conn,
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
             // Use a very large period that will overflow when multiplied by SECOND_TO_NANO
             // i64::MAX / SECOND_TO_NANO ≈ 9_223_372_036 seconds
             // So a period larger than this will overflow
