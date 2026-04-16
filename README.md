@@ -77,21 +77,37 @@ In the configuration file, you can specify the following options:
 
 | Field                      | Description                                                                     | Required | Default    |
 | -------------------------- | ------------------------------------------------------------------------------- | -------- | ---------- |
-| `giganto_name`             | Name of the Giganto server                                                      | Yes      | localhost  |
-| `giganto_ingest_srv_addr`  | Giganto's ingest IP address and port number                                     | Yes      | [::]:38370 |
-| `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                    | Yes      | [::]:38371 |
+| `giganto_name`             | Name of the Giganto server                                                      | No       | -          |
+| `giganto_ingest_srv_addr`  | Giganto's ingest IP address and port number                                     | Yes      | -          |
+| `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                    | Yes      | -          |
 | `last_timestamp_data`      | JSON file that stores the timestamp of the last time series per sampling policy | Yes      | -          |
 | `log_path`                 | Log file path                                                                   | No       | -          |
 
 <!-- markdownlint-enable MD013 -->
 
+- `giganto_publish_srv_addr` and `giganto_ingest_srv_addr` are required.
+  `giganto_name` is optional; when present, it takes precedence for the
+  Giganto connection name. When absent, the IP from the addresses is used
+  only if both point to the same IP; otherwise a configuration error is
+  returned.
 - `giganto_name`: This must match with the DNS name in the certificate.
 - `log_path`: If not provided, logs are printed to stdout.
 
-## Configuration Example
+## Configuration Examples
+
+Without `giganto_name` (the IP from `giganto_publish_srv_addr` is
+used as the connection name):
 
 ```toml
-giganto_name = "localhost"
+giganto_ingest_srv_addr = "127.0.0.1:38370"
+giganto_publish_srv_addr = "127.0.0.1:38371"
+last_timestamp_data = "path/to/time_data.json"
+```
+
+With `giganto_name` (takes precedence over the address IP):
+
+```toml
+giganto_name = "my-giganto"
 giganto_ingest_srv_addr = "127.0.0.1:38370"
 giganto_publish_srv_addr = "127.0.0.1:38371"
 last_timestamp_data = "path/to/time_data.json"
