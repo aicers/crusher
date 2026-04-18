@@ -114,6 +114,35 @@ last_timestamp_data = "path/to/time_data.json"
 log_path = "path/to/time_series_generator.log"
 ```
 
+## Giganto TLS reload (SIGHUP)
+
+Crusher handles process-level `SIGHUP` as a dedicated trigger for reloading
+the Giganto-facing TLS material. The repository exposes this as a TLS reload
+seam that is kept distinct from the `update_config` / `config_reload` seam,
+so code that cares about rotated certificates does not have to opt into
+configuration-reload semantics.
+
+On `SIGHUP`:
+
+- The process does not terminate.
+- The next remote-mode rerun rereads the cert, key, and CA files from the
+  paths supplied on the command line.
+- A fresh shared Giganto endpoint is built from the reloaded TLS material
+  and is used by both the ingest and publish flows on the next rerun.
+- New QUIC handshakes performed after the rerun use the rotated certificate.
+
+If the reload fails (files missing, malformed, key does not match cert),
+Crusher logs the failure, preserves the last-known-good shared endpoint,
+and retries on the next `SIGHUP` or rerun opportunity. Reload failure
+never terminates the daemon and never forces an immediate hard cut-off of
+existing ingest/publish connections.
+
+On non-Unix targets, `SIGHUP` handling is a no-op; TLS material is loaded
+once at startup.
+
+Rotating the certificate files on disk is the operator's responsibility;
+Crusher does not issue or rotate certificates by itself.
+
 ## Copyright
 
 - Copyright 2023-2025 ClumL Inc.
