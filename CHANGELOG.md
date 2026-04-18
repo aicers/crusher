@@ -12,6 +12,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   are now automatically synchronized from the Manager using
   `get_sampling_policy_list`, allowing data collection to
   resume after a restart.
+- Crusher now handles `SIGHUP` as a dedicated trigger to
+  reload the Giganto-facing TLS material. On `SIGHUP`, the
+  process does not terminate; instead, it rereads the cert,
+  key, and CA files supplied on the command line and rebuilds
+  the shared Giganto endpoint from the refreshed material
+  before the next remote-mode rerun, so both ingest and
+  publish handshakes pick up rotated certificates. The TLS
+  reload trigger is kept distinct from the existing
+  `update_config` / `config_reload` seam. If reread or
+  endpoint rebuild fails, Crusher logs the error, preserves
+  the last-known-good shared endpoint, and keeps running.
 
 ### Changed
 
