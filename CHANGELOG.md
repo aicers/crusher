@@ -67,6 +67,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   receiver to exit before reaching its cleanup path.
 - Made `AddPolicies` batch fully atomic: all newly inserted policies are
   rolled back on send failure.
+- Centralized inbound stream dispatch in `publish_connection_control`. A single
+  per-connection task now owns `accept_uni()`, reads the policy id from the
+  stream-start message, looks it up via the policy actor, and only then spawns
+  the per-stream worker. Removes a race where one of many policy-scoped
+  receivers could be bound to the wrong inbound stream, and silently drops
+  streams whose policy was deleted before they arrived.
 
 ## [0.7.1] - 2026-02-11
 

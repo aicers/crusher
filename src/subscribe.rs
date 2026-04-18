@@ -300,20 +300,26 @@ async fn publish_connection_control(
                     }
                 });
 
+                // One dispatcher task per publish connection owns
+                // `accept_uni()`. It reads each incoming stream's id
+                // from the wire, looks up the matching policy state,
+                // and only then spawns the per-stream worker. This
+                // removes the previous race where one of many
+                // policy-scoped receivers could be bound to the wrong
+                // inbound stream.
+                let dispatcher_handle = coordinator.tracker().spawn(run_inbound_dispatcher(
+                    conn.clone(),
+                    series_send.clone(),
+                    connection_notify.clone(),
+                    policy_handle.clone(),
+                    last_series_time_path.to_path_buf(),
+                    coordinator.clone(),
+                ));
+
                 let policies = policy_handle.get_all_policies().await;
                 for policy in policies {
-                    if let Err(e) = process_network_stream(
-                        conn.clone(),
-                        series_send.clone(),
-                        policy,
-                        stream_tx.clone(),
-                        connection_notify.clone(),
-                        policy_handle.clone(),
-                        last_series_time_path.to_path_buf(),
-                        coordinator.clone(),
-                    )
-                    .await
-                    {
+                    if let Err(e) = process_network_stream(policy, stream_tx.clone()).await {
+                        dispatcher_handle.abort();
                         for cause in e.chain() {
                             if let Some(e) = cause.downcast_ref::<WriteError>() {
                                 match e {
@@ -340,6 +346,7 @@ async fn publish_connection_control(
                     tokio::select! {
                         () = connection_notify.notified() => {
                             drop(connection_notify);
+                            dispatcher_handle.abort();
                             warn!(
                                 "Stream channel closed. Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
@@ -348,6 +355,7 @@ async fn publish_connection_control(
                             continue 'connection;
                         }
                         err = conn.closed() => {
+                            dispatcher_handle.abort();
                             warn!(
                                 "Stream channel closed: {:?}. Retry connection to {} after {} seconds.",
                                 err, server_addr, SERVER_RETRY_INTERVAL,
@@ -358,17 +366,9 @@ async fn publish_connection_control(
                         }
                         Ok(policy) = request_recv.recv() => {
                             info!("Stream's policy : {:?}", policy);
-                            if let Err(e) = process_network_stream(
-                                conn.clone(),
-                                series_send.clone(),
-                                policy,
-                                stream_tx.clone(),
-                                connection_notify.clone(),
-                                policy_handle.clone(),
-                                last_series_time_path.to_path_buf(),
-                                coordinator.clone(),
-                            ).await
+                            if let Err(e) = process_network_stream(policy, stream_tx.clone()).await
                             {
+                                dispatcher_handle.abort();
                                 for cause in e.chain() {
                                     if let Some(e) = cause.downcast_ref::<WriteError>() {
                                         match e {
@@ -447,29 +447,14 @@ async fn publish_connect(
     Ok((conn, send))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Sends the stream-open request for a policy. The actual inbound
+/// stream is accepted by the per-connection dispatcher (see
+/// [`run_inbound_dispatcher`]) and bound to its policy by id read off
+/// the wire, so this function does not spawn any per-policy receiver.
 async fn process_network_stream(
-    conn: Connection,
-    sender: Sender<TimeSeries>,
     policy: SamplingPolicy,
     stream_tx: tokio::sync::mpsc::Sender<StreamSendRequest>,
-    connection_notify: Arc<Notify>,
-    policy_handle: PolicyHandle,
-    last_series_time_path: PathBuf,
-    coordinator: CancellationCoordinator,
 ) -> Result<()> {
-    // Fetch the policy token BEFORE sending the stream request so
-    // that a concurrent delete cannot slip between send and token
-    // acquisition.  If the token is gone the policy was already
-    // deleted — this is a normal add/delete race, not an error.
-    let Some(policy_token) = policy_handle.get_policy_token(policy.id).await else {
-        info!(
-            "Stale queued policy {}; already deleted, skipping stream open",
-            policy.id
-        );
-        return Ok(());
-    };
-
     let start = policy.start_timestamp().await?;
     let req_msg = RequestTimeSeriesGeneratorStream {
         start,
@@ -492,61 +477,91 @@ async fn process_network_stream(
     reply_rx
         .await
         .map_err(|_| anyhow::anyhow!("SendStream actor dropped reply"))??;
-
-    let recv_coordinator = coordinator.clone();
-    coordinator.tracker().spawn(async move {
-        receiver(
-            conn,
-            sender,
-            connection_notify,
-            policy,
-            policy_token,
-            last_series_time_path,
-            recv_coordinator,
-        )
-        .await
-    });
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-async fn receiver(
+/// Owns `accept_uni()` for a single publish connection and centralises
+/// inbound stream dispatch. For each accepted unidirectional stream
+/// it reads the stream-start message to determine the policy id, then
+/// looks up the live policy state from the policy actor and spawns a
+/// per-stream worker. Streams whose policy was already deleted are
+/// silently skipped — they are a normal consequence of a delete that
+/// raced with an in-flight stream open.
+async fn run_inbound_dispatcher(
     conn: Connection,
     sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
+    policy_handle: PolicyHandle,
+    last_series_time_path: PathBuf,
+    coordinator: CancellationCoordinator,
+) {
+    loop {
+        let recv_result = tokio::select! {
+            biased;
+            () = coordinator.cancelled() => return,
+            result = conn.accept_uni() => result,
+        };
+        let mut recv = match recv_result {
+            Ok(r) => r,
+            Err(e) => {
+                info!("Inbound stream dispatcher exiting: {e}");
+                return;
+            }
+        };
+
+        let id = tokio::select! {
+            biased;
+            () = coordinator.cancelled() => return,
+            result = receive_time_series_generator_stream_start_message(&mut recv) => match result {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("Failed to receive stream id value: {e}");
+                    connection_notify.notify_waiters();
+                    return;
+                }
+            }
+        };
+
+        let Some((policy, policy_token)) = policy_handle.get_policy_with_token(id).await else {
+            info!(
+                "Inbound stream for unknown/deleted policy {id}; \
+                 dropping stream"
+            );
+            let _ = recv.stop(VarInt::default());
+            continue;
+        };
+
+        let sender = sender.clone();
+        let path = last_series_time_path.clone();
+        let coord = coordinator.clone();
+        coordinator.tracker().spawn(async move {
+            run_stream_worker(recv, sender, policy, policy_token, path, coord).await
+        });
+    }
+}
+
+/// Per-stream worker, spawned by [`run_inbound_dispatcher`] only after
+/// the inbound stream has been bound to its policy by id. The worker
+/// owns the recv stream and is responsible for decoding events,
+/// reacting to per-policy deletion (`policy_token`), and global
+/// cancellation.
+///
+/// When the inbound stream finishes or errors, the worker exits
+/// silently; reconnection is driven by `conn.closed()` in
+/// `publish_connection_control` and by `accept_uni()` in the
+/// dispatcher, both of which observe genuine connection failures
+/// directly. Forcing a reconnect from a single stream's end would
+/// race-kill any sibling streams in flight.
+async fn run_stream_worker(
+    mut recv: RecvStream,
+    sender: Sender<TimeSeries>,
     policy: SamplingPolicy,
     policy_token: tokio_util::sync::CancellationToken,
     last_series_time_path: PathBuf,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
-    let recv_result = tokio::select! {
-        biased;
-        () = coordinator.cancelled() => return Ok(()),
-        result = conn.accept_uni() => result,
-    };
-    let Ok(mut recv) = recv_result else {
-        return Ok(());
-    };
-
-    let id = tokio::select! {
-        biased;
-        () = coordinator.cancelled() => return Ok(()),
-        result = receive_time_series_generator_stream_start_message(&mut recv) => {
-            if let Ok(id) = result {
-                id
-            } else {
-                connection_notify.notify_waiters();
-                warn!("Failed to receive stream id value");
-                bail!("Failed to receive stream id value");
-            }
-        }
-    };
-
-    debug_assert_eq!(
-        id, policy.id,
-        "stream id must match the policy passed by the caller"
-    );
     info!("Raw event {:?} has been connected", policy.kind);
+    let id = policy.id;
 
     let mut series = TimeSeries::try_new(&policy).await?;
 
@@ -554,11 +569,11 @@ async fn receiver(
         tokio::select! {
             biased;
             () = coordinator.cancelled() => {
-                info!("Receiver for policy {id} shutting down");
+                info!("Stream worker for policy {id} shutting down");
                 break;
             }
             () = policy_token.cancelled() => {
-                info!("Policy {id} deleted, stopping receiver");
+                info!("Policy {id} deleted, stopping stream worker");
                 recv.stop(VarInt::default())?;
                 delete_last_timestamp(&last_series_time_path, id)?;
                 break;
@@ -577,7 +592,7 @@ async fn receiver(
                         warn!("Failed to generate time series: {}", e);
                     }
                 } else {
-                    connection_notify.notify_waiters();
+                    info!("Stream for policy {id} ended");
                     break;
                 }
             }

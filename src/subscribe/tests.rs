@@ -39,12 +39,41 @@ const SECS_PER_MINUTE: u64 = 60;
 const SECS_PER_DAY: u64 = 86_400;
 const DEFAULT_POLICY_ID: u32 = 1;
 
+/// Selects how the fake publish server emits inbound uni streams in
+/// response to client stream requests. Tests use this to drive the
+/// dispatcher down specific code paths (out-of-order arrival, unknown
+/// id, deleted policy).
+#[derive(Clone)]
+enum PublishBehavior {
+    /// Open one uni stream per request, immediately, in request order.
+    Default,
+    /// Collect `expected` requests, then open uni streams in REVERSE
+    /// order. Verifies the dispatcher binds streams by id read off the
+    /// wire, not by request order.
+    ReverseOrder { expected: usize },
+    /// For each request, first open a uni stream announcing `stale_id`
+    /// (which the policy actor does not know about), then the real
+    /// stream. Verifies the dispatcher silently drops unknown-id
+    /// streams without breaking subsequent traffic.
+    StaleIdFirst { stale_id: u32 },
+    /// Collect `expected` requests, then notify `request_received` and
+    /// wait on `release` before opening the inbound streams. Lets the
+    /// test mutate policy state (e.g., delete) between request landing
+    /// and stream arrival.
+    HoldUntilSignal {
+        expected: usize,
+        request_received: Arc<Notify>,
+        release: Arc<Notify>,
+    },
+}
+
 struct FakeGigantoServer {
     server_config: ServerConfig,
     server_address: SocketAddr,
     ingest_notify: Option<async_channel::Sender<u32>>,
     publish_repeat_count: usize,
     publish_repeat_delay: Duration,
+    publish_behavior: PublishBehavior,
 }
 
 struct TestServerHandlers {
@@ -64,6 +93,7 @@ impl FakeGigantoServer {
             ingest_notify: None,
             publish_repeat_count: 0,
             publish_repeat_delay: Duration::from_millis(0),
+            publish_behavior: PublishBehavior::Default,
         }
     }
 
@@ -76,11 +106,17 @@ impl FakeGigantoServer {
             ingest_notify: None,
             publish_repeat_count: 3,
             publish_repeat_delay: Duration::from_millis(200),
+            publish_behavior: PublishBehavior::Default,
         }
     }
 
     fn with_notify(mut self, notify: async_channel::Sender<u32>) -> Self {
         self.ingest_notify = Some(notify);
+        self
+    }
+
+    fn with_publish_behavior(mut self, behavior: PublishBehavior) -> Self {
+        self.publish_behavior = behavior;
         self
     }
 
@@ -114,16 +150,19 @@ impl FakeGigantoServer {
         let local_addr = endpoint.local_addr().expect("local_addr");
         let publish_repeat_count = self.publish_repeat_count;
         let publish_repeat_delay = self.publish_repeat_delay;
+        let behavior = self.publish_behavior;
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Some(conn) = endpoint.accept() => {
+                        let behavior = behavior.clone();
                         tokio::spawn(async move {
                             if let Ok(connection) = conn.await {
                                 handle_publish_connection(
                                     connection,
                                     publish_repeat_count,
                                     publish_repeat_delay,
+                                    behavior,
                                 )
                                 .await;
                             }
@@ -161,14 +200,80 @@ async fn handle_publish_connection(
     connection: Connection,
     repeat_count: usize,
     repeat_delay: Duration,
+    behavior: PublishBehavior,
 ) {
     let version_req = format!("={REQUIRED_GIGANTO_VERSION}");
     let Ok((_send, mut recv)) = server_handshake(&connection, &version_req).await else {
         return;
     };
 
+    match behavior {
+        PublishBehavior::Default => {
+            handle_default_publish(&connection, &mut recv, repeat_count, repeat_delay).await;
+        }
+        PublishBehavior::ReverseOrder { expected } => {
+            handle_reverse_order_publish(
+                &connection,
+                &mut recv,
+                expected,
+                repeat_count,
+                repeat_delay,
+            )
+            .await;
+        }
+        PublishBehavior::StaleIdFirst { stale_id } => {
+            handle_stale_id_publish(&connection, &mut recv, stale_id, repeat_count, repeat_delay)
+                .await;
+        }
+        PublishBehavior::HoldUntilSignal {
+            expected,
+            request_received,
+            release,
+        } => {
+            handle_hold_until_signal_publish(
+                &connection,
+                &mut recv,
+                expected,
+                request_received,
+                release,
+                repeat_count,
+                repeat_delay,
+            )
+            .await;
+        }
+    }
+}
+
+async fn open_and_emit_stream(
+    connection: &Connection,
+    policy_id_bytes: &[u8],
+    record_bytes: &[u8],
+    repeat_count: usize,
+    repeat_delay: Duration,
+) {
+    let Ok(mut uni) = connection.open_uni().await else {
+        return;
+    };
+    let _ = send_raw(&mut uni, policy_id_bytes).await;
+    for idx in 0..repeat_count {
+        let ts = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+        let _ = send_bytes(&mut uni, &ts.to_le_bytes()).await;
+        let _ = send_raw(&mut uni, record_bytes).await;
+        if idx + 1 < repeat_count {
+            sleep(repeat_delay).await;
+        }
+    }
+    let _ = uni.finish();
+}
+
+async fn handle_default_publish(
+    connection: &Connection,
+    recv: &mut RecvStream,
+    repeat_count: usize,
+    repeat_delay: Duration,
+) {
     loop {
-        let Ok(payload) = receive_stream_request(&mut recv).await else {
+        let Ok(payload) = receive_stream_request(recv).await else {
             break;
         };
         let (policy_id, record_bytes) = match payload {
@@ -177,21 +282,108 @@ async fn handle_publish_connection(
             }
             _ => continue,
         };
+        open_and_emit_stream(
+            connection,
+            policy_id.as_bytes(),
+            &record_bytes,
+            repeat_count,
+            repeat_delay,
+        )
+        .await;
+    }
+}
 
-        let Ok(mut uni) = connection.open_uni().await else {
-            continue;
+async fn handle_reverse_order_publish(
+    connection: &Connection,
+    recv: &mut RecvStream,
+    expected: usize,
+    repeat_count: usize,
+    repeat_delay: Duration,
+) {
+    let mut requests = Vec::with_capacity(expected);
+    for _ in 0..expected {
+        let Ok(payload) = receive_stream_request(recv).await else {
+            return;
         };
-        let _ = send_raw(&mut uni, policy_id.as_bytes()).await;
-
-        for idx in 0..repeat_count {
-            let ts = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-            let _ = send_bytes(&mut uni, &ts.to_le_bytes()).await;
-            let _ = send_raw(&mut uni, &record_bytes).await;
-            if idx + 1 < repeat_count {
-                sleep(repeat_delay).await;
-            }
+        if let StreamRequestPayload::TimeSeriesGenerator { request, .. } = payload {
+            requests.push((request.id, bincode::serialize(&gen_conn()).unwrap()));
         }
-        let _ = uni.finish();
+    }
+    requests.reverse();
+    for (policy_id, record_bytes) in requests {
+        open_and_emit_stream(
+            connection,
+            policy_id.as_bytes(),
+            &record_bytes,
+            repeat_count,
+            repeat_delay,
+        )
+        .await;
+    }
+}
+
+async fn handle_stale_id_publish(
+    connection: &Connection,
+    recv: &mut RecvStream,
+    stale_id: u32,
+    repeat_count: usize,
+    repeat_delay: Duration,
+) {
+    loop {
+        let Ok(payload) = receive_stream_request(recv).await else {
+            break;
+        };
+        let (policy_id, record_bytes) = match payload {
+            StreamRequestPayload::TimeSeriesGenerator { request, .. } => {
+                (request.id, bincode::serialize(&gen_conn()).unwrap())
+            }
+            _ => continue,
+        };
+        let stale = stale_id.to_string();
+        // First open a uni stream announcing the stale id; the
+        // dispatcher must drop it without breaking the connection.
+        open_and_emit_stream(connection, stale.as_bytes(), &record_bytes, 1, repeat_delay).await;
+        // Then the real stream — must be processed normally.
+        open_and_emit_stream(
+            connection,
+            policy_id.as_bytes(),
+            &record_bytes,
+            repeat_count,
+            repeat_delay,
+        )
+        .await;
+    }
+}
+
+async fn handle_hold_until_signal_publish(
+    connection: &Connection,
+    recv: &mut RecvStream,
+    expected: usize,
+    request_received: Arc<Notify>,
+    release: Arc<Notify>,
+    repeat_count: usize,
+    repeat_delay: Duration,
+) {
+    let mut requests = Vec::with_capacity(expected);
+    for _ in 0..expected {
+        let Ok(payload) = receive_stream_request(recv).await else {
+            return;
+        };
+        if let StreamRequestPayload::TimeSeriesGenerator { request, .. } = payload {
+            requests.push((request.id, bincode::serialize(&gen_conn()).unwrap()));
+        }
+    }
+    request_received.notify_one();
+    release.notified().await;
+    for (policy_id, record_bytes) in requests {
+        open_and_emit_stream(
+            connection,
+            policy_id.as_bytes(),
+            &record_bytes,
+            repeat_count,
+            repeat_delay,
+        )
+        .await;
     }
 }
 
@@ -813,4 +1005,186 @@ async fn restart_state_consistency() {
     );
 
     cleanup_test_resources(coordinator2, client_handle2, server_handles2).await;
+}
+
+/// Spawns a subscribe client wired to a publish endpoint with the
+/// given [`PublishBehavior`]. Returns the resources the test needs to
+/// observe ACKs and tear everything down.
+async fn run_with_publish_behavior(
+    policies: &[SamplingPolicy],
+    behavior: PublishBehavior,
+) -> (
+    CancellationCoordinator,
+    crate::request::Client,
+    PolicyHandle,
+    tokio::task::JoinHandle<()>,
+    TestServerHandlers,
+    async_channel::Receiver<u32>,
+    PathBuf,
+    TempDir,
+) {
+    reset_last_transfer_time().await;
+
+    let (ingest_ack_send, ingest_ack_recv) = async_channel::bounded::<u32>(10);
+    let ingest_server = FakeGigantoServer::new_ingest().with_notify(ingest_ack_send);
+    let publish_server = FakeGigantoServer::new_publish().with_publish_behavior(behavior);
+    let ingest_shutdown = Arc::new(Notify::new());
+    let publish_shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = ingest_server.start_ingest(ingest_shutdown.clone());
+    let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
+
+    let certs = cert_key();
+    let coordinator = CancellationCoordinator::new();
+    let (mut request_client, request_recv, last_time_series_path, temp_dir, policy_handle) =
+        setup_request_client(policies.len().max(1), &coordinator);
+    request_client.sampling_policy_list(policies).await.unwrap();
+
+    let client_handle = spawn_subscribe_client(
+        &certs,
+        request_recv,
+        &last_time_series_path,
+        ingest_addr,
+        publish_addr,
+        policy_handle.clone(),
+        coordinator.clone(),
+    );
+
+    (
+        coordinator,
+        request_client,
+        policy_handle,
+        client_handle,
+        TestServerHandlers {
+            ingest_shutdown,
+            publish_shutdown,
+            ingest_handle,
+            publish_handle,
+        },
+        ingest_ack_recv,
+        last_time_series_path,
+        temp_dir,
+    )
+}
+
+/// Test: Inbound streams must be dispatched by the policy id read off
+/// the wire, not by the order in which the requests went out. Here the
+/// publish server collects both stream requests and then opens uni
+/// streams in REVERSE order; both policies must still receive the
+/// correct ACKs because the dispatcher binds streams by id.
+#[serial]
+#[tokio::test]
+async fn inbound_stream_dispatch_is_id_keyed() {
+    let policy_a = new_policy(1);
+    let policy_b = new_policy(2);
+    let (coordinator, _rc, _ph, client_handle, server_handles, ingest_ack_recv, _, _temp) =
+        run_with_publish_behavior(
+            &[policy_a.clone(), policy_b.clone()],
+            PublishBehavior::ReverseOrder { expected: 2 },
+        )
+        .await;
+
+    let mut expected_ids = vec![policy_a.id, policy_b.id];
+    for _ in 0..2 {
+        let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+            .await
+            .expect("ACK should arrive within 5s")
+            .expect("ACK channel should remain open");
+        expected_ids.retain(|e| *e != id);
+    }
+    assert!(
+        expected_ids.is_empty(),
+        "Both policies should receive correct ACKs even with reversed stream arrival: {expected_ids:?}"
+    );
+
+    cleanup_test_resources(coordinator, client_handle, server_handles).await;
+}
+
+/// Test: A uni stream that announces a policy id the dispatcher does
+/// not know about (e.g., a delete that raced with stream-open on the
+/// server side) must be dropped silently; subsequent valid streams on
+/// the same connection must continue to work normally.
+#[serial]
+#[tokio::test]
+async fn inbound_stream_for_unknown_policy_is_dropped() {
+    let policy = new_policy(DEFAULT_POLICY_ID);
+    let (coordinator, _rc, _ph, client_handle, server_handles, ingest_ack_recv, _, _temp) =
+        run_with_publish_behavior(
+            std::slice::from_ref(&policy),
+            PublishBehavior::StaleIdFirst { stale_id: 9999 },
+        )
+        .await;
+
+    // The real policy's ACK must still arrive even though the
+    // dispatcher saw an unknown-id stream first.
+    let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        .await
+        .expect("ACK for the real policy must arrive within 5s")
+        .expect("ACK channel should remain open");
+    assert_eq!(id, policy.id);
+
+    cleanup_test_resources(coordinator, client_handle, server_handles).await;
+}
+
+/// Test: When a policy is deleted between the request being sent and
+/// the inbound stream arriving, the dispatcher must drop the orphaned
+/// stream silently. Other policies on the same connection must still
+/// receive their streams normally.
+#[serial]
+#[tokio::test]
+async fn inbound_stream_arrival_after_delete_is_dropped() {
+    let policy_a = new_policy(1);
+    let policy_b = new_policy(2);
+    let request_received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (
+        coordinator,
+        mut request_client,
+        _ph,
+        client_handle,
+        server_handles,
+        ingest_ack_recv,
+        _,
+        _temp,
+    ) = run_with_publish_behavior(
+        &[policy_a.clone(), policy_b.clone()],
+        PublishBehavior::HoldUntilSignal {
+            expected: 2,
+            request_received: request_received.clone(),
+            release: release.clone(),
+        },
+    )
+    .await;
+
+    // Server has both stream requests in hand and is now blocked on
+    // `release`. Delete policy_a before its inbound stream is opened.
+    timeout(Duration::from_secs(5), request_received.notified())
+        .await
+        .expect("server should receive both stream requests within 5s");
+    request_client
+        .delete_sampling_policy(&[policy_a.id])
+        .await
+        .unwrap();
+
+    // Let the server open both inbound streams. The dispatcher must
+    // bind policy_b normally and drop policy_a (deleted) silently.
+    release.notify_one();
+
+    // Drain any ACKs arriving within a short window — only policy_b
+    // should produce ACKs.
+    let mut received = Vec::new();
+    while let Ok(Ok(id)) = timeout(Duration::from_millis(800), ingest_ack_recv.recv()).await {
+        received.push(id);
+    }
+    assert!(
+        !received.contains(&policy_a.id),
+        "deleted policy {} must not produce ACKs; got {received:?}",
+        policy_a.id,
+    );
+    assert!(
+        received.contains(&policy_b.id),
+        "live policy {} must still produce ACKs after sibling delete; got {received:?}",
+        policy_b.id,
+    );
+
+    cleanup_test_resources(coordinator, client_handle, server_handles).await;
 }

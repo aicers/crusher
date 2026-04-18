@@ -27,9 +27,14 @@ enum PolicyCommand {
     GetAllPolicies {
         reply: oneshot::Sender<Vec<SamplingPolicy>>,
     },
+    #[cfg(test)]
     GetPolicyToken {
         id: u32,
         reply: oneshot::Sender<Option<CancellationToken>>,
+    },
+    GetPolicyWithToken {
+        id: u32,
+        reply: oneshot::Sender<Option<(SamplingPolicy, CancellationToken)>>,
     },
 }
 
@@ -99,14 +104,35 @@ impl PolicyHandle {
         reply_rx.await.unwrap_or_default()
     }
 
-    /// Returns the `CancellationToken` for the given policy ID.
-    /// The receiver watches this token to detect when its specific
-    /// policy is deleted, eliminating the delete/re-add race condition.
+    /// Returns the `CancellationToken` for the given policy ID. Used
+    /// by tests to observe per-policy cancellation directly; production
+    /// code uses [`Self::get_policy_with_token`] for atomic lookup.
+    #[cfg(test)]
     pub(crate) async fn get_policy_token(&self, id: u32) -> Option<CancellationToken> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self
             .tx
             .send(PolicyCommand::GetPolicyToken {
+                id,
+                reply: reply_tx,
+            })
+            .await;
+        reply_rx.await.ok().flatten()
+    }
+
+    /// Atomically returns both the policy and its `CancellationToken`
+    /// for the given ID. Returns `None` if the policy is not active.
+    /// Used by the inbound stream dispatcher to bind a freshly accepted
+    /// stream to its current policy state in a single actor command,
+    /// preventing a delete from slipping between separate lookups.
+    pub(crate) async fn get_policy_with_token(
+        &self,
+        id: u32,
+    ) -> Option<(SamplingPolicy, CancellationToken)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(PolicyCommand::GetPolicyWithToken {
                 id,
                 reply: reply_tx,
             })
@@ -189,8 +215,16 @@ pub(crate) fn spawn_policy_actor(
                 PolicyCommand::GetAllPolicies { reply } => {
                     let _ = reply.send(active_policies.values().cloned().collect());
                 }
+                #[cfg(test)]
                 PolicyCommand::GetPolicyToken { id, reply } => {
                     let _ = reply.send(policy_tokens.get(&id).cloned());
+                }
+                PolicyCommand::GetPolicyWithToken { id, reply } => {
+                    let combined = active_policies
+                        .get(&id)
+                        .cloned()
+                        .and_then(|p| policy_tokens.get(&id).cloned().map(|token| (p, token)));
+                    let _ = reply.send(combined);
                 }
             }
         }
@@ -212,8 +246,8 @@ mod tests {
         SamplingPolicy {
             id,
             kind: SamplingKind::Conn,
-            interval: Duration::from_secs(60),
-            period: Duration::from_secs(3600),
+            interval: Duration::from_mins(1),
+            period: Duration::from_hours(1),
             offset: 0,
             src_ip: None,
             dst_ip: None,
