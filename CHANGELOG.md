@@ -6,40 +6,41 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Added
-
-- On startup, previously registered `sampling_policy` entries
-  are now automatically synchronized from the Manager using
-  `get_sampling_policy_list`, allowing data collection to
-  resume after a restart.
-
 ### Changed
 
-- Changed how `giganto_name`, `giganto_publish_srv_addr`, and
-  `giganto_ingest_srv_addr` are handled. All three fields no
-  longer have default values. `giganto_name` is optional;
-  `giganto_publish_srv_addr` and `giganto_ingest_srv_addr` are
-  required. If `giganto_name` is provided it is used for the
-  Giganto connection; otherwise the IP from the addresses is
-  used only when both point to the same IP. If the IPs differ
-  and `giganto_name` is absent, a configuration error is
-  returned.
+- Reworked `giganto_name` / `giganto_publish_srv_addr` /
+  `giganto_ingest_srv_addr` handling: the two addresses are required,
+  `giganto_name` is optional and falls back to the shared IP of the
+  two addresses (error if they differ and no name is given).
+- Added cooperative cancellation across async paths via a
+  `CancellationCoordinator` (`CancellationToken` + `TaskTracker`).
+  All spawned tasks are tracked and drained before exit or config
+  reload, preventing detached background work and partial-state
+  corruption during shutdown.
+- Moved policy state behind a single-owner actor (`PolicyHandle`),
+  eliminating shared `RwLock` mutation across await points.
+- Centralised inbound publish-stream dispatch: one per-connection
+  task owns `accept_uni()`, binds each stream to its policy by the
+  id read off the wire, and silently drops streams whose policy was
+  deleted before arrival.
+- Centralised timestamp-file I/O behind a single writer-actor task
+  that uses atomic write-and-rename and tombstones deleted policy
+  ids so late ACKs cannot resurrect timestamps.
 - Updated `review-protocol` dependency to rev `c284fa6`.
 
 ### Fixed
 
-- Automatically create `last_timestamp_data` file with an empty
-  JSON object (`{}`) on startup when it does not exist, so
-  fresh deployments no longer require manual file creation.
-- Replaced `process::exit` calls in `request` and `subscribe`
-  modules with proper error propagation (`bail!`). Previously,
-  invalid peer certificate errors triggered `process::exit(0)`,
-  which could terminate the entire test harness during
-  `cargo test`, causing intermittent missing test coverage.
-- Used `biased` selection in the request handler's `run()` loop
-  so the shutdown branch is checked first, preventing a race
-  where `handle_incoming` could be entered before a pending
-  shutdown notification is observed.
+- Removed lock-across-await patterns in `TimeSeries::fill()`,
+  `SendStream` serialisation, and `publish_connection_control`.
+- Fixed `INGEST_CHANNEL` stale-sender cleanup on early exit,
+  reconnect, and drain timeout.
+- Preserved in-flight ACK/timestamp messages across shutdown.
+- Fixed a race in `process_network_stream()` where the stream
+  request was sent before acquiring the per-policy cancellation
+  token.
+- Made `AddPolicies` batches fully atomic: inserted policies are
+  rolled back if any forward to the subscribe side fails.
+- Auto-create the timestamp data file on startup when missing.
 
 ## [0.7.1] - 2026-02-11
 

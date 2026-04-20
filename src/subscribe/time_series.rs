@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{BufReader, BufWriter},
+    collections::{HashMap, HashSet},
+    fs::File,
+    io::BufReader,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -104,7 +104,14 @@ impl TimeSeries {
         let period = i64::try_from(policy.period.as_secs())?;
 
         if time.timestamp() - self.start.timestamp() > period {
-            if let Some(sender) = INGEST_CHANNEL.read().await.get(&self.sampling_policy_id) {
+            // Clone the sender out of the lock to avoid holding the
+            // RwLock read guard across an await point.
+            let cached_sender = INGEST_CHANNEL
+                .read()
+                .await
+                .get(&self.sampling_policy_id)
+                .cloned();
+            if let Some(sender) = cached_sender {
                 sender.send(self.clone()).await?;
             } else {
                 send_channel.send(self.clone()).await?;
@@ -166,21 +173,131 @@ fn start_time(policy: &SamplingPolicy, time: DateTime<Utc>) -> Result<DateTime<U
     Ok(datetime)
 }
 
+/// Commands sent to the timestamp writer actor. The actor is the
+/// single owner of timestamp-file writes and in-memory
+/// [`LAST_TRANSFER_TIME`] mutations, so no other task performs
+/// file I/O on the timestamp path or concurrent writes to the map.
+pub(super) enum TimestampCommand {
+    /// Record an ACK timestamp for the given policy. Writes are
+    /// rejected if `id` is tombstoned (i.e., the policy was deleted
+    /// and a late ACK arrived), preventing resurrection.
+    Write { id: String, timestamp: i64 },
+    /// Remove the entry for the given policy and tombstone its id so
+    /// any in-flight ACKs for this policy are ignored.
+    Delete { id: u32 },
+    /// Clear the tombstone for the given policy so a freshly re-added
+    /// policy with the same id accepts new Writes.
+    Reset { id: u32 },
+}
+
 pub(super) async fn write_last_timestamp(
     last_series_time_path: PathBuf,
-    time_receiver: Receiver<(String, i64)>,
+    time_receiver: Receiver<TimestampCommand>,
+    coordinator: crate::cancellation::CancellationCoordinator,
 ) -> Result<()> {
-    while let Ok((id, timestamp)) = time_receiver.recv().await {
-        LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&last_series_time_path)
-            .context("Failed to open last time series timestamp file")?;
-        serde_json::to_writer(&file, &(*LAST_TRANSFER_TIME.read().await))
-            .context("Failed to write last time series timestamp file")?;
+    let mut tombstones: HashSet<String> = HashSet::new();
+    loop {
+        let item = tokio::select! {
+            biased;
+            () = coordinator.cancelled() => {
+                // Drain remaining commands in the channel before exiting
+                // so timestamps are flushed to disk.  Wait for channel
+                // closure (all `receive_time_series_timestamp` senders
+                // dropped after their own drain) with a safety timeout
+                // to guarantee the writer outlasts the ACK receivers.
+                const WRITER_DRAIN_TIMEOUT: tokio::time::Duration =
+                    tokio::time::Duration::from_secs(2);
+                let drain_deadline =
+                    tokio::time::Instant::now() + WRITER_DRAIN_TIMEOUT;
+                loop {
+                    let remaining = drain_deadline
+                        .saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        tracing::warn!(
+                            "write_last_timestamp drain timed out; \
+                             flushing what was collected"
+                        );
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, time_receiver.recv()).await {
+                        Ok(Ok(cmd)) => {
+                            apply_command(cmd, &mut tombstones).await;
+                        }
+                        // Channel closed (all senders dropped) — drain
+                        // complete.  Timeout — safety net exhausted.
+                        Ok(Err(_)) | Err(_) => break,
+                    }
+                }
+                atomic_write_timestamp_file(
+                    &last_series_time_path,
+                    &*LAST_TRANSFER_TIME.read().await,
+                )?;
+                tracing::info!("write_last_timestamp flushed and shutting down");
+                return Ok(());
+            }
+            result = time_receiver.recv() => result,
+        };
+        match item {
+            Ok(cmd) => {
+                let changed = apply_command(cmd, &mut tombstones).await;
+                if changed {
+                    atomic_write_timestamp_file(
+                        &last_series_time_path,
+                        &*LAST_TRANSFER_TIME.read().await,
+                    )?;
+                }
+            }
+            Err(_) => break,
+        }
     }
+    Ok(())
+}
+
+/// Applies a single [`TimestampCommand`] to in-memory state. Returns
+/// `true` when the on-disk representation needs to be rewritten.
+async fn apply_command(cmd: TimestampCommand, tombstones: &mut HashSet<String>) -> bool {
+    match cmd {
+        TimestampCommand::Write { id, timestamp } => {
+            if tombstones.contains(&id) {
+                return false;
+            }
+            LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
+            true
+        }
+        TimestampCommand::Delete { id } => {
+            let id_str = id.to_string();
+            tombstones.insert(id_str.clone());
+            LAST_TRANSFER_TIME.write().await.remove(&id_str).is_some()
+        }
+        TimestampCommand::Reset { id } => {
+            tombstones.remove(&id.to_string());
+            false
+        }
+    }
+}
+
+/// Atomically writes the timestamp map to the given path by writing
+/// to a temporary file in the same directory, flushing to disk, and
+/// then renaming over the target path. This prevents partial writes
+/// on crash.
+fn atomic_write_timestamp_file(path: &Path, data: &HashMap<String, i64>) -> Result<()> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .context("timestamp file has no parent directory")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .context("Failed to create temporary timestamp file")?;
+    serde_json::to_writer(&mut tmp, data)
+        .context("Failed to write timestamp data to temporary file")?;
+    tmp.as_file_mut()
+        .flush()
+        .context("Failed to flush temporary timestamp file")?;
+    tmp.as_file_mut()
+        .sync_all()
+        .context("Failed to sync temporary timestamp file")?;
+    tmp.persist(path)
+        .context("Failed to atomically replace timestamp file")?;
     Ok(())
 }
 
@@ -224,19 +341,6 @@ pub(super) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<
         };
         LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
     }
-    Ok(())
-}
-
-pub(super) fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Result<()> {
-    let file = File::open(last_series_time_path)?;
-    let id = format!("{id}");
-    let mut json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
-    if let Value::Object(ref mut map_data) = json {
-        map_data.remove(&id);
-    }
-    let file = File::create(last_series_time_path)?;
-    serde_json::to_writer(BufWriter::new(file), &json)?;
-
     Ok(())
 }
 
@@ -527,18 +631,25 @@ mod tests {
         let key1 = format!("write_creates_1_{unique_id}");
         let key2 = format!("write_creates_2_{unique_id}");
 
-        let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
+        let (sender, receiver) = async_channel::bounded::<TimestampCommand>(10);
 
         // Start the writer task
-        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver));
+        let coord = crate::cancellation::CancellationCoordinator::new();
+        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver, coord));
 
         // Send some timestamps
         sender
-            .send((key1.clone(), 1_000_000_000_i64))
+            .send(TimestampCommand::Write {
+                id: key1.clone(),
+                timestamp: 1_000_000_000_i64,
+            })
             .await
             .unwrap();
         sender
-            .send((key2.clone(), 2_000_000_000_i64))
+            .send(TimestampCommand::Write {
+                id: key2.clone(),
+                timestamp: 2_000_000_000_i64,
+            })
             .await
             .unwrap();
 
@@ -581,17 +692,30 @@ mod tests {
         );
         let key = format!("write_updates_{unique_id}");
 
-        let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
+        let (sender, receiver) = async_channel::bounded::<TimestampCommand>(10);
 
         let path_clone = file_path.clone();
+        let coord = crate::cancellation::CancellationCoordinator::new();
         let writer_handle =
-            tokio::spawn(async move { write_last_timestamp(path_clone, receiver).await });
+            tokio::spawn(async move { write_last_timestamp(path_clone, receiver, coord).await });
 
         // Send initial timestamp
-        sender.send((key.clone(), 1_000_000_000_i64)).await.unwrap();
+        sender
+            .send(TimestampCommand::Write {
+                id: key.clone(),
+                timestamp: 1_000_000_000_i64,
+            })
+            .await
+            .unwrap();
 
         // Update with new timestamp
-        sender.send((key.clone(), 3_000_000_000_i64)).await.unwrap();
+        sender
+            .send(TimestampCommand::Write {
+                id: key.clone(),
+                timestamp: 3_000_000_000_i64,
+            })
+            .await
+            .unwrap();
 
         drop(sender);
         let _ = writer_handle.await;
@@ -689,84 +813,63 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_delete_last_timestamp_removes_entry() {
+    #[serial]
+    #[tokio::test]
+    async fn test_writer_delete_then_write_is_tombstoned() {
+        // Delete sets a tombstone so late Writes for the same id are
+        // rejected; Reset lifts the tombstone so new Writes succeed.
         let dir = tempdir().expect("failed to create temp dir");
         let file_path = dir.path().join("timestamps.json");
+        ensure_time_data_exists(&file_path).unwrap();
 
-        // Pre-write a JSON file with multiple entries
-        let mut file = File::create(&file_path).expect("failed to create file");
-        file.write_all(b"{\"1\": 1000, \"2\": 2000, \"3\": 3000}")
-            .expect("failed to write");
-        drop(file);
+        let numeric_id: u32 = 424_242;
+        let key = numeric_id.to_string();
 
-        // Delete entry with id=2
-        delete_last_timestamp(&file_path, 2).expect("failed to delete");
+        // Pre-populate.
+        LAST_TRANSFER_TIME
+            .write()
+            .await
+            .insert(key.clone(), 100_i64);
 
-        // Verify the file contents
-        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
-        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-        let map = json.as_object().unwrap();
+        let (sender, receiver) = async_channel::bounded::<TimestampCommand>(10);
+        let coord = crate::cancellation::CancellationCoordinator::new();
+        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver, coord));
 
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key("1"));
-        assert!(!map.contains_key("2"));
-        assert!(map.contains_key("3"));
-    }
+        // Delete → tombstone + entry removed on disk.
+        sender
+            .send(TimestampCommand::Delete { id: numeric_id })
+            .await
+            .unwrap();
+        // Late ACK — must be rejected.
+        sender
+            .send(TimestampCommand::Write {
+                id: key.clone(),
+                timestamp: 999_i64,
+            })
+            .await
+            .unwrap();
+        // Reset (simulates a re-add) → tombstone lifted.
+        sender
+            .send(TimestampCommand::Reset { id: numeric_id })
+            .await
+            .unwrap();
+        // Fresh write accepted.
+        sender
+            .send(TimestampCommand::Write {
+                id: key.clone(),
+                timestamp: 777_i64,
+            })
+            .await
+            .unwrap();
 
-    #[test]
-    fn test_delete_last_timestamp_nonexistent_entry() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("timestamps.json");
+        drop(sender);
+        let _ = writer_handle.await;
 
-        // Pre-write a JSON file
-        let mut file = File::create(&file_path).expect("failed to create file");
-        file.write_all(b"{\"1\": 1000, \"2\": 2000}")
-            .expect("failed to write");
-        drop(file);
+        let map = LAST_TRANSFER_TIME.read().await;
+        assert_eq!(map.get(&key), Some(&777_i64));
+        drop(map);
 
-        // Delete entry with id=99 (doesn't exist)
-        delete_last_timestamp(&file_path, 99).expect("should succeed even if entry doesn't exist");
-
-        // Verify original entries are still there
-        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
-        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-        let map = json.as_object().unwrap();
-
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key("1"));
-        assert!(map.contains_key("2"));
-    }
-
-    #[test]
-    fn test_delete_last_timestamp_nonexistent_file() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("nonexistent.json");
-
-        // Deleting from nonexistent file should fail
-        let result = delete_last_timestamp(&file_path, 1);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_delete_last_timestamp_last_entry() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("timestamps.json");
-
-        // Pre-write a JSON file with single entry
-        let mut file = File::create(&file_path).expect("failed to create file");
-        file.write_all(b"{\"1\": 1000}").expect("failed to write");
-        drop(file);
-
-        // Delete the only entry
-        delete_last_timestamp(&file_path, 1).expect("failed to delete");
-
-        // Verify the file is now empty object
-        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
-        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-        let map = json.as_object().unwrap();
-
-        assert!(map.is_empty());
+        LAST_TRANSFER_TIME.write().await.remove(&key);
     }
 
     // =========================================================================
