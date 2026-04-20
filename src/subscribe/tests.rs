@@ -400,12 +400,21 @@ async fn handle_ingest_stream(
         return;
     }
 
-    let mut buf = Vec::new();
-    if recv_raw(&mut recv, &mut buf).await.is_err() {
-        return;
-    }
+    // A bi-di stream carries one header followed by any number of
+    // batches until the client closes it. Looping here lets tests
+    // observe ACKs from multiple batches on the same stream — which
+    // happens naturally when a policy is deleted and re-added on the
+    // same live ingest connection (the client reuses the bi-di stream
+    // via `INGEST_CHANNEL`).
+    loop {
+        let mut buf = Vec::new();
+        if recv_raw(&mut recv, &mut buf).await.is_err() {
+            return;
+        }
 
-    if let Ok(batch) = bincode::deserialize::<Vec<(i64, Vec<u8>)>>(&buf) {
+        let Ok(batch) = bincode::deserialize::<Vec<(i64, Vec<u8>)>>(&buf) else {
+            continue;
+        };
         let policy_id = batch
             .first()
             .and_then(|(_, payload)| bincode::deserialize::<TimeSeries>(payload).ok())
@@ -1064,6 +1073,60 @@ async fn run_with_publish_behavior(
         last_time_series_path,
         temp_dir,
     )
+}
+
+/// Test: After a policy is deleted on a live publish connection, a
+/// re-add with the same id MUST open a fresh stream on that same
+/// connection. This is the regression test for the startup-only-dedup
+/// contract: no connection-lifetime dedupe set may survive into the
+/// steady-state `request_recv.recv()` loop — otherwise a re-add would
+/// be silently dropped as "already opened," breaking live
+/// reconfiguration.
+#[serial]
+#[tokio::test]
+async fn delete_then_readd_same_id_starts_fresh_stream() {
+    let policy = new_policy(DEFAULT_POLICY_ID);
+    let mut harness = TestHarness::new(std::slice::from_ref(&policy)).await;
+
+    // Initial add: observe ACK + timestamp.
+    let id = harness.wait_for_ack().await;
+    assert_eq!(id, policy.id);
+    let _ = harness.wait_for_timestamp(&[policy.id]).await;
+
+    // Delete and confirm timestamp is removed (writer actor's Delete
+    // command both removes the in-memory entry and rewrites the file).
+    harness
+        .request_client
+        .delete_sampling_policy(&[policy.id])
+        .await
+        .unwrap();
+    let map_after_delete = harness.wait_for_timestamp_removed(&[policy.id]).await;
+    assert_eq!(map_after_delete.get(&policy.id.to_string()), None);
+
+    // Re-add the same policy id on the same live publish connection.
+    // The subscribe client must enqueue a fresh stream request and
+    // the fake server must respond with a new inbound stream — which
+    // drives a fresh ACK back through the ingest path.
+    harness
+        .request_client
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+
+    let id = harness.wait_for_ack().await;
+    assert_eq!(
+        id, policy.id,
+        "re-added policy must produce a fresh ACK on the same live connection"
+    );
+    let map_after_readd = harness.wait_for_timestamp(&[policy.id]).await;
+    assert!(
+        map_after_readd.contains_key(&policy.id.to_string()),
+        "timestamp for re-added policy must reappear; the writer \
+         actor's tombstone must have been cleared by the new stream \
+         worker's Reset command"
+    );
+
+    harness.cleanup().await;
 }
 
 /// Test: Inbound streams must be dispatched by the policy id read off

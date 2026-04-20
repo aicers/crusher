@@ -8,71 +8,39 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
-- Changed how `giganto_name`, `giganto_publish_srv_addr`, and
-  `giganto_ingest_srv_addr` are handled. All three fields no
-  longer have default values. `giganto_name` is optional;
-  `giganto_publish_srv_addr` and `giganto_ingest_srv_addr` are
-  required. If `giganto_name` is provided it is used for the
-  Giganto connection; otherwise the IP from the addresses is
-  used only when both point to the same IP. If the IPs differ
-  and `giganto_name` is absent, a configuration error is
-  returned.
+- Reworked `giganto_name` / `giganto_publish_srv_addr` /
+  `giganto_ingest_srv_addr` handling: the two addresses are required,
+  `giganto_name` is optional and falls back to the shared IP of the
+  two addresses (error if they differ and no name is given).
+- Added cooperative cancellation across async paths via a
+  `CancellationCoordinator` (`CancellationToken` + `TaskTracker`).
+  All spawned tasks are tracked and drained before exit or config
+  reload, preventing detached background work and partial-state
+  corruption during shutdown.
+- Moved policy state behind a single-owner actor (`PolicyHandle`),
+  eliminating shared `RwLock` mutation across await points.
+- Centralised inbound publish-stream dispatch: one per-connection
+  task owns `accept_uni()`, binds each stream to its policy by the
+  id read off the wire, and silently drops streams whose policy was
+  deleted before arrival.
+- Centralised timestamp-file I/O behind a single writer-actor task
+  that uses atomic write-and-rename and tombstones deleted policy
+  ids so late ACKs cannot resurrect timestamps.
 - Updated `review-protocol` dependency to rev `c284fa6`.
-- Cancellation-safe shutdown framework using
-  `CancellationToken` and `TaskTracker` from `tokio-util`.
-  All spawned tasks are now tracked and drained before the
-  process exits or restarts, preventing detached background
-  work.
-- Top-level `request`/`subscribe` tasks are now explicitly
-  owned by `run()` with `abort + join`, while `TaskTracker`
-  is reserved for child/background tasks. Drain timeout is
-  treated as fatal (`process::exit`) to prevent overlapping
-  generations.
-- Policy state (`active_policy_list`, `delete_policy_ids`)
-  moved behind a single-owner actor task (`PolicyHandle`),
-  eliminating shared `RwLock` mutation mixed with `.await`
-  points and ensuring cancellation-safe policy updates.
-- Scenario-level tests verifying that shutdown drains all
-  tasks, timestamp flush completes, and restart-time state
-  remains consistent.
-- Timestamp file writes are now atomic (write-to-temp then
-  rename), preventing partial writes on crash.
 
 ### Fixed
 
-- Fixed lock-across-await patterns in `TimeSeries::fill()`,
+- Removed lock-across-await patterns in `TimeSeries::fill()`,
   `SendStream` serialisation, and `publish_connection_control`.
 - Fixed `INGEST_CHANNEL` stale-sender cleanup on early exit,
-  reconnect, and shutdown-drain timeout.
-- Fixed in-flight ACK/timestamp messages being lost on
-  shutdown.
-- Fixed request-side partial-state update problem where
-  cancellation during `sampling_policy_list` or
-  `delete_sampling_policy` could leave `active_policy_list`,
-  `delete_policy_ids`, and subscribe-side state out of sync.
-- Automatically create timestamp data file on startup when
-  missing.
-- Replaced `process::exit` calls with proper error propagation.
-- Added cancellation safety to prevent partial state corruption during shutdown
-  and config reload.
-- Renamed `ShutdownCoordinator` to `CancellationCoordinator` (module
-  `shutdown` → `cancellation`) to better distinguish async task cancellation
-  from system shutdown.
-- Replaced hard abort of top-level tasks with cooperative cancellation via
-  `CancellationCoordinator`, removing the mixed abort/cooperative model.
-- Fixed race in `process_network_stream()` where the stream request was sent
-  before acquiring the per-policy `CancellationToken`.
-- Passed `SamplingPolicy` directly into `receiver()` instead of re-reading
-  from the actor, eliminating a gap where a concurrent delete could cause the
-  receiver to exit before reaching its cleanup path.
-- Made `AddPolicies` batch fully atomic: all newly inserted policies are
-  rolled back on send failure.
-- Centralized inbound stream dispatch in `publish_connection_control`. A single
-  per-connection task now owns `accept_uni()`, reads the policy id from the
-  stream-start message, looks it up via the policy actor, and only then spawns
-  the per-stream worker. Removes a race where one of many policy-scoped
-  receivers could be bound to the wrong inbound stream, and silently drops
-  streams whose policy was deleted before they arrived.
+  reconnect, and drain timeout.
+- Preserved in-flight ACK/timestamp messages across shutdown.
+- Fixed a race in `process_network_stream()` where the stream
+  request was sent before acquiring the per-policy cancellation
+  token.
+- Made `AddPolicies` batches fully atomic: inserted policies are
+  rolled back if any forward to the subscribe side fails.
+- Auto-create the timestamp data file on startup when missing.
 
 ## [0.7.1] - 2026-02-11
 

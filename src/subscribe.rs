@@ -2,6 +2,7 @@
 mod tests;
 mod time_series;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -26,7 +27,7 @@ use giganto_client::{
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
 use review_protocol::types::{SamplingKind, SamplingPolicy};
-use time_series::{SamplingPolicyExt, TimeSeries, delete_last_timestamp, write_last_timestamp};
+use time_series::{SamplingPolicyExt, TimeSeries, TimestampCommand, write_last_timestamp};
 use tokio::{
     sync::{Notify, RwLock, oneshot},
     time::{Duration, sleep},
@@ -154,6 +155,19 @@ impl Client {
         coordinator: CancellationCoordinator,
     ) -> Result<()> {
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
+        // The timestamp writer actor is the single owner of timestamp
+        // file writes and in-memory `LAST_TRANSFER_TIME` mutations. It
+        // outlives publish/ingest reconnects so tombstones persist
+        // across connection churn, preventing late ACKs for deleted
+        // policies from resurrecting timestamps.
+        let (time_sender, time_receiver) =
+            async_channel::bounded::<TimestampCommand>(LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE);
+        coordinator.tracker().spawn(write_last_timestamp(
+            self.last_series_time_path.clone(),
+            time_receiver,
+            coordinator.clone(),
+        ));
+
         let connection_notify = Arc::new(Notify::new());
         tokio::select! {
             Err(e) = async {tokio::try_join!(
@@ -162,8 +176,8 @@ impl Client {
                     self.ingest_addr,
                     &self.server_name,
                     &self.endpoint,
-                    &self.last_series_time_path,
                     REQUIRED_GIGANTO_VERSION,
+                    time_sender.clone(),
                     connection_notify.clone(),
                     coordinator.clone(),
                 ),
@@ -175,7 +189,7 @@ impl Client {
                     REQUIRED_GIGANTO_VERSION,
                     &self.request_recv,
                     policy_handle,
-                    &self.last_series_time_path,
+                    time_sender.clone(),
                     connection_notify.clone(),
                     coordinator.clone(),
                 )
@@ -198,8 +212,8 @@ async fn ingest_connection_control(
     server_addr: SocketAddr,
     server_name: &str,
     endpoint: &Endpoint,
-    last_series_time_path: &Path,
     version: &str,
+    time_sender: Sender<TimestampCommand>,
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
@@ -208,16 +222,6 @@ async fn ingest_connection_control(
         match ingest_connect(endpoint, server_addr, server_name, version).await {
             Ok(conn) => {
                 let arc_conn = Arc::new(conn);
-
-                // Write last time_series timestamp
-                let (time_sender, time_receiver) = async_channel::bounded::<(String, i64)>(
-                    LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE,
-                );
-                coordinator.tracker().spawn(write_last_timestamp(
-                    last_series_time_path.to_path_buf(),
-                    time_receiver,
-                    coordinator.clone(),
-                ));
 
                 loop {
                     tokio::select! {
@@ -270,6 +274,32 @@ async fn ingest_connection_control(
     }
 }
 
+/// Recovery decision for errors returned by [`process_network_stream`].
+/// Only connection-level signals map to a variant; everything else is
+/// treated as fatal by the caller.
+enum StreamRecoveryAction {
+    Reconnect,
+    Exit,
+}
+
+fn classify_stream_error(err: &anyhow::Error) -> Option<StreamRecoveryAction> {
+    for cause in err.chain() {
+        if let Some(e) = cause.downcast_ref::<WriteError>() {
+            match e {
+                WriteError::ConnectionLost(_) => return Some(StreamRecoveryAction::Reconnect),
+                WriteError::Stopped(_) => return Some(StreamRecoveryAction::Exit),
+                _ => {}
+            }
+        }
+        if let Some(ConnectionError::TimedOut | ConnectionError::LocallyClosed) =
+            cause.downcast_ref::<ConnectionError>()
+        {
+            return Some(StreamRecoveryAction::Reconnect);
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn publish_connection_control(
     series_send: Sender<TimeSeries>,
@@ -279,7 +309,7 @@ async fn publish_connection_control(
     version: &str,
     request_recv: &Receiver<SamplingPolicy>,
     policy_handle: PolicyHandle,
-    last_series_time_path: &Path,
+    time_sender: Sender<TimestampCommand>,
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
@@ -312,35 +342,63 @@ async fn publish_connection_control(
                     series_send.clone(),
                     connection_notify.clone(),
                     policy_handle.clone(),
-                    last_series_time_path.to_path_buf(),
+                    time_sender.clone(),
                     coordinator.clone(),
                 ));
 
-                let policies = policy_handle.get_all_policies().await;
-                for policy in policies {
-                    if let Err(e) = process_network_stream(policy, stream_tx.clone()).await {
-                        dispatcher_handle.abort();
-                        for cause in e.chain() {
-                            if let Some(e) = cause.downcast_ref::<WriteError>() {
-                                match e {
-                                    WriteError::ConnectionLost(_) => {
-                                        continue 'connection;
-                                    }
-                                    WriteError::Stopped(_) => {
-                                        return Ok(());
-                                    }
-                                    _ => {}
+                // Startup-only dedup: on (re)connect we replay the
+                // full active-policy snapshot from the policy actor,
+                // but the bounded `request_recv` may also hold the
+                // same policies queued by recent adds. Without dedup
+                // we'd open two streams per such policy. The set is
+                // deliberately scoped to this block so it cannot bleed
+                // into the steady-state loop below — steady state must
+                // treat every `request_recv.recv()` as a fresh open so
+                // a delete-then-readd on the same live connection
+                // produces a new stream.
+                {
+                    let mut opened_policy_ids: HashSet<u32> = HashSet::new();
+                    let policies = policy_handle.get_all_policies().await;
+                    for policy in policies {
+                        if !opened_policy_ids.insert(policy.id) {
+                            continue;
+                        }
+                        if let Err(e) = process_network_stream(policy, stream_tx.clone()).await {
+                            dispatcher_handle.abort();
+                            if let Some(action) = classify_stream_error(&e) {
+                                match action {
+                                    StreamRecoveryAction::Reconnect => continue 'connection,
+                                    StreamRecoveryAction::Exit => return Ok(()),
                                 }
                             }
-                            if let Some(
-                                ConnectionError::TimedOut | ConnectionError::LocallyClosed,
-                            ) = cause.downcast_ref::<ConnectionError>()
-                            {
-                                continue 'connection;
-                            }
+                            bail!("Cannot recover from open stream error: {e}");
                         }
-                        bail!("Cannot recover from open stream error: {e}");
                     }
+                    // Drain any `request_recv` items enqueued before or
+                    // during startup that duplicate the snapshot. Using
+                    // `try_recv` (not `recv`) means we never block on
+                    // the bounded channel — this is what prevents the
+                    // restore-path deadlock when the sender is waiting
+                    // for capacity. Non-duplicate items (policies added
+                    // after the snapshot) are opened here so they are
+                    // not lost before we reach the steady-state loop.
+                    while let Ok(policy) = request_recv.try_recv() {
+                        if !opened_policy_ids.insert(policy.id) {
+                            continue;
+                        }
+                        if let Err(e) = process_network_stream(policy, stream_tx.clone()).await {
+                            dispatcher_handle.abort();
+                            if let Some(action) = classify_stream_error(&e) {
+                                match action {
+                                    StreamRecoveryAction::Reconnect => continue 'connection,
+                                    StreamRecoveryAction::Exit => return Ok(()),
+                                }
+                            }
+                            bail!("Cannot recover from open stream error: {e}");
+                        }
+                    }
+                    // `opened_policy_ids` drops here so no dedup state
+                    // survives into the steady-state loop.
                 }
                 loop {
                     tokio::select! {
@@ -369,20 +427,10 @@ async fn publish_connection_control(
                             if let Err(e) = process_network_stream(policy, stream_tx.clone()).await
                             {
                                 dispatcher_handle.abort();
-                                for cause in e.chain() {
-                                    if let Some(e) = cause.downcast_ref::<WriteError>() {
-                                        match e {
-                                            WriteError::ConnectionLost(_) => {
-                                                continue 'connection;
-                                            }
-                                            WriteError::Stopped(_) => {
-                                                return Ok(());
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    if let Some(ConnectionError::TimedOut | ConnectionError::LocallyClosed) = cause.downcast_ref::<ConnectionError>() {
-                                        continue 'connection;
+                                if let Some(action) = classify_stream_error(&e) {
+                                    match action {
+                                        StreamRecoveryAction::Reconnect => continue 'connection,
+                                        StreamRecoveryAction::Exit => return Ok(()),
                                     }
                                 }
                                 bail!("Cannot recover from open stream error: {e}");
@@ -492,7 +540,7 @@ async fn run_inbound_dispatcher(
     sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
     policy_handle: PolicyHandle,
-    last_series_time_path: PathBuf,
+    time_sender: Sender<TimestampCommand>,
     coordinator: CancellationCoordinator,
 ) {
     loop {
@@ -532,10 +580,10 @@ async fn run_inbound_dispatcher(
         };
 
         let sender = sender.clone();
-        let path = last_series_time_path.clone();
+        let time_sender = time_sender.clone();
         let coord = coordinator.clone();
         coordinator.tracker().spawn(async move {
-            run_stream_worker(recv, sender, policy, policy_token, path, coord).await
+            run_stream_worker(recv, sender, policy, policy_token, time_sender, coord).await
         });
     }
 }
@@ -557,11 +605,17 @@ async fn run_stream_worker(
     sender: Sender<TimeSeries>,
     policy: SamplingPolicy,
     policy_token: tokio_util::sync::CancellationToken,
-    last_series_time_path: PathBuf,
+    time_sender: Sender<TimestampCommand>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
     info!("Raw event {:?} has been connected", policy.kind);
     let id = policy.id;
+
+    // A policy may be deleted and then re-added with the same id on
+    // the same live publish connection. The writer actor carries a
+    // tombstone for deleted ids to reject late ACKs; we clear that
+    // tombstone here so fresh Writes on this new stream are accepted.
+    let _ = time_sender.send(TimestampCommand::Reset { id }).await;
 
     let mut series = TimeSeries::try_new(&policy).await?;
 
@@ -575,7 +629,10 @@ async fn run_stream_worker(
             () = policy_token.cancelled() => {
                 info!("Policy {id} deleted, stopping stream worker");
                 recv.stop(VarInt::default())?;
-                delete_last_timestamp(&last_series_time_path, id)?;
+                // Route the delete through the writer actor so it remains
+                // the single owner of timestamp-file writes and can set
+                // a tombstone that blocks any late ACKs already in flight.
+                let _ = time_sender.send(TimestampCommand::Delete { id }).await;
                 break;
             }
             result = receive_time_series_generator_data(&mut recv) => {
@@ -619,7 +676,7 @@ pub(crate) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<
 async fn send_time_series(
     connection: Arc<Connection>,
     series: TimeSeries,
-    time_sender: Sender<(String, i64)>,
+    time_sender: Sender<TimestampCommand>,
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
@@ -708,7 +765,7 @@ const ACK_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 async fn receive_time_series_timestamp(
     mut series_receiver: RecvStream,
     sampling_policy_id: String,
-    time_sender: Sender<(String, i64)>,
+    time_sender: Sender<TimestampCommand>,
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
@@ -736,7 +793,10 @@ async fn receive_time_series_timestamp(
                     {
                         Ok(Ok(ts)) => {
                             let _ = time_sender
-                                .send((sampling_policy_id.clone(), ts))
+                                .send(TimestampCommand::Write {
+                                    id: sampling_policy_id.clone(),
+                                    timestamp: ts,
+                                })
                                 .await;
                         }
                         _ => break,
@@ -749,7 +809,10 @@ async fn receive_time_series_timestamp(
         match result {
             Ok(timestamp) => {
                 let _ = time_sender
-                    .send((sampling_policy_id.clone(), timestamp))
+                    .send(TimestampCommand::Write {
+                        id: sampling_policy_id.clone(),
+                        timestamp,
+                    })
                     .await;
             }
             Err(RecvError::ReadError(quinn::ReadExactError::FinishedEarly(_))) => {
