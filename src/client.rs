@@ -70,6 +70,19 @@ impl Certs {
 }
 
 pub(crate) fn config(certs: &Certs) -> Result<Endpoint> {
+    let config = client_config(certs)?;
+
+    let mut endpoint = quinn::Endpoint::client((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
+        .expect("Failed to create endpoint");
+    endpoint.set_default_client_config(config);
+
+    Ok(endpoint)
+}
+
+/// Builds the QUIC `ClientConfig` from the given certificates without
+/// binding a UDP socket. This is useful for validating candidate TLS
+/// material (including cert/key match-up) outside of an async runtime.
+pub(crate) fn client_config(certs: &Certs) -> Result<ClientConfig> {
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(certs.ca_certs.clone())
         .with_client_auth_cert(certs.certs.clone(), certs.key.clone_key())?;
@@ -80,11 +93,7 @@ pub(crate) fn config(certs: &Certs) -> Result<Endpoint> {
     let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
     config.transport_config(Arc::new(transport));
 
-    let mut endpoint = quinn::Endpoint::client((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
-        .expect("Failed to create endpoint");
-    endpoint.set_default_client_config(config);
-
-    Ok(endpoint)
+    Ok(config)
 }
 
 #[cfg(test)]

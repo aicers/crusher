@@ -9,12 +9,12 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use client::Certs;
 use logging::init_tracing;
+use request::IdleExitReason;
 use review_protocol::types::SamplingPolicy;
 use settings::Settings;
 use subscribe::{ensure_time_data_exists, read_last_timestamp};
@@ -103,34 +103,39 @@ fn read_cert_pems(args: &CmdLineArgs) -> Result<CertPems> {
     Ok((cert_pem, key_pem, ca_certs_pem))
 }
 
-/// Reads Giganto cert/key/CA material from disk and builds a new [`Certs`].
+/// Reads, parses, and validates Giganto cert/key/CA material from disk.
 ///
-/// This is the loader used both at startup and by the repository-level TLS
-/// reload trigger. It is kept distinct from the `update_config()` /
-/// `config_reload` seam so that other components can opt into TLS reloads
-/// without being affected by configuration reload semantics.
+/// The candidate certs are validated by building the same QUIC client
+/// configuration that `subscribe::Client::new` uses, so that mismatched
+/// cert/key pairs are rejected here (returning an error) rather than
+/// panicking later when the shared endpoint is rebuilt.
 ///
 /// # Errors
 ///
 /// Returns an error if any cert/key/CA file cannot be read, the private key
-/// does not match the certificate, or the CA bundle cannot be parsed.
-fn load_giganto_certs(args: &CmdLineArgs) -> Result<Certs> {
+/// does not match the certificate, the CA bundle cannot be parsed, or the
+/// client/endpoint configuration cannot be built from the candidate certs.
+fn load_giganto_tls_material(args: &CmdLineArgs) -> Result<Certs> {
     let (cert_pem, key_pem, ca_certs_pem) = read_cert_pems(args)?;
-    Certs::try_new(
+    let certs = Certs::try_new(
         &cert_pem,
         &key_pem,
         &ca_certs_pem.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-    )
+    )?;
+    let _ = client::client_config(&certs)
+        .context("failed to build a Giganto client endpoint from the TLS material")?;
+    Ok(certs)
 }
 
-/// Registers a process-level SIGHUP handler that sets the shared TLS reload
-/// pending flag and wakes any waiters on the dedicated TLS reload notifier.
+/// Registers a process-level SIGHUP handler that requests a Giganto TLS
+/// reload via the dedicated notifier.
+///
+/// `notify_one()` stores a permit when there is no waiter, so a signal that
+/// lands between reload checks is still delivered to the next waiter
+/// without being lost.
 ///
 /// SIGHUP is POSIX-only; on non-Unix targets this is a no-op.
-fn register_tls_reload_signal_handler(
-    tls_reload: Arc<Notify>,
-    tls_reload_pending: Arc<AtomicBool>,
-) {
+fn register_tls_reload_signal_handler(tls_reload: Arc<Notify>) {
     #[cfg(unix)]
     {
         tokio::spawn(async move {
@@ -144,32 +149,35 @@ fn register_tls_reload_signal_handler(
                 };
             while hup.recv().await.is_some() {
                 info!("Received SIGHUP; requesting Giganto TLS reload");
-                tls_reload_pending.store(true, Ordering::SeqCst);
-                tls_reload.notify_waiters();
+                tls_reload.notify_one();
             }
         });
     }
     #[cfg(not(unix))]
     {
-        let _ = (tls_reload, tls_reload_pending);
+        let _ = tls_reload;
     }
+}
+
+/// Distinguishes the reasons a successful `run()` returns, so the main loop
+/// can decide whether to refresh the Giganto TLS material before the next
+/// rerun.
+#[derive(Debug, PartialEq, Eq)]
+enum RerunReason {
+    ConfigReload,
+    TlsReload,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CmdLineArgs::parse();
     let (cert_pem, key_pem, ca_certs_pem) = read_cert_pems(&args)?;
-    let mut certs = Certs::try_new(
-        &cert_pem,
-        &key_pem,
-        &ca_certs_pem.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-    )?;
+    let mut certs = load_giganto_tls_material(&args)?;
     let (request_send, request_recv) =
         async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
     let config_reload = Arc::new(Notify::new());
     let tls_reload = Arc::new(Notify::new());
-    let tls_reload_pending = Arc::new(AtomicBool::new(false));
-    register_tls_reload_signal_handler(tls_reload.clone(), tls_reload_pending.clone());
+    register_tls_reload_signal_handler(tls_reload.clone());
     let mut request_client = request::Client::new(
         args.manager_server.rpc_srv_addr,
         args.manager_server.name.clone(),
@@ -182,8 +190,42 @@ async fn main() -> Result<()> {
     let mut guard = None;
 
     loop {
-        if tls_reload_pending.swap(false, Ordering::SeqCst) {
-            match load_giganto_certs(&args) {
+        let outcome = run(
+            &args,
+            &certs,
+            request_client.clone(),
+            request_recv.clone(),
+            config_reload.clone(),
+            tls_reload.clone(),
+            &mut guard,
+        )
+        .await;
+
+        let should_reload_tls = match outcome {
+            Ok(RerunReason::TlsReload) => true,
+            Ok(RerunReason::ConfigReload) => false,
+            Err(e) => {
+                assert!(args.is_remote_mode(), "{e}");
+                error_or_eprint!("Main processing encountered an error: {e}");
+                let health_check = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                    matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionAborted
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::TimedOut
+                    )
+                });
+                matches!(
+                    request_client
+                        .enter_idle_mode(health_check, tls_reload.clone())
+                        .await,
+                    IdleExitReason::TlsReload
+                )
+            }
+        };
+
+        if should_reload_tls {
+            match load_giganto_tls_material(&args) {
                 Ok(new_certs) => {
                     info!("Reloaded Giganto TLS material");
                     certs = new_certs;
@@ -195,28 +237,6 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-        }
-
-        if let Err(e) = run(
-            &args,
-            &certs,
-            request_client.clone(),
-            request_recv.clone(),
-            config_reload.clone(),
-            tls_reload.clone(),
-            &mut guard,
-        )
-        .await
-        {
-            assert!(args.is_remote_mode(), "{e}");
-            error_or_eprint!("Main processing encountered an error: {e}");
-            let health_check = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                matches!(
-                    e.kind(),
-                    ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::TimedOut
-                )
-            });
-            request_client.enter_idle_mode(health_check).await;
         }
     }
 }
@@ -230,7 +250,7 @@ async fn run(
     config_reload: Arc<Notify>,
     tls_reload: Arc<Notify>,
     guard: &mut Option<WorkerGuard>,
-) -> Result<()> {
+) -> Result<RerunReason> {
     let (settings, is_local_config) = if let Some(local_config) = args.config.as_deref() {
         (Settings::from_file(local_config)?, true)
     } else {
@@ -263,7 +283,7 @@ async fn run(
 
     info!("Time series generate started");
     let shutdown = Arc::new(Notify::new());
-    tokio::select! {
+    let reason = tokio::select! {
         Ok(Err(e)) = tokio::spawn(subscribe_client.run(
             request_client.active_policy_list.clone(),
             request_client.delete_policy_ids.clone(),
@@ -286,20 +306,21 @@ async fn run(
             shutdown.notify_waiters();
             shutdown.notified().await;
             info!("Reloading the configuration");
+            RerunReason::ConfigReload
         },
         () = tls_reload.notified() => {
             shutdown.notify_waiters();
             shutdown.notified().await;
             info!("Rebuilding the shared Giganto endpoint from reloaded TLS material");
+            RerunReason::TlsReload
         },
     };
-    Ok(())
+    Ok(reason)
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tempfile::tempdir;
     use tokio::sync::Notify;
@@ -322,19 +343,30 @@ mod tests {
         }
     }
 
+    fn write_rotated_material(
+        dir: &std::path::Path,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        ca_pem: &[u8],
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(&cert_path, cert_pem).expect("write cert");
+        std::fs::write(&key_path, key_pem).expect("write key");
+        std::fs::write(&ca_path, ca_pem).expect("write ca");
+        (cert_path, key_path, ca_path)
+    }
+
     #[test]
-    fn load_giganto_certs_reads_from_disk() {
+    fn load_giganto_tls_material_reads_from_disk() {
         let cert_pem = std::fs::read("tests/cert.pem").expect("read cert");
         let key_pem = std::fs::read("tests/key.pem").expect("read key");
         let ca_pem = std::fs::read("tests/ca_cert.pem").expect("read ca");
 
         let dir = tempdir().expect("tempdir");
-        let cert_path = dir.path().join("cert.pem");
-        let key_path = dir.path().join("key.pem");
-        let ca_path = dir.path().join("ca.pem");
-        std::fs::write(&cert_path, &cert_pem).expect("write cert");
-        std::fs::write(&key_path, &key_pem).expect("write key");
-        std::fs::write(&ca_path, &ca_pem).expect("write ca");
+        let (cert_path, key_path, ca_path) =
+            write_rotated_material(dir.path(), &cert_pem, &key_pem, &ca_pem);
 
         let args = args_with_paths(
             cert_path.to_str().expect("utf-8 cert path"),
@@ -342,20 +374,20 @@ mod tests {
             vec![ca_path.to_str().expect("utf-8 ca path").to_string()],
         );
 
-        let certs = load_giganto_certs(&args).expect("load certs from disk");
+        let certs = load_giganto_tls_material(&args).expect("load certs from disk");
         assert!(!certs.certs.is_empty());
         assert!(!certs.ca_certs.is_empty());
     }
 
     fn expect_load_err(args: &CmdLineArgs) -> anyhow::Error {
-        match load_giganto_certs(args) {
+        match load_giganto_tls_material(args) {
             Ok(_) => panic!("expected TLS reload to fail"),
             Err(e) => e,
         }
     }
 
     #[test]
-    fn load_giganto_certs_fails_on_missing_file() {
+    fn load_giganto_tls_material_fails_on_missing_file() {
         let args = args_with_paths(
             "tests/does_not_exist.pem",
             "tests/key.pem",
@@ -366,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn load_giganto_certs_fails_on_invalid_cert() {
+    fn load_giganto_tls_material_fails_on_invalid_cert() {
         let dir = tempdir().expect("tempdir");
         let cert_path = dir.path().join("cert.pem");
         std::fs::write(&cert_path, b"not a pem").expect("write cert");
@@ -385,18 +417,17 @@ mod tests {
     }
 
     #[test]
-    fn load_giganto_certs_fails_on_invalid_key() {
+    fn load_giganto_tls_material_fails_on_invalid_key() {
         let cert_pem = std::fs::read("tests/cert.pem").expect("read cert");
         let ca_pem = std::fs::read("tests/ca_cert.pem").expect("read ca");
 
         let dir = tempdir().expect("tempdir");
-        let cert_path = dir.path().join("cert.pem");
-        let key_path = dir.path().join("key.pem");
-        let ca_path = dir.path().join("ca.pem");
-        std::fs::write(&cert_path, &cert_pem).expect("write cert");
-        // Content without PEM markers so the private-key parser rejects it.
-        std::fs::write(&key_path, b"not a pem-encoded private key").expect("write key");
-        std::fs::write(&ca_path, &ca_pem).expect("write ca");
+        let (cert_path, key_path, ca_path) = write_rotated_material(
+            dir.path(),
+            &cert_pem,
+            b"not a pem-encoded private key",
+            &ca_pem,
+        );
 
         let args = args_with_paths(
             cert_path.to_str().expect("utf-8 cert path"),
@@ -410,71 +441,84 @@ mod tests {
         );
     }
 
-    /// Mismatched key vs cert is detected when the TLS client configuration
-    /// is built. The TLS reload path uses the same `client::config` builder
-    /// via `subscribe::Client::new`, so this verifies that a mismatched key
-    /// is rejected before being swapped into the shared endpoint state.
+    /// The loader must reject a rotated-but-mismatched key/cert pair rather
+    /// than returning candidate certs that would later panic during
+    /// endpoint construction in `subscribe::Client::new`.
     #[test]
-    fn mismatched_key_is_rejected_by_client_config() {
+    fn load_giganto_tls_material_rejects_mismatched_key() {
         let cert_pem = std::fs::read("tests/cert.pem").expect("read cert");
         let ca_pem = std::fs::read("tests/ca_cert.pem").expect("read ca");
-        // Generate an unrelated PKCS#8 key that will not match the cert above.
         let unrelated = rcgen::KeyPair::generate().expect("generate key");
         let unrelated_pem = unrelated.serialize_pem();
 
         let dir = tempdir().expect("tempdir");
-        let cert_path = dir.path().join("cert.pem");
-        let key_path = dir.path().join("key.pem");
-        let ca_path = dir.path().join("ca.pem");
-        std::fs::write(&cert_path, &cert_pem).expect("write cert");
-        std::fs::write(&key_path, unrelated_pem.as_bytes()).expect("write key");
-        std::fs::write(&ca_path, &ca_pem).expect("write ca");
+        let (cert_path, key_path, ca_path) =
+            write_rotated_material(dir.path(), &cert_pem, unrelated_pem.as_bytes(), &ca_pem);
 
         let args = args_with_paths(
             cert_path.to_str().expect("utf-8 cert path"),
             key_path.to_str().expect("utf-8 key path"),
             vec![ca_path.to_str().expect("utf-8 ca path").to_string()],
         );
-        let certs = load_giganto_certs(&args).expect("parses cert/key/CA individually");
+        let err = expect_load_err(&args);
         assert!(
-            client::config(&certs).is_err(),
-            "mismatched key must be rejected when the shared endpoint is built"
+            format!("{err:#}").contains("Giganto client endpoint"),
+            "mismatched key must surface an endpoint-build error: {err:#}"
         );
     }
 
-    /// Verifies that SIGHUP reaches the TLS reload seam without terminating
-    /// the process and sets the pending flag so the next rerun boundary
-    /// picks up rotated TLS material.
+    /// Verifies that SIGHUP is delivered as a TLS reload notification
+    /// without terminating the process. The handler uses `notify_one`, so a
+    /// signal that lands before a waiter registers still wakes the next
+    /// `notified()` call.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn sighup_signals_tls_reload_without_exit() {
         let tls_reload = Arc::new(Notify::new());
-        let tls_reload_pending = Arc::new(AtomicBool::new(false));
-        register_tls_reload_signal_handler(tls_reload.clone(), tls_reload_pending.clone());
+        register_tls_reload_signal_handler(tls_reload.clone());
 
-        let notifier = tls_reload.clone();
-        let waiter = tokio::spawn(async move { notifier.notified().await });
-
-        // Give the signal stream a moment to register before raising.
+        // Give the signal stream a moment to install before raising.
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Send SIGHUP to the current process.
-        // SAFETY: libc::raise is safe here; we are the only caller and no
-        // assumptions are made about other threads.
+        // SAFETY: `libc::raise` is safe here; we target only the current
+        // process and make no assumptions about other threads.
         unsafe {
             libc::raise(libc::SIGHUP);
         }
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        tokio::time::timeout(std::time::Duration::from_secs(2), tls_reload.notified())
             .await
-            .expect("tls_reload notification within timeout")
-            .expect("waiter task not aborted");
+            .expect("tls_reload notification delivered within timeout");
+    }
 
-        assert!(
-            tls_reload_pending.load(Ordering::SeqCst),
-            "SIGHUP must set the TLS reload pending flag"
-        );
+    /// A SIGHUP that lands *before* a waiter registers must still be picked
+    /// up by the next `notified()` call. This covers the lost-wakeup window
+    /// that the `Notify + AtomicBool` split previously had.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sighup_before_waiter_is_not_lost() {
+        let tls_reload = Arc::new(Notify::new());
+        register_tls_reload_signal_handler(tls_reload.clone());
+
+        // Allow the signal stream to register.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // SAFETY: see `sighup_signals_tls_reload_without_exit`.
+        unsafe {
+            libc::raise(libc::SIGHUP);
+        }
+
+        // Give the SIGHUP handler time to call `notify_one` before any
+        // waiter registers.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Only now register a waiter. The stored permit must wake it
+        // immediately.
+        tokio::time::timeout(std::time::Duration::from_secs(2), tls_reload.notified())
+            .await
+            .expect("stored permit must wake the next waiter");
     }
 
     /// Verifies that the `run()` select converges on a rerun boundary when
@@ -497,7 +541,7 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        tls_reload.notify_waiters();
+        tls_reload.notify_one();
 
         let reason = tokio::time::timeout(std::time::Duration::from_secs(1), runner)
             .await
@@ -510,7 +554,7 @@ mod tests {
     /// last-known-good `Certs` value and must not propagate an error.
     #[test]
     fn failed_reload_preserves_last_known_good_certs() {
-        let good = load_giganto_certs(&args_with_paths(
+        let good = load_giganto_tls_material(&args_with_paths(
             "tests/cert.pem",
             "tests/key.pem",
             vec!["tests/ca_cert.pem".to_string()],
@@ -526,10 +570,70 @@ mod tests {
 
         // Simulate the main-loop reload branch: on failure, keep `good`.
         let mut current = good;
-        if let Ok(new_certs) = load_giganto_certs(&args) {
+        if let Ok(new_certs) = load_giganto_tls_material(&args) {
             current = new_certs;
         }
 
         assert_eq!(current.certs.len(), good_leaf_count);
+    }
+
+    /// End-to-end rotation scenario that exercises the full reload contract
+    /// required by issue #315: rotate cert files on disk, ask the loader to
+    /// validate them, and verify that mismatched material is rejected before
+    /// any swap occurs, while a valid rotation still produces usable certs
+    /// (verified by both the runtime-free validator and the real endpoint
+    /// builder used by the shared Giganto client).
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotated_material_preserves_last_known_good_on_invalid_swap() {
+        let cert_pem = std::fs::read("tests/cert.pem").expect("read cert");
+        let key_pem = std::fs::read("tests/key.pem").expect("read key");
+        let ca_pem = std::fs::read("tests/ca_cert.pem").expect("read ca");
+
+        let dir = tempdir().expect("tempdir");
+        let (cert_path, key_path, ca_path) =
+            write_rotated_material(dir.path(), &cert_pem, &key_pem, &ca_pem);
+        let args = args_with_paths(
+            cert_path.to_str().expect("utf-8 cert path"),
+            key_path.to_str().expect("utf-8 key path"),
+            vec![ca_path.to_str().expect("utf-8 ca path").to_string()],
+        );
+
+        // Initial load succeeds; validated material also drives a real
+        // endpoint the way `subscribe::Client::new` would.
+        let current = load_giganto_tls_material(&args).expect("initial load succeeds");
+        let initial_leaf_count = current.certs.len();
+        client::config(&current)
+            .expect("initial certs build an endpoint")
+            .close(0u32.into(), &[]);
+
+        // Operator "rotates" the key file on disk but points it at an
+        // unrelated key, so the cert/key no longer match.
+        let unrelated = rcgen::KeyPair::generate().expect("generate key");
+        std::fs::write(&key_path, unrelated.serialize_pem().as_bytes()).expect("rewrite key file");
+
+        // Reload attempt must fail and the caller must keep the previous
+        // certs (mirroring the main-loop reload branch).
+        match load_giganto_tls_material(&args) {
+            Ok(_) => panic!("mismatched material must not be accepted by the loader"),
+            Err(e) => {
+                assert!(
+                    format!("{e:#}").contains("Giganto client endpoint"),
+                    "unexpected error: {e:#}"
+                );
+            }
+        }
+
+        // The preserved "current" certs still produce a usable endpoint,
+        // so ingest/publish keep using the last-known-good TLS state.
+        assert_eq!(current.certs.len(), initial_leaf_count);
+        client::config(&current)
+            .expect("last-known-good certs still build an endpoint")
+            .close(0u32.into(), &[]);
+
+        // A subsequent valid rotation (write a fresh but matching pair)
+        // swaps the material cleanly.
+        std::fs::write(&key_path, &key_pem).expect("restore matching key");
+        let refreshed = load_giganto_tls_material(&args).expect("valid rotation loads");
+        assert_eq!(refreshed.certs.len(), initial_leaf_count);
     }
 }
