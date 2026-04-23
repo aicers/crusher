@@ -468,12 +468,9 @@ async fn handle_ingest_stream(
         return;
     }
 
-    // A bi-di stream carries one header followed by any number of
-    // batches until the client closes it. Looping here lets tests
-    // observe ACKs from multiple batches on the same stream — which
-    // happens naturally when a policy is deleted and re-added on the
-    // same live ingest connection (the client reuses the bi-di stream
-    // via `INGEST_CHANNEL`).
+    // A bi-di stream carries one header followed by any number of batches
+    // until the client closes it. Looping here lets tests observe multiple
+    // ACKs on the same stream while a single sender task remains active.
     loop {
         let mut buf = Vec::new();
         if recv_raw(&mut recv, &mut buf).await.is_err() {
@@ -1172,15 +1169,13 @@ async fn cancellation_flushes_timestamps() {
     }
 }
 
-/// Test: In-flight ACK/timestamp messages sent near the cancellation
-/// boundary are captured by the drain window and flushed to disk.
+/// Test: Shutdown near ACK delivery must preserve persisted timestamp
+/// state.
 ///
-/// The publish server sends 3 ACKs with 200ms gaps. We cancel
-/// immediately after the first ACK notification, so the remaining
-/// ACKs arrive while `receive_time_series_timestamp` and
-/// `write_last_timestamp` are draining.  The final timestamp on disk
-/// must be >= the pre-cancellation value, proving the drain captured
-/// in-flight messages.
+/// The publish server sends 3 ACKs with 200ms gaps. We cancel after the
+/// first ACK notification and then verify the timestamp on disk is not
+/// older than the pre-cancellation value. This checks that cancellation
+/// does not regress persisted timestamp state.
 #[serial]
 #[tokio::test]
 async fn cancellation_drain_captures_inflight_acks() {
@@ -1416,12 +1411,10 @@ async fn delete_then_readd_same_id_starts_fresh_stream() {
     harness.cleanup().await;
 }
 
-/// Regression test for per-policy generation separation on the ingest
-/// side: deleting a policy must tear down the `send_time_series` task
-/// and its `INGEST_CHANNEL` entry bound to that generation. Without
-/// this, the old generation's ingest sender would leak across a
-/// delete/re-add cycle and the new generation's series would be
-/// routed into a stale QUIC bi-di stream.
+/// Regression test for delete teardown on the ingest side: deleting a
+/// policy must stop the active `send_time_series` task and remove its
+/// `INGEST_CHANNEL` entry. Without this, an old sender could survive
+/// the delete and interfere with later work for the same id.
 #[serial]
 #[tokio::test]
 async fn delete_policy_tears_down_ingest_channel_entry() {
