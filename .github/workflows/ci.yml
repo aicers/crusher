@@ -18,7 +18,7 @@ jobs:
       docs_only: ${{ steps.derive.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
