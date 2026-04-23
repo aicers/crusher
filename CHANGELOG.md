@@ -56,6 +56,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Updated `review-protocol` dependency to version 0.18.1.
 - Changed `REQUIRED_GIGANTO_VERSION` to 0.27.0.
 - Changed `REQUIRED_MANAGER_VERSION` to 0.48.0.
+- Added cooperative shutdown for Tokio tasks using a
+  `CancellationCoordinator` (`CancellationToken` + `TaskTracker`)
+  and task draining on shutdown/reload.
+- Refactored async policy/stream/timestamp handling to improve
+  cancellation safety and avoid partial state loss during shutdown.
+- Updated `review-protocol` dependency to rev `c284fa6`.
 
 ### Fixed
 
