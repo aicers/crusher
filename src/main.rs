@@ -25,9 +25,9 @@ use tracing_appender::non_blocking::WorkerGuard;
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 
 #[derive(Debug, Clone)]
-struct ManagerServer {
-    name: String,
-    rpc_srv_addr: SocketAddr,
+pub(crate) struct ManagerServer {
+    pub(crate) name: String,
+    pub(crate) rpc_srv_addr: SocketAddr,
 }
 
 impl FromStr for ManagerServer {
@@ -48,18 +48,18 @@ impl FromStr for ManagerServer {
 
 #[derive(Parser, Debug, Clone)]
 #[command(version)]
-struct CmdLineArgs {
+pub(crate) struct CmdLineArgs {
     /// Path to the local configuration TOML file.
     #[arg(short, value_name = "CONFIG_PATH")]
-    config: Option<String>,
+    pub(crate) config: Option<String>,
 
     /// Path to the certificate file.
     #[arg(long, value_name = "CERT_PATH")]
-    cert: String,
+    pub(crate) cert: String,
 
     /// Path to the key file.
     #[arg(long, value_name = "KEY_PATH")]
-    key: String,
+    pub(crate) key: String,
 
     /// Path to the CA certificate files. Multiple paths can be provided as a comma-separated list.
     #[arg(
@@ -68,11 +68,11 @@ struct CmdLineArgs {
         required = true,
         value_delimiter = ','
     )]
-    ca_certs: Vec<String>,
+    pub(crate) ca_certs: Vec<String>,
 
     /// Address of the Manager server formatted as `<server_name>@<server_ip>:<server_port>`.
     #[arg(value_parser=clap::builder::ValueParser::new(ManagerServer::from_str))]
-    manager_server: ManagerServer,
+    pub(crate) manager_server: ManagerServer,
 }
 
 impl CmdLineArgs {
@@ -115,7 +115,7 @@ fn read_cert_pems(args: &CmdLineArgs) -> Result<CertPems> {
 /// Returns an error if any cert/key/CA file cannot be read, the private key
 /// does not match the certificate, the CA bundle cannot be parsed, or the
 /// client/endpoint configuration cannot be built from the candidate certs.
-fn load_giganto_tls_material(args: &CmdLineArgs) -> Result<Certs> {
+pub(crate) fn load_giganto_tls_material(args: &CmdLineArgs) -> Result<Certs> {
     let (cert_pem, key_pem, ca_certs_pem) = read_cert_pems(args)?;
     let certs = Certs::try_new(
         &cert_pem,
@@ -135,7 +135,7 @@ fn load_giganto_tls_material(args: &CmdLineArgs) -> Result<Certs> {
 /// without being lost.
 ///
 /// SIGHUP is POSIX-only; on non-Unix targets this is a no-op.
-fn register_tls_reload_signal_handler(tls_reload: Arc<Notify>) {
+pub(crate) fn register_tls_reload_signal_handler(tls_reload: Arc<Notify>) {
     #[cfg(unix)]
     {
         tokio::spawn(async move {
@@ -322,6 +322,7 @@ async fn run(
 mod tests {
     use std::sync::Arc;
 
+    use serial_test::serial;
     use tempfile::tempdir;
     use tokio::sync::Notify;
 
@@ -472,6 +473,7 @@ mod tests {
     /// signal that lands before a waiter registers still wakes the next
     /// `notified()` call.
     #[cfg(unix)]
+    #[serial]
     #[tokio::test(flavor = "current_thread")]
     async fn sighup_signals_tls_reload_without_exit() {
         let tls_reload = Arc::new(Notify::new());
@@ -496,6 +498,7 @@ mod tests {
     /// up by the next `notified()` call. This covers the lost-wakeup window
     /// that the `Notify + AtomicBool` split previously had.
     #[cfg(unix)]
+    #[serial]
     #[tokio::test(flavor = "current_thread")]
     async fn sighup_before_waiter_is_not_lost() {
         let tls_reload = Arc::new(Notify::new());

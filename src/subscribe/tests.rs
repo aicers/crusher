@@ -654,3 +654,147 @@ async fn sampling_policy_multiple_streams() {
     // Cleanup: stop client and servers.
     cleanup_test_resources(client_shutdown, client_handle, server_handles).await;
 }
+
+/// Acceptance test for issue #315: a real `SIGHUP` delivers through the
+/// process-level handler into the TLS reload seam, the main-loop rerun
+/// boundary rebuilds the shared `subscribe::Client`, and both ingest and
+/// publish continue against the rebuilt endpoint. Rotating to mismatched
+/// material must not swap the daemon's endpoint; ingest/publish keep
+/// running against the last-known-good endpoint.
+#[cfg(unix)]
+#[serial]
+#[tokio::test(flavor = "current_thread")]
+async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
+    reset_last_transfer_time().await;
+
+    let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
+
+    // Stage the cert/key/CA on disk in a rotation-friendly location so the
+    // test can mutate the files between SIGHUPs.
+    let tls_dir = tempfile::tempdir().expect("tempdir");
+    let cert_path = tls_dir.path().join("cert.pem");
+    let key_path = tls_dir.path().join("key.pem");
+    let ca_path = tls_dir.path().join("ca.pem");
+    let cert_pem = fs::read(CERT_PATH).expect("read cert fixture");
+    let key_pem = fs::read(KEY_PATH).expect("read key fixture");
+    let ca_pem = fs::read(CA_CERT_PATH).expect("read ca fixture");
+    fs::write(&cert_path, &cert_pem).expect("write cert");
+    fs::write(&key_path, &key_pem).expect("write key");
+    fs::write(&ca_path, &ca_pem).expect("write ca");
+
+    let args = crate::CmdLineArgs {
+        config: None,
+        cert: cert_path.to_str().expect("utf-8 cert path").to_string(),
+        key: key_path.to_str().expect("utf-8 key path").to_string(),
+        ca_certs: vec![ca_path.to_str().expect("utf-8 ca path").to_string()],
+        manager_server: "manager@127.0.0.1:38390"
+            .parse()
+            .expect("valid manager address"),
+    };
+
+    // Install the real SIGHUP handler used by main(). A libc::raise below
+    // will traverse the same POSIX signal → tokio::signal::unix path the
+    // daemon uses in production.
+    let tls_reload = Arc::new(Notify::new());
+    crate::register_tls_reload_signal_handler(tls_reload.clone());
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Iteration 1: register a policy, build the shared endpoint, and drive
+    // both ingest and publish to a first ACK.
+    let (mut request_client, request_recv, last_time_series_path, _temp_dir) =
+        setup_request_client(1);
+    let policy = new_policy(DEFAULT_POLICY_ID);
+    request_client
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+
+    let mut certs = crate::load_giganto_tls_material(&args).expect("initial load");
+    let (client_handle_1, client_shutdown_1) = spawn_subscribe_client(
+        &certs,
+        request_recv.clone(),
+        &last_time_series_path,
+        ingest_addr,
+        publish_addr,
+        &request_client,
+    );
+
+    let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        .await
+        .expect("initial ingest ACK before SIGHUP")
+        .expect("ingest ACK channel open");
+    assert_eq!(id, policy.id);
+
+    // Act: deliver a real SIGHUP. The process-level handler must translate
+    // it into a tls_reload notification.
+    // SAFETY: `libc::raise` only targets the current process; no other
+    // threads rely on the default SIGHUP disposition.
+    unsafe {
+        libc::raise(libc::SIGHUP);
+    }
+    timeout(Duration::from_secs(2), tls_reload.notified())
+        .await
+        .expect("SIGHUP delivers tls_reload notification");
+
+    // Drive the main-loop rerun boundary: shutdown the existing shared
+    // endpoint, reload TLS material from disk, and rebuild the shared
+    // subscribe::Client. This mirrors the `RerunReason::TlsReload` branch
+    // in `main::main`.
+    client_shutdown_1.notify_one();
+    let _ = client_handle_1.await;
+    INGEST_CHANNEL.write().await.clear();
+
+    certs = crate::load_giganto_tls_material(&args).expect("valid material reloads");
+    let (client_handle_2, client_shutdown_2) = spawn_subscribe_client(
+        &certs,
+        request_recv.clone(),
+        &last_time_series_path,
+        ingest_addr,
+        publish_addr,
+        &request_client,
+    );
+
+    // Assert: the rebuilt endpoint drives both ingest and publish end to end;
+    // an ingest ACK arrives on the fresh connection opened with the reloaded
+    // TLS material.
+    let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        .await
+        .expect("ingest ACK after SIGHUP-driven rebuild")
+        .expect("ingest ACK channel open");
+    assert_eq!(id, policy.id);
+
+    // Invalid-material case: rotate the key to an unrelated pair so the
+    // loader's endpoint-build validation rejects the candidate certs.
+    let unrelated = rcgen::KeyPair::generate().expect("generate unrelated key");
+    fs::write(&key_path, unrelated.serialize_pem().as_bytes()).expect("rotate to bad key");
+
+    // SAFETY: see earlier `libc::raise` call.
+    unsafe {
+        libc::raise(libc::SIGHUP);
+    }
+    timeout(Duration::from_secs(2), tls_reload.notified())
+        .await
+        .expect("second SIGHUP delivers tls_reload notification");
+
+    // The main-loop would attempt to load the rotated material; this call
+    // must fail and the caller must keep the last-known-good `certs`.
+    let reload_err = crate::load_giganto_tls_material(&args)
+        .err()
+        .expect("mismatched material must be rejected");
+    assert!(
+        format!("{reload_err:#}").contains("Giganto client endpoint"),
+        "unexpected reload error: {reload_err:#}"
+    );
+
+    // The existing subscribe::Client (still running with the last-known-good
+    // endpoint) must keep producing ACKs for the same policy, proving that a
+    // failed reload does not tear down ingest/publish.
+    let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        .await
+        .expect("last-known-good endpoint keeps producing ACKs after failed reload")
+        .expect("ingest ACK channel open");
+    assert_eq!(id, policy.id);
+
+    cleanup_test_resources(client_shutdown_2, client_handle_2, server_handles).await;
+}
