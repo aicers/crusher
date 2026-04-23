@@ -238,14 +238,10 @@ async fn ingest_connection_control(
                             continue 'connection;
                         }
                         Ok(series) = series_recv.recv() => {
-                            // Bind the freshly received series to the
-                            // current generation of its policy by
-                            // looking up its `CancellationToken` in a
-                            // single actor call. If the policy was
-                            // deleted before we got here, the series
-                            // belongs to the dying old generation and
-                            // is dropped: a subsequent re-add opens a
-                            // fresh stream and a fresh `send_time_series`.
+                            // Bind the freshly received series to the currently active policy id by
+                            // looking up its `CancellationToken` in a single actor call. If the
+                            // policy is no longer active by the time we dequeue the series, drop it
+                            // instead of spawning another sender task.
                             let Some(policy_token) = policy_token_for_series(
                                 &policy_handle,
                                 &series.sampling_policy_id,
@@ -691,12 +687,10 @@ pub(crate) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<
     time_series::read_last_timestamp(last_series_time_path).await
 }
 
-/// Resolves the per-policy `CancellationToken` for a series the ingest
-/// side has just dequeued. Returns `None` when the id is not a valid
-/// `u32` (malformed) or when the policy is no longer active (the old
-/// generation was deleted before the series was picked up), signalling
-/// the caller to drop the series instead of spawning a worker bound
-/// to a stale generation.
+/// Resolves the current `CancellationToken` for a dequeued series by its
+/// policy id. Returns `None` when the id is malformed or when the policy
+/// is no longer active, signalling the caller to drop the series instead
+/// of spawning a sender task for an inactive policy.
 async fn policy_token_for_series(
     policy_handle: &PolicyHandle,
     sampling_policy_id: &str,
