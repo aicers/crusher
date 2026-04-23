@@ -130,17 +130,16 @@ impl Client {
         last_series_time_path: PathBuf,
         certs: &Certs,
         request_recv: Receiver<SamplingPolicy>,
-    ) -> Self {
-        let endpoint =
-            client::config(certs).expect("Server configuration error with cert, key or ca_certs");
-        Client {
+    ) -> Result<Self> {
+        let endpoint = client::config(certs)?;
+        Ok(Client {
             ingest_addr,
             publish_addr,
             server_name,
             endpoint,
             request_recv,
             last_series_time_path,
-        }
+        })
     }
 
     pub(crate) async fn run(
