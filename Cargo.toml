@@ -42,7 +42,7 @@ rstest = "0.26"
 review-protocol = { git = "https://github.com/petabi/review-protocol.git", features = [
     "server",
 ], tag = "0.17.0" }
-libc = "0.2.185"
+libc = "0.2"
 
 [lints.clippy]
 pedantic = "warn"

@@ -12,10 +12,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   are now automatically synchronized from the Manager using
   `get_sampling_policy_list`, allowing data collection to
   resume after a restart.
-- `SIGHUP` now reloads the Giganto TLS material without
-  restarting the process, so rotated certificates take effect
-  on the next remote-mode rerun. Failed reloads keep the
-  last-known-good endpoint.
+- `SIGHUP` now reloads the Giganto TLS material without restarting the process,
+  so rotated certificates take effect on the next remote-mode rerun. Failed
+  reloads keep the last-known-good endpoint.
 
 ### Changed
 

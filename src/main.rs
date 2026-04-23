@@ -103,7 +103,7 @@ fn read_cert_pems(args: &CmdLineArgs) -> Result<CertPems> {
     Ok((cert_pem, key_pem, ca_certs_pem))
 }
 
-/// Reads, parses, and validates Giganto cert/key/CA material from disk.
+/// Reads, parses, and validates TLS cert/key/CA material from disk.
 ///
 /// The candidate certs are validated by building the same QUIC client
 /// configuration that `subscribe::Client::new` uses, so that mismatched
@@ -115,7 +115,7 @@ fn read_cert_pems(args: &CmdLineArgs) -> Result<CertPems> {
 /// Returns an error if any cert/key/CA file cannot be read, the private key
 /// does not match the certificate, the CA bundle cannot be parsed, or the
 /// client/endpoint configuration cannot be built from the candidate certs.
-pub(crate) fn load_giganto_tls_material(args: &CmdLineArgs) -> Result<Certs> {
+pub(crate) fn load_tls_material(args: &CmdLineArgs) -> Result<Certs> {
     let (cert_pem, key_pem, ca_certs_pem) = read_cert_pems(args)?;
     let certs = Certs::try_new(
         &cert_pem,
@@ -123,7 +123,7 @@ pub(crate) fn load_giganto_tls_material(args: &CmdLineArgs) -> Result<Certs> {
         &ca_certs_pem.iter().map(Vec::as_slice).collect::<Vec<_>>(),
     )?;
     let _ = client::client_config(&certs)
-        .context("failed to build a Giganto client endpoint from the TLS material")?;
+        .context("failed to build a client endpoint from the TLS material")?;
     Ok(certs)
 }
 
@@ -172,7 +172,7 @@ enum RerunReason {
 async fn main() -> Result<()> {
     let args = CmdLineArgs::parse();
     let (cert_pem, key_pem, ca_certs_pem) = read_cert_pems(&args)?;
-    let mut certs = load_giganto_tls_material(&args)?;
+    let mut certs = load_tls_material(&args)?;
     let (request_send, request_recv) =
         async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
     let config_reload = Arc::new(Notify::new());
@@ -225,7 +225,7 @@ async fn main() -> Result<()> {
         };
 
         if should_reload_tls {
-            match load_giganto_tls_material(&args) {
+            match load_tls_material(&args) {
                 Ok(new_certs) => {
                     info!("Reloaded Giganto TLS material");
                     certs = new_certs;
@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn load_giganto_tls_material_reads_from_disk() {
+    fn load_tls_material_reads_from_disk() {
         let cert_pem = std::fs::read("tests/cert.pem").expect("read cert");
         let key_pem = std::fs::read("tests/key.pem").expect("read key");
         let ca_pem = std::fs::read("tests/ca_cert.pem").expect("read ca");
@@ -375,20 +375,20 @@ mod tests {
             vec![ca_path.to_str().expect("utf-8 ca path").to_string()],
         );
 
-        let certs = load_giganto_tls_material(&args).expect("load certs from disk");
+        let certs = load_tls_material(&args).expect("load certs from disk");
         assert!(!certs.certs.is_empty());
         assert!(!certs.ca_certs.is_empty());
     }
 
     fn expect_load_err(args: &CmdLineArgs) -> anyhow::Error {
-        match load_giganto_tls_material(args) {
+        match load_tls_material(args) {
             Ok(_) => panic!("expected TLS reload to fail"),
             Err(e) => e,
         }
     }
 
     #[test]
-    fn load_giganto_tls_material_fails_on_missing_file() {
+    fn load_tls_material_fails_on_missing_file() {
         let args = args_with_paths(
             "tests/does_not_exist.pem",
             "tests/key.pem",
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn load_giganto_tls_material_fails_on_invalid_cert() {
+    fn load_tls_material_fails_on_invalid_cert() {
         let dir = tempdir().expect("tempdir");
         let cert_path = dir.path().join("cert.pem");
         std::fs::write(&cert_path, b"not a pem").expect("write cert");
@@ -418,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn load_giganto_tls_material_fails_on_invalid_key() {
+    fn load_tls_material_fails_on_invalid_key() {
         let cert_pem = std::fs::read("tests/cert.pem").expect("read cert");
         let ca_pem = std::fs::read("tests/ca_cert.pem").expect("read ca");
 
@@ -446,7 +446,7 @@ mod tests {
     /// than returning candidate certs that would later panic during
     /// endpoint construction in `subscribe::Client::new`.
     #[test]
-    fn load_giganto_tls_material_rejects_mismatched_key() {
+    fn load_tls_material_rejects_mismatched_key() {
         let cert_pem = std::fs::read("tests/cert.pem").expect("read cert");
         let ca_pem = std::fs::read("tests/ca_cert.pem").expect("read ca");
         let unrelated = rcgen::KeyPair::generate().expect("generate key");
@@ -463,7 +463,7 @@ mod tests {
         );
         let err = expect_load_err(&args);
         assert!(
-            format!("{err:#}").contains("Giganto client endpoint"),
+            format!("{err:#}").contains("client endpoint"),
             "mismatched key must surface an endpoint-build error: {err:#}"
         );
     }
@@ -557,7 +557,7 @@ mod tests {
     /// last-known-good `Certs` value and must not propagate an error.
     #[test]
     fn failed_reload_preserves_last_known_good_certs() {
-        let good = load_giganto_tls_material(&args_with_paths(
+        let good = load_tls_material(&args_with_paths(
             "tests/cert.pem",
             "tests/key.pem",
             vec!["tests/ca_cert.pem".to_string()],
@@ -573,7 +573,7 @@ mod tests {
 
         // Simulate the main-loop reload branch: on failure, keep `good`.
         let mut current = good;
-        if let Ok(new_certs) = load_giganto_tls_material(&args) {
+        if let Ok(new_certs) = load_tls_material(&args) {
             current = new_certs;
         }
 
@@ -603,7 +603,7 @@ mod tests {
 
         // Initial load succeeds; validated material also drives a real
         // endpoint the way `subscribe::Client::new` would.
-        let current = load_giganto_tls_material(&args).expect("initial load succeeds");
+        let current = load_tls_material(&args).expect("initial load succeeds");
         let initial_leaf_count = current.certs.len();
         client::config(&current)
             .expect("initial certs build an endpoint")
@@ -616,11 +616,11 @@ mod tests {
 
         // Reload attempt must fail and the caller must keep the previous
         // certs (mirroring the main-loop reload branch).
-        match load_giganto_tls_material(&args) {
+        match load_tls_material(&args) {
             Ok(_) => panic!("mismatched material must not be accepted by the loader"),
             Err(e) => {
                 assert!(
-                    format!("{e:#}").contains("Giganto client endpoint"),
+                    format!("{e:#}").contains("client endpoint"),
                     "unexpected error: {e:#}"
                 );
             }
@@ -636,7 +636,7 @@ mod tests {
         // A subsequent valid rotation (write a fresh but matching pair)
         // swaps the material cleanly.
         std::fs::write(&key_path, &key_pem).expect("restore matching key");
-        let refreshed = load_giganto_tls_material(&args).expect("valid rotation loads");
+        let refreshed = load_tls_material(&args).expect("valid rotation loads");
         assert_eq!(refreshed.certs.len(), initial_leaf_count);
     }
 }
