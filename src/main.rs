@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use client::Certs;
+use client::{Certs, SharedTlsBytes, TlsBytes};
 use logging::init_tracing;
 use request::IdleExitReason;
 use review_protocol::types::SamplingPolicy;
@@ -116,6 +116,19 @@ fn read_cert_pems(args: &CmdLineArgs) -> Result<CertPems> {
 /// does not match the certificate, the CA bundle cannot be parsed, or the
 /// client/endpoint configuration cannot be built from the candidate certs.
 pub(crate) fn load_tls_material(args: &CmdLineArgs) -> Result<Certs> {
+    load_tls_material_with_bytes(args).map(|(certs, _)| certs)
+}
+
+/// Like [`load_tls_material`], but also returns the raw PEM bytes so the
+/// manager/control reconnect path can swap in rotated material without a
+/// second disk read. Validation happens once against the staged bytes; on
+/// success both the parsed `Certs` and the raw bytes are known good and
+/// may be published together.
+///
+/// # Errors
+///
+/// Returns the same errors as [`load_tls_material`].
+pub(crate) fn load_tls_material_with_bytes(args: &CmdLineArgs) -> Result<(Certs, TlsBytes)> {
     let (cert_pem, key_pem, ca_certs_pem) = read_cert_pems(args)?;
     let certs = Certs::try_new(
         &cert_pem,
@@ -124,7 +137,7 @@ pub(crate) fn load_tls_material(args: &CmdLineArgs) -> Result<Certs> {
     )?;
     let _ = client::client_config(&certs)
         .context("failed to build a client endpoint from the TLS material")?;
-    Ok(certs)
+    Ok((certs, TlsBytes::new(cert_pem, key_pem, ca_certs_pem)))
 }
 
 /// Registers a process-level SIGHUP handler that requests a Giganto TLS
@@ -171,8 +184,8 @@ enum RerunReason {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CmdLineArgs::parse();
-    let (cert_pem, key_pem, ca_certs_pem) = read_cert_pems(&args)?;
-    let mut certs = load_tls_material(&args)?;
+    let (mut certs, tls_bytes) = load_tls_material_with_bytes(&args)?;
+    let manager_tls = SharedTlsBytes::new(tls_bytes);
     let (request_send, request_recv) =
         async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
     let config_reload = Arc::new(Notify::new());
@@ -182,9 +195,7 @@ async fn main() -> Result<()> {
         args.manager_server.rpc_srv_addr,
         args.manager_server.name.clone(),
         request_send,
-        cert_pem,
-        key_pem,
-        ca_certs_pem,
+        manager_tls.clone(),
         config_reload.clone(),
     );
     let mut guard = None;
@@ -225,15 +236,17 @@ async fn main() -> Result<()> {
         };
 
         if should_reload_tls {
-            match load_tls_material(&args) {
-                Ok(new_certs) => {
+            match load_tls_material_with_bytes(&args) {
+                Ok((new_certs, new_bytes)) => {
                     info!("Reloaded Giganto TLS material");
                     certs = new_certs;
+                    manager_tls.replace(new_bytes);
+                    info!("Refreshed manager/control TLS bytes for next reconnect");
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to reload Giganto TLS material; keeping last-known-good shared \
-                         endpoint state: {e:#}"
+                        "Failed to reload TLS material; keeping last-known-good shared \
+                         endpoint state and manager/control TLS bytes: {e:#}"
                     );
                 }
             }
@@ -638,5 +651,53 @@ mod tests {
         std::fs::write(&key_path, &key_pem).expect("restore matching key");
         let refreshed = load_tls_material(&args).expect("valid rotation loads");
         assert_eq!(refreshed.certs.len(), initial_leaf_count);
+    }
+
+    /// End-to-end reload contract for the manager/control path: a valid
+    /// rotation replaces the shared `TlsBytes`; an invalid rotation
+    /// preserves the last-known-good bytes.
+    #[test]
+    fn manager_tls_bytes_refresh_follows_reload_outcome() {
+        let cert_pem = std::fs::read("tests/cert.pem").expect("read cert");
+        let key_pem = std::fs::read("tests/key.pem").expect("read key");
+        let ca_pem = std::fs::read("tests/ca_cert.pem").expect("read ca");
+
+        let dir = tempdir().expect("tempdir");
+        let (cert_path, key_path, ca_path) =
+            write_rotated_material(dir.path(), &cert_pem, &key_pem, &ca_pem);
+        let args = args_with_paths(
+            cert_path.to_str().expect("utf-8 cert path"),
+            key_path.to_str().expect("utf-8 key path"),
+            vec![ca_path.to_str().expect("utf-8 ca path").to_string()],
+        );
+
+        let (_, initial_bytes) =
+            load_tls_material_with_bytes(&args).expect("initial load succeeds");
+        let manager_tls = SharedTlsBytes::new(initial_bytes.clone());
+        assert_eq!(manager_tls.snapshot(), initial_bytes);
+
+        // Invalid rotation: mismatched key. Reload must fail and the
+        // shared bytes must remain at the last-known-good value because
+        // the caller mirrors the main-loop branch that skips the swap on
+        // error.
+        let unrelated = rcgen::KeyPair::generate().expect("generate key");
+        std::fs::write(&key_path, unrelated.serialize_pem().as_bytes()).expect("rewrite key file");
+        assert!(
+            load_tls_material_with_bytes(&args).is_err(),
+            "mismatched material must not be accepted by the loader",
+        );
+        assert_eq!(
+            manager_tls.snapshot(),
+            initial_bytes,
+            "failed reload must preserve the last-known-good manager TLS bytes",
+        );
+
+        // Valid rotation: restore the matching key, reload succeeds,
+        // and the shared bytes swap atomically.
+        std::fs::write(&key_path, &key_pem).expect("restore matching key");
+        let (_, refreshed_bytes) =
+            load_tls_material_with_bytes(&args).expect("valid rotation loads");
+        manager_tls.replace(refreshed_bytes.clone());
+        assert_eq!(manager_tls.snapshot(), refreshed_bytes);
     }
 }

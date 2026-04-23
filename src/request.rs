@@ -16,7 +16,10 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{client::SERVER_RETRY_INTERVAL, info_or_print};
+use crate::{
+    client::{SERVER_RETRY_INTERVAL, SharedTlsBytes},
+    info_or_print,
+};
 
 const REQUIRED_MANAGER_VERSION: &str = "0.47.0";
 const MAX_RETRIES: u8 = 3;
@@ -63,9 +66,7 @@ pub(crate) struct Client {
     server_name: String,
     connection: Option<Connection>,
     request_send: Sender<SamplingPolicy>,
-    cert: Vec<u8>,
-    key: Vec<u8>,
-    ca_certs: Vec<Vec<u8>>,
+    tls_bytes: SharedTlsBytes,
     config_reload: Arc<Notify>,
     status: Status,
     pub(crate) active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
@@ -73,14 +74,11 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         server_address: SocketAddr,
         server_name: String,
         request_send: Sender<SamplingPolicy>,
-        cert: Vec<u8>,
-        key: Vec<u8>,
-        ca_certs: Vec<Vec<u8>>,
+        tls_bytes: SharedTlsBytes,
         config_reload: Arc<Notify>,
     ) -> Self {
         Client {
@@ -88,9 +86,7 @@ impl Client {
             server_name,
             connection: None,
             request_send,
-            cert,
-            key,
-            ca_certs,
+            tls_bytes,
             config_reload,
             status: Status::Ready,
             active_policy_list: Arc::new(RwLock::new(HashMap::new())),
@@ -180,6 +176,11 @@ impl Client {
             .is_none_or(|conn| conn.close_reason().is_some());
 
         if needs_reconnect {
+            // Snapshot the shared TLS bytes so each reconnect attempt
+            // builds a `ConnectionBuilder` from the current material,
+            // picking up any rotation that landed since the previous
+            // attempt.
+            let tls = self.tls_bytes.snapshot();
             let mut conn_builder = ConnectionBuilder::new(
                 &self.server_name,
                 self.server_address,
@@ -187,10 +188,10 @@ impl Client {
                 env!("CARGO_PKG_VERSION"),
                 REQUIRED_MANAGER_VERSION,
                 self.status,
-                &self.cert,
-                &self.key,
+                &tls.cert,
+                &tls.key,
             )?;
-            conn_builder.root_certs(&self.ca_certs)?;
+            conn_builder.root_certs(&tls.ca_certs)?;
             self.connection = Some(conn_builder.connect().await?);
             info!(
                 "Connection established to the manager server {}",
@@ -440,7 +441,7 @@ mod tests {
     use rustls::server::WebPkiClientVerifier;
 
     use super::*;
-    use crate::client::Certs;
+    use crate::client::{Certs, TlsBytes};
 
     const CERT_PATH: &str = "tests/cert.pem";
     const KEY_PATH: &str = "tests/key.pem";
@@ -457,9 +458,7 @@ mod tests {
             server_name: "test".to_string(),
             connection: None,
             request_send: tx,
-            cert: Vec::new(),
-            key: Vec::new(),
-            ca_certs: Vec::new(),
+            tls_bytes: SharedTlsBytes::new(TlsBytes::new(Vec::new(), Vec::new(), Vec::new())),
             config_reload,
             status: Status::Ready,
             active_policy_list: Arc::new(RwLock::new(HashMap::new())),
@@ -1084,13 +1083,12 @@ mod tests {
         });
 
         let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let tls_bytes = SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
         let mut client = Client::new(
             server_addr,
             "mismatched-server-name".to_string(),
             request_send,
-            cert_pem,
-            key_pem,
-            ca_certs_pem,
+            tls_bytes,
             Arc::new(Notify::new()),
         );
 
@@ -1224,13 +1222,12 @@ mod tests {
         });
 
         let (request_send, request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let tls_bytes = SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
         let mut client = Client::new(
             server_addr,
             "localhost".to_string(),
             request_send,
-            cert_pem,
-            key_pem,
-            ca_certs_pem,
+            tls_bytes,
             Arc::new(Notify::new()),
         );
 
@@ -1254,6 +1251,166 @@ mod tests {
         );
 
         server_task.abort();
+    }
+
+    // =========================================================================
+    // Shared TLS Bytes Reload Tests
+    // =========================================================================
+
+    /// Spawns a minimal review-protocol server that performs the handshake
+    /// once per connection. Returns the local server address, a shared
+    /// counter that tracks successful handshakes, and a handle to the
+    /// driver task.
+    fn spawn_handshake_only_server(
+        certs: &Certs,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let server_endpoint = Endpoint::server(
+            create_test_server_config(certs),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        )
+        .expect("create server endpoint");
+        let server_addr = server_endpoint.local_addr().expect("read server address");
+        let handshake_count = Arc::new(AtomicUsize::new(0));
+        let counter = handshake_count.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(conn) = server_endpoint.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let Ok(connection) = conn.await else {
+                        return;
+                    };
+                    let addr = connection.remote_address();
+                    if review_protocol::server::handshake(
+                        &connection,
+                        addr,
+                        ">=0",
+                        REQUIRED_MANAGER_VERSION,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    // Keep the connection open; we only care that the
+                    // handshake completed, so that the client side has
+                    // observed the presented client certificate.
+                    while connection.accept_bi().await.is_ok() {}
+                });
+            }
+        });
+        (server_addr, handshake_count, handle)
+    }
+
+    /// Acceptance test: `connect()` reads the current shared TLS bytes on
+    /// every reconnect, so a swap performed between attempts takes effect
+    /// on the next attempt.
+    ///
+    /// Replaces invalid initial bytes with valid ones and verifies that
+    /// the first attempt fails (invalid bytes) while the second attempt
+    /// succeeds (rotated bytes picked up from the shared store).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_uses_rotated_shared_tls_bytes() {
+        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+        let (server_addr, _handshake_count, server_handle) = spawn_handshake_only_server(&certs);
+
+        // Start with empty bytes so the first reconnect attempt fails at
+        // builder construction. This proves the client is reading from
+        // the shared store rather than baking the bytes in at construction.
+        let shared = SharedTlsBytes::new(TlsBytes::new(Vec::new(), Vec::new(), Vec::new()));
+        let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let mut client = Client::new(
+            server_addr,
+            "localhost".to_string(),
+            request_send,
+            shared.clone(),
+            Arc::new(Notify::new()),
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(3), client.connect())
+            .await
+            .expect("connect returns within timeout");
+        assert!(
+            first.is_err(),
+            "empty shared bytes must fail at builder construction"
+        );
+
+        // Swap in valid bytes; this models the reload-time refresh.
+        shared.replace(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
+
+        let connected = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect returns within timeout")
+            .expect("rotated bytes must produce a valid ConnectionBuilder");
+        assert!(
+            connected.close_reason().is_none(),
+            "rebuilt connection must be alive"
+        );
+
+        server_handle.abort();
+    }
+
+    /// The shared store must not drop the existing `Connection` when
+    /// bytes are swapped. Only a later reconnect attempt sees the new
+    /// material, so an already established connection stays alive across
+    /// a reload.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_does_not_disconnect_existing_connection() {
+        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+        let (server_addr, handshake_count, server_handle) = spawn_handshake_only_server(&certs);
+
+        let shared = SharedTlsBytes::new(TlsBytes::new(
+            cert_pem.clone(),
+            key_pem.clone(),
+            ca_certs_pem.clone(),
+        ));
+        let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let mut client = Client::new(
+            server_addr,
+            "localhost".to_string(),
+            request_send,
+            shared.clone(),
+            Arc::new(Notify::new()),
+        );
+
+        let initial = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect returns within timeout")
+            .expect("initial connection succeeds");
+        assert!(initial.close_reason().is_none());
+
+        // Wait for the server to record the handshake so the comparison
+        // below is deterministic.
+        for _ in 0..50 {
+            if handshake_count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(handshake_count.load(Ordering::SeqCst), 1);
+
+        // Swap in new (equivalent) bytes; this models a reload that
+        // rotated the material. The swap alone must not tear down the
+        // connection, and the next `connect()` must reuse it (since the
+        // existing connection is still healthy) rather than re-handshake.
+        shared.replace(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
+
+        let after = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect returns within timeout")
+            .expect("connection stays open across reload");
+        assert!(after.close_reason().is_none());
+
+        // Give the server time to observe a spurious reconnect if the
+        // reload path ever decides to tear down the existing connection.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            handshake_count.load(Ordering::SeqCst),
+            1,
+            "reload must not proactively reconnect the active connection",
+        );
+
+        server_handle.abort();
     }
 
     // =========================================================================
