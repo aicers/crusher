@@ -73,7 +73,7 @@ pub(crate) fn config(certs: &Certs) -> Result<Endpoint> {
     let config = client_config(certs)?;
 
     let mut endpoint = quinn::Endpoint::client((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
-        .expect("Failed to create endpoint");
+        .context("failed to create client endpoint")?;
     endpoint.set_default_client_config(config);
 
     Ok(endpoint)

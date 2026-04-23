@@ -433,7 +433,8 @@ fn spawn_subscribe_client(
         last_time_series_path.to_path_buf(),
         certs,
         request_recv,
-    );
+    )
+    .expect("test client should build an endpoint");
 
     let client_shutdown = Arc::new(Notify::new());
     let client_shutdown_clone = client_shutdown.clone();

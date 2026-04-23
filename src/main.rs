@@ -279,7 +279,7 @@ async fn run(
         settings.last_timestamp_data,
         certs,
         request_recv,
-    );
+    )?;
 
     info!("Time series generate started");
     let shutdown = Arc::new(Notify::new());
