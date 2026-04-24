@@ -21,7 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: Cache docs theme
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: docs/.theme
           key: ${{ runner.os }}-docs-theme-${{ hashFiles('docs/theme.toml') }}
