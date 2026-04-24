@@ -52,18 +52,32 @@ impl SharedTlsBytes {
     }
 
     /// Returns a clone of the currently stored TLS bytes.
+    ///
+    /// Recovers from a poisoned lock by reading through the poison
+    /// wrapper, because the locked sections only clone or replace the
+    /// whole [`TlsBytes`] value. A poisoned lock therefore still holds
+    /// coherent bytes, and panicking here would turn a stale worker
+    /// failure into a whole-daemon outage.
     pub(crate) fn snapshot(&self) -> TlsBytes {
-        self.inner
-            .read()
-            .expect("tls bytes lock is not poisoned")
-            .clone()
+        match self.inner.read() {
+            Ok(bytes) => bytes.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Atomically replaces the shared bytes with `bytes`. Callers must
     /// only invoke this after successfully validating `bytes`, so that
     /// the store never holds material known to be invalid.
+    ///
+    /// Recovers from a poisoned lock in the same way as
+    /// [`Self::snapshot`]: the whole value is overwritten, so a prior
+    /// panic during a read or write cannot leave the store in a
+    /// partially updated state.
     pub(crate) fn replace(&self, bytes: TlsBytes) {
-        *self.inner.write().expect("tls bytes lock is not poisoned") = bytes;
+        match self.inner.write() {
+            Ok(mut current) => *current = bytes,
+            Err(poisoned) => *poisoned.into_inner() = bytes,
+        }
     }
 }
 
