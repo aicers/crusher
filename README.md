@@ -167,4 +167,4 @@ The script produces `site/pdf/crusher-manual.{locale}.pdf`.
 
 ## Copyright
 
-- Copyright 2023-2025 ClumL Inc.
+- Copyright 2023-2026 ClumL Inc.
