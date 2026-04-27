@@ -1447,6 +1447,14 @@ mod tests {
         key_pem: Vec<u8>,
     }
 
+    struct PeerCertTrackingServer {
+        addr: SocketAddr,
+        peer_certs: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        handshake_count: Arc<AtomicUsize>,
+        latest_conn: Arc<std::sync::Mutex<Option<quinn::Connection>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
     /// Builds a CA with three leaves (server, client A, client B) so that
     /// the same server can accept connections presenting either client
     /// certificate. Without this split, an A-to-B rotation test cannot
@@ -1512,16 +1520,7 @@ mod tests {
     /// way to trigger a reconnect on the client without relying on a
     /// client-side `close()` API that `review_protocol::client::Connection`
     /// does not expose.
-    #[allow(clippy::type_complexity)]
-    fn spawn_server_tracking_peer_certs(
-        certs: &Certs,
-    ) -> (
-        SocketAddr,
-        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-        Arc<AtomicUsize>,
-        Arc<std::sync::Mutex<Option<quinn::Connection>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    fn spawn_server_tracking_peer_certs(certs: &Certs) -> PeerCertTrackingServer {
         let server_endpoint = Endpoint::server(
             create_test_server_config(certs),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
@@ -1573,13 +1572,13 @@ mod tests {
                 });
             }
         });
-        (
-            server_addr,
+        PeerCertTrackingServer {
+            addr: server_addr,
             peer_certs,
             handshake_count,
             latest_conn,
             handle,
-        )
+        }
     }
 
     /// End-to-end client-cert rotation contract (#314): an initial
@@ -1589,13 +1588,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn reconnect_presents_rotated_client_certificate_after_reload() {
         let material = shared_ca_material();
-        let (server_addr, peer_certs, handshake_count, latest_conn, server_handle) =
-            spawn_server_tracking_peer_certs(&material.server_certs);
+        let server = spawn_server_tracking_peer_certs(&material.server_certs);
 
         let shared = SharedTlsBytes::new(material.client_a_bytes);
         let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
         let client = Client::new(
-            server_addr,
+            server.addr,
             "localhost".to_string(),
             request_send,
             shared.clone(),
@@ -1609,14 +1607,19 @@ mod tests {
         assert!(initial.close_reason().is_none());
 
         for _ in 0..50 {
-            if handshake_count.load(Ordering::SeqCst) >= 1 {
+            if server.handshake_count.load(Ordering::SeqCst) >= 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(handshake_count.load(Ordering::SeqCst), 1);
+        assert_eq!(server.handshake_count.load(Ordering::SeqCst), 1);
         assert_eq!(
-            peer_certs.lock().expect("peer_certs lock").first().cloned(),
+            server
+                .peer_certs
+                .lock()
+                .expect("peer_certs lock")
+                .first()
+                .cloned(),
             Some(material.client_a_leaf_der.clone()),
             "initial connection must present client cert A",
         );
@@ -1633,7 +1636,8 @@ mod tests {
         // Simulate the active session ending naturally (for example,
         // the server closing after rotating its own material). The
         // next `connect()` must rebuild using the rotated B bytes.
-        latest_conn
+        server
+            .latest_conn
             .lock()
             .expect("latest_conn lock")
             .as_ref()
@@ -1659,14 +1663,14 @@ mod tests {
         assert!(reconnected.close_reason().is_none());
 
         for _ in 0..50 {
-            if handshake_count.load(Ordering::SeqCst) >= 2 {
+            if server.handshake_count.load(Ordering::SeqCst) >= 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(handshake_count.load(Ordering::SeqCst), 2);
+        assert_eq!(server.handshake_count.load(Ordering::SeqCst), 2);
 
-        let observed = peer_certs.lock().expect("peer_certs lock").clone();
+        let observed = server.peer_certs.lock().expect("peer_certs lock").clone();
         assert_eq!(observed.len(), 2, "server records both connections");
         assert_eq!(
             observed[0], material.client_a_leaf_der,
@@ -1677,7 +1681,7 @@ mod tests {
             "post-reload reconnect must present the rotated client cert B",
         );
 
-        server_handle.abort();
+        server.handle.abort();
     }
 
     /// Exercises the real SIGHUP reload handoff: `main.rs` notifies
