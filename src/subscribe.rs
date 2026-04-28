@@ -228,6 +228,10 @@ async fn ingest_connection_control(
 
                 loop {
                     tokio::select! {
+                        biased;
+                        () = coordinator.cancelled() => {
+                            return Ok(());
+                        }
                         () = connection_notify.notified() => {
                             drop(connection_notify);
                             INGEST_CHANNEL.write().await.clear();
@@ -273,7 +277,11 @@ async fn ingest_connection_control(
                                 "Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
                             );
-                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                            tokio::select! {
+                                biased;
+                                () = coordinator.cancelled() => return Ok(()),
+                                () = sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)) => {}
+                            }
                             continue;
                         }
                         ConnectionError::TransportError(_) => {
@@ -423,7 +431,11 @@ async fn publish_connection_control(
                                 "Stream channel closed. Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
                             );
-                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                            tokio::select! {
+                                biased;
+                                () = coordinator.cancelled() => return Ok(()),
+                                () = sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)) => {}
+                            }
                             continue 'connection;
                         }
                         err = conn.closed() => {
@@ -433,7 +445,11 @@ async fn publish_connection_control(
                                 err, server_addr, SERVER_RETRY_INTERVAL,
                             );
                             connection_notify.notify_waiters();
-                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                            tokio::select! {
+                                biased;
+                                () = coordinator.cancelled() => return Ok(()),
+                                () = sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)) => {}
+                            }
                             continue 'connection;
                         }
                         Ok(policy) = request_recv.recv() => {
@@ -464,7 +480,11 @@ async fn publish_connection_control(
                                 "Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
                             );
-                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                            tokio::select! {
+                                biased;
+                                () = coordinator.cancelled() => return Ok(()),
+                                () = sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)) => {}
+                            }
                             continue;
                         }
                         ConnectionError::TransportError(_) => {
