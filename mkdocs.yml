@@ -24,13 +24,25 @@ plugins:
           default: true
           nav:
             - Overview: index.md
+            - Prerequisites: prerequisites.md
+            - Configuration: configuration.md
+            - Operations: operations.md
+            - Troubleshooting: troubleshooting.md
         - locale: ko
           name: 한국어
           build: true
           nav:
             - Overview: index.md
+            - Prerequisites: prerequisites.md
+            - Configuration: configuration.md
+            - Operations: operations.md
+            - Troubleshooting: troubleshooting.md
           nav_translations:
             Overview: 개요
+            Prerequisites: 설치 전 준비
+            Configuration: 설정
+            Operations: 실행
+            Troubleshooting: 문제 해결
 
 extra_css:
   - .theme/styles/lists.css
