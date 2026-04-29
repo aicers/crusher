@@ -182,39 +182,51 @@ impl Client {
     }
 
     async fn connect(&self) -> Result<Connection> {
-        let mut guard = self.connection.lock().await;
-        let needs_reconnect = guard
-            .as_ref()
-            .is_none_or(|conn| conn.close_reason().is_some());
-
-        if needs_reconnect {
-            // Snapshot the shared TLS bytes so each reconnect attempt
-            // builds a `ConnectionBuilder` from the current material,
-            // picking up any rotation that landed since the previous
-            // attempt.
-            let tls = self.tls_bytes.snapshot();
-            let mut conn_builder = ConnectionBuilder::new(
-                &self.server_name,
-                self.server_address,
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION"),
-                REQUIRED_MANAGER_VERSION,
-                self.status,
-                &tls.cert,
-                &tls.key,
-            )?;
-            conn_builder.root_certs(&tls.ca_certs)?;
-            *guard = Some(conn_builder.connect().await?);
-            info!(
-                "Connection established to the manager server {}",
-                self.server_address
-            );
+        // Fast path: if a live connection is already installed, return a
+        // clone without holding the mutex across an async boundary.
+        {
+            let guard = self.connection.lock().await;
+            if let Some(conn) = guard.as_ref()
+                && conn.close_reason().is_none()
+            {
+                return Ok(conn.clone());
+            }
         }
 
-        guard
-            .as_ref()
-            .cloned()
-            .context("Failed to access the connection")
+        // Snapshot the shared TLS bytes so each reconnect attempt builds a
+        // `ConnectionBuilder` from the current material, picking up any
+        // rotation that landed since the previous attempt. The mutex is
+        // intentionally not held across this await: a rare duplicate
+        // reconnect during a race is preferable to using the shared
+        // connection mutex as the async connect guard.
+        let tls = self.tls_bytes.snapshot();
+        let mut conn_builder = ConnectionBuilder::new(
+            &self.server_name,
+            self.server_address,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            REQUIRED_MANAGER_VERSION,
+            self.status,
+            &tls.cert,
+            &tls.key,
+        )?;
+        conn_builder.root_certs(&tls.ca_certs)?;
+        let new_conn = conn_builder.connect().await?;
+
+        // Reacquire the lock and install the new connection only if
+        // another caller has not already installed a live one.
+        let mut guard = self.connection.lock().await;
+        if let Some(existing) = guard.as_ref()
+            && existing.close_reason().is_none()
+        {
+            return Ok(existing.clone());
+        }
+        *guard = Some(new_conn.clone());
+        info!(
+            "Connection established to the manager server {}",
+            self.server_address
+        );
+        Ok(new_conn)
     }
 
     pub(crate) async fn get_config(&mut self) -> Result<String> {

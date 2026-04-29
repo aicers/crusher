@@ -161,7 +161,7 @@ pub(crate) fn register_tls_reload_signal_handler(tls_reload: Arc<Notify>) {
                     }
                 };
             while hup.recv().await.is_some() {
-                info!("Received SIGHUP; requesting Giganto TLS reload");
+                info!("Received SIGHUP; requesting TLS reload for Giganto and Manager");
                 tls_reload.notify_one();
             }
         });
