@@ -18,6 +18,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `SIGHUP` now reloads the Giganto TLS material without restarting the process,
   so rotated certificates take effect on the next remote-mode rerun. Failed
   reloads keep the last-known-good endpoint.
+- `SIGHUP` also refreshes the manager/control TLS bytes in place, so the
+  next reconnect presents the rotated client certificate without tearing
+  down the active manager/control connection. The underlying
+  `review_protocol::client::Connection` is now held behind a shared
+  handle that survives the internal `run()` shutdown/respawn driven by
+  the reload signal, so the manager/control session stays established
+  across a SIGHUP. Failed reloads keep the last-known-good bytes.
 
 ### Changed
 

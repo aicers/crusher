@@ -11,12 +11,15 @@ use review_protocol::{
     types::{self as protocol_types, SamplingPolicy, Status},
 };
 use tokio::{
-    sync::{Notify, RwLock},
+    sync::{Mutex, Notify, RwLock},
     time::{Duration, sleep},
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{client::SERVER_RETRY_INTERVAL, info_or_print};
+use crate::{
+    client::{SERVER_RETRY_INTERVAL, SharedTlsBytes},
+    info_or_print,
+};
 
 const REQUIRED_MANAGER_VERSION: &str = "0.47.0";
 const MAX_RETRIES: u8 = 3;
@@ -57,15 +60,25 @@ fn classify_connect_error(error: &anyhow::Error) -> ConnectErrorDisposition {
     ConnectErrorDisposition::Other
 }
 
+/// Shared storage for the active manager/control connection.
+///
+/// The connection lives behind an `Arc<Mutex<...>>` so that cloning a
+/// [`Client`] (for example, to pass into a spawned task) preserves
+/// access to the same underlying `review_protocol::client::Connection`.
+/// That way the connection survives the common `run()` shutdown ->
+/// respawn cycle triggered by SIGHUP: the spawned task exits, but the
+/// retained handle in `main` keeps the connection alive so the next
+/// reconnect attempt reuses it instead of tearing down the manager/
+/// control path.
+type SharedConnection = Arc<Mutex<Option<Connection>>>;
+
 #[derive(Clone)]
 pub(crate) struct Client {
     server_address: SocketAddr,
     server_name: String,
-    connection: Option<Connection>,
+    connection: SharedConnection,
     request_send: Sender<SamplingPolicy>,
-    cert: Vec<u8>,
-    key: Vec<u8>,
-    ca_certs: Vec<Vec<u8>>,
+    tls_bytes: SharedTlsBytes,
     config_reload: Arc<Notify>,
     status: Status,
     pub(crate) active_policy_list: Arc<RwLock<HashMap<u32, SamplingPolicy>>>,
@@ -73,24 +86,19 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         server_address: SocketAddr,
         server_name: String,
         request_send: Sender<SamplingPolicy>,
-        cert: Vec<u8>,
-        key: Vec<u8>,
-        ca_certs: Vec<Vec<u8>>,
+        tls_bytes: SharedTlsBytes,
         config_reload: Arc<Notify>,
     ) -> Self {
         Client {
             server_address,
             server_name,
-            connection: None,
+            connection: Arc::new(Mutex::new(None)),
             request_send,
-            cert,
-            key,
-            ca_certs,
+            tls_bytes,
             config_reload,
             status: Status::Ready,
             active_policy_list: Arc::new(RwLock::new(HashMap::new())),
@@ -173,34 +181,52 @@ impl Client {
         }
     }
 
-    async fn connect(&mut self) -> Result<&Connection> {
-        let needs_reconnect = self
-            .connection
-            .as_ref()
-            .is_none_or(|conn| conn.close_reason().is_some());
-
-        if needs_reconnect {
-            let mut conn_builder = ConnectionBuilder::new(
-                &self.server_name,
-                self.server_address,
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION"),
-                REQUIRED_MANAGER_VERSION,
-                self.status,
-                &self.cert,
-                &self.key,
-            )?;
-            conn_builder.root_certs(&self.ca_certs)?;
-            self.connection = Some(conn_builder.connect().await?);
-            info!(
-                "Connection established to the manager server {}",
-                self.server_address
-            );
+    async fn connect(&self) -> Result<Connection> {
+        // Fast path: if a live connection is already installed, return a
+        // clone without holding the mutex across an async boundary.
+        {
+            let guard = self.connection.lock().await;
+            if let Some(conn) = guard.as_ref()
+                && conn.close_reason().is_none()
+            {
+                return Ok(conn.clone());
+            }
         }
 
-        self.connection
-            .as_ref()
-            .context("Failed to access the connection")
+        // Snapshot the shared TLS bytes so each reconnect attempt builds a
+        // `ConnectionBuilder` from the current material, picking up any
+        // rotation that landed since the previous attempt. The mutex is
+        // intentionally not held across this await: a rare duplicate
+        // reconnect during a race is preferable to using the shared
+        // connection mutex as the async connect guard.
+        let tls = self.tls_bytes.snapshot();
+        let mut conn_builder = ConnectionBuilder::new(
+            &self.server_name,
+            self.server_address,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            REQUIRED_MANAGER_VERSION,
+            self.status,
+            &tls.cert,
+            &tls.key,
+        )?;
+        conn_builder.root_certs(&tls.ca_certs)?;
+        let new_conn = conn_builder.connect().await?;
+
+        // Reacquire the lock and install the new connection only if
+        // another caller has not already installed a live one.
+        let mut guard = self.connection.lock().await;
+        if let Some(existing) = guard.as_ref()
+            && existing.close_reason().is_none()
+        {
+            return Ok(existing.clone());
+        }
+        *guard = Some(new_conn.clone());
+        info!(
+            "Connection established to the manager server {}",
+            self.server_address
+        );
+        Ok(new_conn)
     }
 
     pub(crate) async fn get_config(&mut self) -> Result<String> {
@@ -440,7 +466,7 @@ mod tests {
     use rustls::server::WebPkiClientVerifier;
 
     use super::*;
-    use crate::client::Certs;
+    use crate::client::{Certs, TlsBytes};
 
     const CERT_PATH: &str = "tests/cert.pem";
     const KEY_PATH: &str = "tests/key.pem";
@@ -455,11 +481,9 @@ mod tests {
         let client = Client {
             server_address: "127.0.0.1:8080".parse().unwrap(),
             server_name: "test".to_string(),
-            connection: None,
+            connection: Arc::new(Mutex::new(None)),
             request_send: tx,
-            cert: Vec::new(),
-            key: Vec::new(),
-            ca_certs: Vec::new(),
+            tls_bytes: SharedTlsBytes::new(TlsBytes::new(Vec::new(), Vec::new(), Vec::new())),
             config_reload,
             status: Status::Ready,
             active_policy_list: Arc::new(RwLock::new(HashMap::new())),
@@ -1084,13 +1108,12 @@ mod tests {
         });
 
         let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let tls_bytes = SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
         let mut client = Client::new(
             server_addr,
             "mismatched-server-name".to_string(),
             request_send,
-            cert_pem,
-            key_pem,
-            ca_certs_pem,
+            tls_bytes,
             Arc::new(Notify::new()),
         );
 
@@ -1224,13 +1247,12 @@ mod tests {
         });
 
         let (request_send, request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let tls_bytes = SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
         let mut client = Client::new(
             server_addr,
             "localhost".to_string(),
             request_send,
-            cert_pem,
-            key_pem,
-            ca_certs_pem,
+            tls_bytes,
             Arc::new(Notify::new()),
         );
 
@@ -1254,6 +1276,507 @@ mod tests {
         );
 
         server_task.abort();
+    }
+
+    // =========================================================================
+    // Shared TLS Bytes Reload Tests
+    // =========================================================================
+
+    /// Spawns a minimal review-protocol server that performs the handshake
+    /// once per connection. Returns the local server address, a shared
+    /// counter that tracks successful handshakes, and a handle to the
+    /// driver task.
+    fn spawn_handshake_only_server(
+        certs: &Certs,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let server_endpoint = Endpoint::server(
+            create_test_server_config(certs),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        )
+        .expect("create server endpoint");
+        let server_addr = server_endpoint.local_addr().expect("read server address");
+        let handshake_count = Arc::new(AtomicUsize::new(0));
+        let counter = handshake_count.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(conn) = server_endpoint.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let Ok(connection) = conn.await else {
+                        return;
+                    };
+                    let addr = connection.remote_address();
+                    if review_protocol::server::handshake(
+                        &connection,
+                        addr,
+                        ">=0",
+                        REQUIRED_MANAGER_VERSION,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    // Keep the connection open; we only care that the
+                    // handshake completed, so that the client side has
+                    // observed the presented client certificate.
+                    while connection.accept_bi().await.is_ok() {}
+                });
+            }
+        });
+        (server_addr, handshake_count, handle)
+    }
+
+    /// Acceptance test: `connect()` reads the current shared TLS bytes on
+    /// every reconnect, so a swap performed between attempts takes effect
+    /// on the next attempt.
+    ///
+    /// Replaces invalid initial bytes with valid ones and verifies that
+    /// the first attempt fails (invalid bytes) while the second attempt
+    /// succeeds (rotated bytes picked up from the shared store).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_uses_rotated_shared_tls_bytes() {
+        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+        let (server_addr, _handshake_count, server_handle) = spawn_handshake_only_server(&certs);
+
+        // Start with empty bytes so the first reconnect attempt fails at
+        // builder construction. This proves the client is reading from
+        // the shared store rather than baking the bytes in at construction.
+        let shared = SharedTlsBytes::new(TlsBytes::new(Vec::new(), Vec::new(), Vec::new()));
+        let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let client = Client::new(
+            server_addr,
+            "localhost".to_string(),
+            request_send,
+            shared.clone(),
+            Arc::new(Notify::new()),
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(3), client.connect())
+            .await
+            .expect("connect returns within timeout");
+        assert!(
+            first.is_err(),
+            "empty shared bytes must fail at builder construction"
+        );
+
+        // Swap in valid bytes; this models the reload-time refresh.
+        shared.replace(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
+
+        let connected = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect returns within timeout")
+            .expect("rotated bytes must produce a valid ConnectionBuilder");
+        assert!(
+            connected.close_reason().is_none(),
+            "rebuilt connection must be alive"
+        );
+
+        server_handle.abort();
+    }
+
+    /// The shared store must not drop the existing `Connection` when
+    /// bytes are swapped. Only a later reconnect attempt sees the new
+    /// material, so an already established connection stays alive across
+    /// a reload.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_does_not_disconnect_existing_connection() {
+        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+        let (server_addr, handshake_count, server_handle) = spawn_handshake_only_server(&certs);
+
+        let shared = SharedTlsBytes::new(TlsBytes::new(
+            cert_pem.clone(),
+            key_pem.clone(),
+            ca_certs_pem.clone(),
+        ));
+        let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let client = Client::new(
+            server_addr,
+            "localhost".to_string(),
+            request_send,
+            shared.clone(),
+            Arc::new(Notify::new()),
+        );
+
+        let initial = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect returns within timeout")
+            .expect("initial connection succeeds");
+        assert!(initial.close_reason().is_none());
+
+        // Wait for the server to record the handshake so the comparison
+        // below is deterministic.
+        for _ in 0..50 {
+            if handshake_count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(handshake_count.load(Ordering::SeqCst), 1);
+
+        // Swap in new (equivalent) bytes; this models a reload that
+        // rotated the material. The swap alone must not tear down the
+        // connection, and the next `connect()` must reuse it (since the
+        // existing connection is still healthy) rather than re-handshake.
+        shared.replace(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
+
+        let after = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect returns within timeout")
+            .expect("connection stays open across reload");
+        assert!(after.close_reason().is_none());
+
+        // Give the server time to observe a spurious reconnect if the
+        // reload path ever decides to tear down the existing connection.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            handshake_count.load(Ordering::SeqCst),
+            1,
+            "reload must not proactively reconnect the active connection",
+        );
+
+        server_handle.abort();
+    }
+
+    /// Test material for the A-to-B client-certificate rotation contract.
+    ///
+    /// Holds a freshly generated root CA plus two leaf client certificates
+    /// ("A" and "B") signed by that CA, so the server trusts both and can
+    /// accept either during mTLS. The leaf DER bytes are kept alongside
+    /// the PEM-encoded `TlsBytes` so tests can assert which certificate
+    /// the server actually observed on a given connection.
+    struct SharedCaMaterial {
+        server_certs: Certs,
+        client_a_bytes: TlsBytes,
+        client_b_bytes: TlsBytes,
+        client_a_leaf_der: Vec<u8>,
+        client_b_leaf_der: Vec<u8>,
+    }
+
+    struct Leaf {
+        der: Vec<u8>,
+        fullchain_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+    }
+
+    struct PeerCertTrackingServer {
+        addr: SocketAddr,
+        peer_certs: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        handshake_count: Arc<AtomicUsize>,
+        latest_conn: Arc<std::sync::Mutex<Option<quinn::Connection>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    /// Builds a CA with three leaves (server, client A, client B) so that
+    /// the same server can accept connections presenting either client
+    /// certificate. Without this split, an A-to-B rotation test cannot
+    /// distinguish the presented material from the handshake outcome.
+    fn shared_ca_material() -> SharedCaMaterial {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType, string::Ia5String,
+        };
+
+        let ca_kp = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "reload-test-ca");
+        let ca_cert = ca_params.self_signed(&ca_kp).expect("self-sign ca");
+        let ca_pem = ca_cert.pem().into_bytes();
+        let issuer = rcgen::Issuer::from_ca_cert_pem(&ca_cert.pem(), &ca_kp).expect("ca issuer");
+
+        let make_leaf = |cn: &str| -> Leaf {
+            let kp = KeyPair::generate().expect("leaf key");
+            let mut params = CertificateParams::default();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, cn.to_string());
+            params.subject_alt_names = vec![SanType::DnsName(
+                Ia5String::try_from("localhost").expect("valid SAN"),
+            )];
+            let cert = params.signed_by(&kp, &issuer).expect("sign leaf");
+            let mut fullchain_pem = cert.pem().into_bytes();
+            fullchain_pem.extend_from_slice(&ca_pem);
+            Leaf {
+                der: cert.der().to_vec(),
+                fullchain_pem,
+                key_pem: kp.serialize_pem().into_bytes(),
+            }
+        };
+
+        let server = make_leaf("reload-test-server");
+        let first = make_leaf("reload-test-client-first");
+        let second = make_leaf("reload-test-client-second");
+
+        let server_certs =
+            Certs::try_new(&server.fullchain_pem, &server.key_pem, &[ca_pem.as_slice()])
+                .expect("server certs parse");
+
+        SharedCaMaterial {
+            server_certs,
+            client_a_bytes: TlsBytes::new(first.fullchain_pem, first.key_pem, vec![ca_pem.clone()]),
+            client_b_bytes: TlsBytes::new(second.fullchain_pem, second.key_pem, vec![ca_pem]),
+            client_a_leaf_der: first.der,
+            client_b_leaf_der: second.der,
+        }
+    }
+
+    /// Spawns a server that records the DER-encoded leaf certificate the
+    /// client presented on each accepted connection. Used to prove that a
+    /// post-reload reconnect actually sends the rotated client cert on
+    /// the wire rather than merely producing another valid handshake.
+    ///
+    /// The returned `latest_conn` handle lets the test close the most
+    /// recently accepted session from the server side, which is the only
+    /// way to trigger a reconnect on the client without relying on a
+    /// client-side `close()` API that `review_protocol::client::Connection`
+    /// does not expose.
+    fn spawn_server_tracking_peer_certs(certs: &Certs) -> PeerCertTrackingServer {
+        let server_endpoint = Endpoint::server(
+            create_test_server_config(certs),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        )
+        .expect("create server endpoint");
+        let server_addr = server_endpoint.local_addr().expect("read server address");
+        let peer_certs: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handshake_count = Arc::new(AtomicUsize::new(0));
+        let latest_conn: Arc<std::sync::Mutex<Option<quinn::Connection>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let peer_certs_for_task = peer_certs.clone();
+        let handshake_count_for_task = handshake_count.clone();
+        let latest_conn_for_task = latest_conn.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(conn) = server_endpoint.accept().await {
+                let peer_certs = peer_certs_for_task.clone();
+                let handshake_count = handshake_count_for_task.clone();
+                let latest_conn = latest_conn_for_task.clone();
+                tokio::spawn(async move {
+                    let Ok(connection) = conn.await else {
+                        return;
+                    };
+                    if let Some(identity) = connection.peer_identity()
+                        && let Ok(chain) =
+                            identity.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                        && let Some(leaf) = chain.first()
+                    {
+                        peer_certs
+                            .lock()
+                            .expect("peer_certs lock")
+                            .push(leaf.as_ref().to_vec());
+                    }
+                    let addr = connection.remote_address();
+                    if review_protocol::server::handshake(
+                        &connection,
+                        addr,
+                        ">=0",
+                        REQUIRED_MANAGER_VERSION,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    handshake_count.fetch_add(1, Ordering::SeqCst);
+                    *latest_conn.lock().expect("latest_conn lock") = Some(connection.clone());
+                    while connection.accept_bi().await.is_ok() {}
+                });
+            }
+        });
+        PeerCertTrackingServer {
+            addr: server_addr,
+            peer_certs,
+            handshake_count,
+            latest_conn,
+            handle,
+        }
+    }
+
+    /// End-to-end client-cert rotation contract (#314): an initial
+    /// connection presents cert A; a reload updates shared bytes to B
+    /// while the active connection stays alive; a later reconnect
+    /// (after the active session ends naturally) presents B on the wire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_presents_rotated_client_certificate_after_reload() {
+        let material = shared_ca_material();
+        let server = spawn_server_tracking_peer_certs(&material.server_certs);
+
+        let shared = SharedTlsBytes::new(material.client_a_bytes);
+        let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let client = Client::new(
+            server.addr,
+            "localhost".to_string(),
+            request_send,
+            shared.clone(),
+            Arc::new(Notify::new()),
+        );
+
+        let initial = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect returns within timeout")
+            .expect("initial connect with A succeeds");
+        assert!(initial.close_reason().is_none());
+
+        for _ in 0..50 {
+            if server.handshake_count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(server.handshake_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            server
+                .peer_certs
+                .lock()
+                .expect("peer_certs lock")
+                .first()
+                .cloned(),
+            Some(material.client_a_leaf_der.clone()),
+            "initial connection must present client cert A",
+        );
+
+        // Reload: swap shared bytes to B. The active connection must
+        // remain alive, and the swap alone must not trigger a
+        // server-side reconnect.
+        shared.replace(material.client_b_bytes);
+        assert!(
+            initial.close_reason().is_none(),
+            "swapping shared bytes must not tear down the active connection",
+        );
+
+        // Simulate the active session ending naturally (for example,
+        // the server closing after rotating its own material). The
+        // next `connect()` must rebuild using the rotated B bytes.
+        server
+            .latest_conn
+            .lock()
+            .expect("latest_conn lock")
+            .as_ref()
+            .expect("server has a live connection")
+            .close(0u32.into(), b"rotate");
+
+        // Wait for the close frame to propagate.
+        for _ in 0..50 {
+            if initial.close_reason().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            initial.close_reason().is_some(),
+            "server-initiated close must propagate to the client",
+        );
+
+        let reconnected = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("reconnect returns within timeout")
+            .expect("reconnect with B succeeds");
+        assert!(reconnected.close_reason().is_none());
+
+        for _ in 0..50 {
+            if server.handshake_count.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(server.handshake_count.load(Ordering::SeqCst), 2);
+
+        let observed = server.peer_certs.lock().expect("peer_certs lock").clone();
+        assert_eq!(observed.len(), 2, "server records both connections");
+        assert_eq!(
+            observed[0], material.client_a_leaf_der,
+            "first connection must have presented A",
+        );
+        assert_eq!(
+            observed[1], material.client_b_leaf_der,
+            "post-reload reconnect must present the rotated client cert B",
+        );
+
+        server.handle.abort();
+    }
+
+    /// Exercises the real SIGHUP reload handoff: `main.rs` notifies
+    /// `shutdown` on `tls_reload`, which drives `request_client.run()`
+    /// to exit. With the shared connection storage, dropping the
+    /// spawned task must NOT drop the underlying
+    /// `review_protocol::client::Connection`, because the outer `main`
+    /// scope (modeled here by the retained `client` handle) keeps a
+    /// clone of the shared `Arc`. The next reconnect attempt must
+    /// observe the existing session rather than reopening a new one,
+    /// which is how #314's "do not disconnect the active manager/
+    /// control connection" contract is enforced on the wire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_shutdown_preserves_active_manager_connection() {
+        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+        let (server_addr, handshake_count, server_handle) = spawn_handshake_only_server(&certs);
+
+        let shared = SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
+        let (request_send, _request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let client = Client::new(
+            server_addr,
+            "localhost".to_string(),
+            request_send,
+            shared,
+            Arc::new(Notify::new()),
+        );
+
+        let initial = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect returns within timeout")
+            .expect("initial connect succeeds");
+        assert!(initial.close_reason().is_none());
+
+        for _ in 0..50 {
+            if handshake_count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(handshake_count.load(Ordering::SeqCst), 1);
+        drop(initial);
+
+        // Drive the same shutdown pattern `main.rs` uses on
+        // `tls_reload`: spawn `run()` against a fresh shutdown notifier,
+        // then `notify_waiters()` to terminate the task.
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_for_task = shutdown.clone();
+        let mut client_for_task = client.clone();
+        let run_task = tokio::spawn(async move { client_for_task.run(shutdown_for_task).await });
+
+        // Allow the spawned task to enter its select loop.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("run exits promptly")
+            .expect("run task joins")
+            .expect("run returns Ok on shutdown");
+
+        // The outer handle still owns the shared connection state,
+        // so the session must be intact. If `run()` shutdown had
+        // dropped the connection, `close_reason()` would be `Some`.
+        let reused = tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("post-shutdown connect returns within timeout")
+            .expect("post-shutdown connect succeeds");
+        assert!(
+            reused.close_reason().is_none(),
+            "run() shutdown must not drop the active manager/control connection",
+        );
+
+        // No new handshake means the session was reused rather than
+        // re-established, which is the wire-level contract required by
+        // #314.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            handshake_count.load(Ordering::SeqCst),
+            1,
+            "shutdown must preserve the session; no second handshake should occur",
+        );
+
+        server_handle.abort();
     }
 
     // =========================================================================

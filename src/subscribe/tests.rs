@@ -387,13 +387,16 @@ fn setup_request_client(
     let (request_send, request_recv) = async_channel::bounded::<SamplingPolicy>(buffer);
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let last_time_series_path = temp_dir.path().join("time_data.json");
+    let tls_bytes = crate::client::SharedTlsBytes::new(crate::client::TlsBytes::new(
+        fs::read(CERT_PATH).unwrap(),
+        fs::read(KEY_PATH).unwrap(),
+        vec![fs::read(CA_CERT_PATH).unwrap()],
+    ));
     let request_client = crate::request::Client::new(
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
         HOST.to_string(),
         request_send,
-        fs::read(CERT_PATH).unwrap(),
-        fs::read(KEY_PATH).unwrap(),
-        vec![fs::read(CA_CERT_PATH).unwrap()],
+        tls_bytes,
         Arc::new(Notify::new()),
     );
     (

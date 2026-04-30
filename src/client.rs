@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use quinn::{ClientConfig, Endpoint, TransportConfig, crypto::rustls::QuicClientConfig};
@@ -10,6 +10,76 @@ use tokio::time::Duration;
 
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const SERVER_RETRY_INTERVAL: u64 = 3;
+
+/// Raw PEM-encoded TLS material used by the manager/control reconnect
+/// path to build a fresh `review_protocol::client::ConnectionBuilder` on
+/// every reconnect attempt.
+///
+/// The manager/control path keeps the bytes (rather than a pre-built
+/// `ConnectionBuilder`) so that a later reload can atomically swap in
+/// rotated material without tearing down the currently active connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TlsBytes {
+    pub(crate) cert: Vec<u8>,
+    pub(crate) key: Vec<u8>,
+    pub(crate) ca_certs: Vec<Vec<u8>>,
+}
+
+impl TlsBytes {
+    pub(crate) fn new(cert: Vec<u8>, key: Vec<u8>, ca_certs: Vec<Vec<u8>>) -> Self {
+        Self {
+            cert,
+            key,
+            ca_certs,
+        }
+    }
+}
+
+/// Shared, interior-mutable handle to the current manager/control TLS
+/// bytes. Readers (reconnect attempts) snapshot the bytes under a brief
+/// read lock; writers (reload) stage new bytes and swap under a write
+/// lock.
+#[derive(Clone)]
+pub(crate) struct SharedTlsBytes {
+    inner: Arc<RwLock<TlsBytes>>,
+}
+
+impl SharedTlsBytes {
+    pub(crate) fn new(bytes: TlsBytes) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(bytes)),
+        }
+    }
+
+    /// Returns a clone of the currently stored TLS bytes.
+    ///
+    /// Recovers from a poisoned lock by reading through the poison
+    /// wrapper, because the locked sections only clone or replace the
+    /// whole [`TlsBytes`] value. A poisoned lock therefore still holds
+    /// coherent bytes, and panicking here would turn a stale worker
+    /// failure into a whole-daemon outage.
+    pub(crate) fn snapshot(&self) -> TlsBytes {
+        match self.inner.read() {
+            Ok(bytes) => bytes.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Atomically replaces the shared bytes with `bytes`. Callers must
+    /// only invoke this after successfully validating `bytes`, so that
+    /// the store never holds material known to be invalid.
+    ///
+    /// Recovers from a poisoned lock in the same way as
+    /// [`Self::snapshot`]: the whole value is overwritten, so a prior
+    /// panic during a read or write cannot leave the store in a
+    /// partially updated state.
+    pub(crate) fn replace(&self, bytes: TlsBytes) {
+        match self.inner.write() {
+            Ok(mut current) => *current = bytes,
+            Err(poisoned) => *poisoned.into_inner() = bytes,
+        }
+    }
+}
 
 #[allow(clippy::struct_field_names)]
 pub(crate) struct Certs {
@@ -1242,5 +1312,38 @@ mod tests {
 
         assert_eq!(certs.certs.len(), 2, "leaf + intermediate in cert chain");
         assert_eq!(certs.ca_certs.len(), 2, "two separate CA certs loaded");
+    }
+
+    // =========================================================================
+    // SharedTlsBytes Tests
+    // =========================================================================
+
+    #[test]
+    fn shared_tls_bytes_snapshot_returns_current_bytes() {
+        let initial = TlsBytes::new(vec![1, 2, 3], vec![4, 5, 6], vec![vec![7, 8, 9]]);
+        let shared = SharedTlsBytes::new(initial.clone());
+
+        let snap = shared.snapshot();
+        assert_eq!(snap, initial);
+    }
+
+    #[test]
+    fn shared_tls_bytes_replace_updates_snapshot_for_all_clones() {
+        let original = TlsBytes::new(vec![0xA], vec![0xB], vec![vec![0xC]]);
+        let shared = SharedTlsBytes::new(original.clone());
+        let reader = shared.clone();
+
+        // Both clones observe the initial bytes.
+        assert_eq!(shared.snapshot(), original);
+        assert_eq!(reader.snapshot(), original);
+
+        // A swap on one handle is visible via the other handle too, so a
+        // reload performed by main() reaches the request client's
+        // reconnect path without further plumbing.
+        let rotated = TlsBytes::new(vec![0x1A], vec![0x1B], vec![vec![0x1C, 0x2C]]);
+        shared.replace(rotated.clone());
+
+        assert_eq!(shared.snapshot(), rotated);
+        assert_eq!(reader.snapshot(), rotated);
     }
 }
