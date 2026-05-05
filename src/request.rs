@@ -21,7 +21,7 @@ use crate::{
     info_or_print,
 };
 
-const REQUIRED_MANAGER_VERSION: &str = "0.47.0";
+const REQUIRED_MANAGER_VERSION: &str = "0.48.0";
 const MAX_RETRIES: u8 = 3;
 
 #[derive(Debug, PartialEq, Eq)]

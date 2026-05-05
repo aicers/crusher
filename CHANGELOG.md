@@ -4,7 +4,7 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-05-05
 
 ### Added
 
@@ -37,7 +37,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   used only when both point to the same IP. If the IPs differ
   and `giganto_name` is absent, a configuration error is
   returned.
-- Updated `review-protocol` dependency to rev `c284fa6`.
+- Updated `giganto-client` dependency to version 0.27.0.
+- Updated `roxy` dependency to version 0.6.0.
+- Updated `review-protocol` dependency to version 0.18.1.
+- Changed `REQUIRED_GIGANTO_VERSION` to 0.27.0.
+- Changed `REQUIRED_MANAGER_VERSION` to 0.48.0.
 
 ### Fixed
 
@@ -265,7 +269,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
-[Unreleased]: https://github.com/aicers/crusher/compare/0.7.1...main
+[0.8.0]: https://github.com/aicers/crusher/compare/0.7.1...0.8.0
 [0.7.1]: https://github.com/aicers/crusher/compare/0.7.0...0.7.1
 [0.7.0]: https://github.com/aicers/crusher/compare/0.6.4...0.7.0
 [0.6.4]: https://github.com/aicers/crusher/compare/0.6.3...0.6.4
