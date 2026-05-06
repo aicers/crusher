@@ -37,8 +37,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   used only when both point to the same IP. If the IPs differ
   and `giganto_name` is absent, a configuration error is
   returned.
-- Updated `giganto-client` dependency to version 0.27.0.
-- Updated `roxy` dependency to version 0.6.0.
 - Updated `review-protocol` dependency to version 0.18.1.
 - Changed `REQUIRED_GIGANTO_VERSION` to 0.27.0.
 - Changed `REQUIRED_MANAGER_VERSION` to 0.48.0.
