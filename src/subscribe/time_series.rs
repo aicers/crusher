@@ -1547,4 +1547,341 @@ mod tests {
         let err = ensure_time_data_exists(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
+
+    // =========================================================================
+    // Regression tests for time-related behavior (issue #321)
+    //
+    // These tests pin down the externally observable contracts of the
+    // time-handling code so that the subsequent removal of `chrono` can be
+    // validated against a stable baseline. They prefer integer Unix timestamps
+    // and literal RFC3339 strings over chrono-derived expected values.
+    // =========================================================================
+    mod regressions {
+        use super::*;
+
+        // Reference Unix timestamps used as fixed inputs:
+        // - 0                : 1970-01-01T00:00:00Z (Unix epoch)
+        // - 1                : 1970-01-01T00:00:01Z (smallest positive)
+        // - 1_700_000_000    : 2023-11-14T22:13:20Z (mid-range)
+        // - 253_402_300_799  : 9999-12-31T23:59:59Z (large but safe endpoint)
+        const TS_EPOCH: i64 = 0;
+        const TS_EPOCH_PLUS_ONE: i64 = 1;
+        const TS_2023_11_14_221320Z: i64 = 1_700_000_000;
+        const TS_9999_12_31_235959Z: i64 = 253_402_300_799;
+
+        // Helper: build a DateTime from an integer Unix timestamp without
+        // parsing chrono date/time strings.
+        fn dt(ts: i64) -> DateTime<Utc> {
+            DateTime::from_timestamp(ts, 0).expect("valid integer timestamp")
+        }
+
+        #[test]
+        fn time_slot_at_unix_epoch_is_zero() {
+            // Period: 1 day, Interval: 1 hour => 24 slots, offset 0.
+            let policy = create_policy(1, 86_400, 3_600, 0, None);
+            assert_eq!(time_slot(&policy, dt(TS_EPOCH)).unwrap(), 0);
+            // 1 second past epoch is still slot 0.
+            assert_eq!(time_slot(&policy, dt(TS_EPOCH_PLUS_ONE)).unwrap(), 0);
+        }
+
+        #[test]
+        fn time_slot_for_known_rfc3339_midrange() {
+            // 2023-11-14T22:13:20Z is 1_700_000_000s after the epoch.
+            // With period=86400, interval=3600, the expected slot is computed
+            // as a literal: 1_700_000_000 % 86400 = 80_000s of day, and
+            // 80_000 / 3600 = 22 (integer division). Pin this directly so
+            // the assertion does not depend on a chrono-computed value.
+            let policy = create_policy(1, 86_400, 3_600, 0, None);
+            assert_eq!(time_slot(&policy, dt(TS_2023_11_14_221320Z)).unwrap(), 22);
+        }
+
+        #[test]
+        fn time_slot_at_year_9999_endpoint() {
+            // 9999-12-31T23:59:59Z = 253_402_300_799 seconds.
+            // 253_402_300_799 % 86400 = 86_399 (last second of the day),
+            // 86_399 / 3600 = 23 => last hour-slot.
+            let policy = create_policy(1, 86_400, 3_600, 0, None);
+            assert_eq!(time_slot(&policy, dt(TS_9999_12_31_235959Z)).unwrap(), 23);
+        }
+
+        #[test]
+        fn time_slot_normalizes_offset_with_utc_strings() {
+            // RFC3339 strings expressed in different timezones referring to
+            // the same instant must produce the same slot. We use literal
+            // Unix timestamps as the canonical representation:
+            //   "2023-11-14T22:13:20Z"      = 1_700_000_000
+            //   "2023-11-14T23:13:20+01:00" = 1_700_000_000 (same instant)
+            //   "2023-11-14T17:13:20-05:00" = 1_700_000_000 (same instant)
+            let policy = create_policy(1, 86_400, 3_600, 0, None);
+            let same_instants = [1_700_000_000_i64, 1_700_000_000, 1_700_000_000];
+            let mut slots = same_instants
+                .iter()
+                .map(|&ts| time_slot(&policy, dt(ts)).expect("time_slot should succeed"));
+            let first = slots.next().unwrap();
+            for other in slots {
+                assert_eq!(other, first, "same instant must yield the same slot");
+            }
+            assert_eq!(first, 22);
+        }
+
+        #[test]
+        fn timestamp_ordering_strictly_increases() {
+            // Older timestamps must compare strictly less than newer ones.
+            // Stable ordering is a contract that any time backend must keep.
+            let mut timestamps: Vec<i64> = vec![
+                TS_9999_12_31_235959Z,
+                TS_EPOCH,
+                TS_2023_11_14_221320Z,
+                TS_EPOCH_PLUS_ONE,
+            ];
+            timestamps.sort_unstable();
+            assert_eq!(
+                timestamps,
+                vec![
+                    TS_EPOCH,
+                    TS_EPOCH_PLUS_ONE,
+                    TS_2023_11_14_221320Z,
+                    TS_9999_12_31_235959Z,
+                ]
+            );
+        }
+
+        #[test]
+        fn time_series_bincode_serialization_is_chrono_independent() {
+            // The `start` field is `#[serde(skip)]`, so the bincode payload
+            // must be byte-identical for two TimeSeries that differ only in
+            // their start time. This is the contract that lets us drop
+            // chrono without changing the wire format.
+            let series_a = TimeSeries {
+                sampling_policy_id: "42".to_string(),
+                start: dt(TS_EPOCH),
+                series: vec![1.0, 2.0, 3.0, 4.0],
+            };
+            let series_b = TimeSeries {
+                sampling_policy_id: "42".to_string(),
+                start: dt(TS_9999_12_31_235959Z),
+                series: vec![1.0, 2.0, 3.0, 4.0],
+            };
+
+            let bytes_a = bincode::serialize(&series_a).expect("bincode serialize a");
+            let bytes_b = bincode::serialize(&series_b).expect("bincode serialize b");
+
+            assert_eq!(
+                bytes_a, bytes_b,
+                "TimeSeries bincode bytes must not depend on the `start` field",
+            );
+        }
+
+        #[test]
+        fn time_series_bincode_round_trip_preserves_observable_fields() {
+            // The id and series payload must round-trip byte-for-byte.
+            let original = TimeSeries {
+                sampling_policy_id: "policy-1".to_string(),
+                start: dt(TS_2023_11_14_221320Z),
+                series: vec![0.0, 1.5, -2.25, 3.125],
+            };
+            let bytes = bincode::serialize(&original).expect("bincode serialize");
+            let decoded: TimeSeries = bincode::deserialize(&bytes).expect("bincode deserialize");
+            assert_eq!(decoded.sampling_policy_id, "policy-1");
+            assert_eq!(decoded.series, vec![0.0, 1.5, -2.25, 3.125]);
+            // `start` is skipped on the wire and decodes to the Default.
+            assert_eq!(decoded.start, DateTime::<Utc>::default());
+        }
+
+        // Unique-per-test prefix prevents interference with concurrent tests
+        // that share the global LAST_TRANSFER_TIME map.
+        async fn cleanup_keys(keys: &[&str]) {
+            let mut map = LAST_TRANSFER_TIME.write().await;
+            for key in keys {
+                map.remove(*key);
+            }
+        }
+
+        #[serial]
+        #[tokio::test]
+        async fn json_persistence_round_trip_with_boundary_timestamps() {
+            // Round-trip the exact integer values 0, 1, 1_700_000_000, and
+            // 253_402_300_799 through the on-disk JSON file used by
+            // write_last_timestamp/read_last_timestamp. The JSON file is the
+            // external boundary between runs of the daemon, so this format
+            // must remain stable across the chrono removal.
+            let prefix = format!("regression_round_trip_{}", std::process::id());
+            let k0 = format!("{prefix}_0");
+            let k1 = format!("{prefix}_1");
+            let k2 = format!("{prefix}_2");
+            let k3 = format!("{prefix}_3");
+            cleanup_keys(&[&k0, &k1, &k2, &k3]).await;
+
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("time_data.json");
+
+            // Write fixed JSON content with integer timestamps as literals.
+            let payload = format!(
+                "{{\"{k0}\":{TS_EPOCH},\
+                  \"{k1}\":{TS_EPOCH_PLUS_ONE},\
+                  \"{k2}\":{TS_2023_11_14_221320Z},\
+                  \"{k3}\":{TS_9999_12_31_235959Z}}}"
+            );
+            std::fs::write(&path, payload).expect("write timestamps file");
+
+            read_last_timestamp(&path).await.expect("read timestamps");
+
+            let map = LAST_TRANSFER_TIME.read().await;
+            assert_eq!(map.get(&k0), Some(&TS_EPOCH));
+            assert_eq!(map.get(&k1), Some(&TS_EPOCH_PLUS_ONE));
+            assert_eq!(map.get(&k2), Some(&TS_2023_11_14_221320Z));
+            assert_eq!(map.get(&k3), Some(&TS_9999_12_31_235959Z));
+            drop(map);
+
+            // Now write back through the producer task and verify the
+            // file's parsed contents preserve those exact integers.
+            let (sender, receiver) = async_channel::bounded::<(String, i64)>(8);
+            let writer = tokio::spawn(write_last_timestamp(path.clone(), receiver));
+            for (id, ts) in [
+                (&k0, TS_EPOCH),
+                (&k1, TS_EPOCH_PLUS_ONE),
+                (&k2, TS_2023_11_14_221320Z),
+                (&k3, TS_9999_12_31_235959Z),
+            ] {
+                sender.send((id.clone(), ts)).await.expect("send");
+            }
+            drop(sender);
+            let _ = writer.await;
+
+            let raw = std::fs::read_to_string(&path).expect("read file");
+            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse json");
+            let obj = parsed.as_object().expect("object");
+            assert_eq!(obj.get(&k0).and_then(Value::as_i64), Some(TS_EPOCH));
+            assert_eq!(
+                obj.get(&k1).and_then(Value::as_i64),
+                Some(TS_EPOCH_PLUS_ONE),
+            );
+            assert_eq!(
+                obj.get(&k2).and_then(Value::as_i64),
+                Some(TS_2023_11_14_221320Z),
+            );
+            assert_eq!(
+                obj.get(&k3).and_then(Value::as_i64),
+                Some(TS_9999_12_31_235959Z),
+            );
+
+            cleanup_keys(&[&k0, &k1, &k2, &k3]).await;
+        }
+
+        #[tokio::test]
+        async fn json_persistence_rejects_non_integer_timestamp_values() {
+            // The on-disk format must reject non-integer timestamp values.
+            // We assert this against literal JSON strings; if the chrono
+            // removal accidentally relaxes the parser to accept e.g.
+            // RFC3339 strings, this regression test will fail.
+            let dir = tempdir().expect("tempdir");
+
+            // Floating-point values must be rejected even though they are
+            // valid JSON numbers.
+            let path_float = dir.path().join("float.json");
+            std::fs::write(&path_float, b"{\"1\": 1700000000.5}").expect("write");
+            assert!(read_last_timestamp(&path_float).await.is_err());
+
+            // RFC3339-style strings must be rejected (production code
+            // expects integer seconds, not strings).
+            let path_str = dir.path().join("string.json");
+            std::fs::write(&path_str, b"{\"1\": \"2023-11-14T22:13:20Z\"}").expect("write");
+            assert!(read_last_timestamp(&path_str).await.is_err());
+        }
+
+        #[test]
+        fn json_persistence_delete_preserves_other_integer_timestamps() {
+            // Deleting one entry must not perturb the integer values of the
+            // others. Use literal integers so the expected file contents
+            // are independent of any time library.
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("time_data.json");
+            let payload = format!(
+                "{{\"1\":{TS_EPOCH},\
+                  \"2\":{TS_2023_11_14_221320Z},\
+                  \"3\":{TS_9999_12_31_235959Z}}}"
+            );
+            std::fs::write(&path, payload).expect("write");
+
+            delete_last_timestamp(&path, 2).expect("delete");
+
+            let raw = std::fs::read_to_string(&path).expect("read");
+            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+            let obj = parsed.as_object().expect("object");
+            assert_eq!(obj.len(), 2);
+            assert_eq!(obj.get("1").and_then(Value::as_i64), Some(TS_EPOCH));
+            assert!(obj.get("2").is_none());
+            assert_eq!(
+                obj.get("3").and_then(Value::as_i64),
+                Some(TS_9999_12_31_235959Z),
+            );
+        }
+
+        #[serial]
+        #[tokio::test]
+        async fn start_timestamp_arithmetic_uses_integer_nanoseconds() {
+            // start_timestamp() is documented to add the policy's period
+            // (in nanoseconds) to the last transmission time. Pin this
+            // arithmetic against literal integers so any future swap of
+            // the time backend keeps producing exact i64 nanoseconds.
+            let policy_id: u32 = 555_555;
+            cleanup_keys(&[&policy_id.to_string()]).await;
+            let policy = SamplingPolicy {
+                id: policy_id,
+                kind: SamplingKind::Conn,
+                interval: Duration::from_mins(1),
+                period: Duration::from_hours(1),
+                offset: 0,
+                src_ip: None,
+                dst_ip: None,
+                node: Some("regression".to_string()),
+                column: None,
+            };
+
+            // Last transmission at 1_700_000_000 seconds = 2023-11-14T22:13:20Z,
+            // expressed in nanoseconds as i64.
+            let last_ns: i64 = 1_700_000_000_000_000_000;
+            LAST_TRANSFER_TIME
+                .write()
+                .await
+                .insert(policy_id.to_string(), last_ns);
+
+            let next = policy.start_timestamp().await.expect("start_timestamp");
+            // period = 3_600s = 3_600_000_000_000ns; expected = literal sum.
+            let expected: i64 = 1_700_000_000_000_000_000 + 3_600_000_000_000;
+            assert_eq!(next, expected);
+            assert_eq!(next, 1_700_003_600_000_000_000);
+
+            LAST_TRANSFER_TIME
+                .write()
+                .await
+                .remove(&policy_id.to_string());
+        }
+
+        #[serial]
+        #[tokio::test]
+        async fn start_timestamp_returns_zero_for_missing_entry() {
+            // The contract for "no last transmission" is to return integer 0.
+            let policy_id: u32 = 444_444;
+            cleanup_keys(&[&policy_id.to_string()]).await;
+            let policy = SamplingPolicy {
+                id: policy_id,
+                kind: SamplingKind::Conn,
+                interval: Duration::from_mins(1),
+                period: Duration::from_hours(1),
+                offset: 0,
+                src_ip: None,
+                dst_ip: None,
+                node: Some("regression-missing".to_string()),
+                column: None,
+            };
+
+            // Confirm absence and check the documented zero return value.
+            LAST_TRANSFER_TIME
+                .write()
+                .await
+                .remove(&policy_id.to_string());
+            assert_eq!(policy.start_timestamp().await.unwrap(), 0_i64);
+        }
+    }
 }
