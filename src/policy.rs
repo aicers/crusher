@@ -404,6 +404,66 @@ mod tests {
         }
     }
 
+    /// `get_policy_with_token` returns the policy and its token together
+    /// atomically. This prevents a delete from slipping between separate
+    /// lookups of the policy and its token.
+    #[tokio::test]
+    async fn get_policy_with_token_returns_combined_view() {
+        let coordinator = CancellationCoordinator::new();
+        let (policy_tx, _policy_rx) = async_channel::bounded::<SamplingPolicy>(10);
+        let handle = spawn_policy_actor(policy_tx, &coordinator);
+
+        // Returns None for non-existent policy.
+        assert!(handle.get_policy_with_token(99).await.is_none());
+
+        handle.add_policies(vec![test_policy(1)]).await.unwrap();
+
+        let result = handle.get_policy_with_token(1).await;
+        assert!(result.is_some());
+        let (policy, token) = result.unwrap();
+        assert_eq!(policy.id, 1);
+        assert!(!token.is_cancelled());
+
+        // After deletion, returns None.
+        handle.delete_policies(vec![1]).await.unwrap();
+        assert!(handle.get_policy_with_token(1).await.is_none());
+    }
+
+    /// Cancelling the coordinator must drain both the relay task and the
+    /// actor task cleanly within the drain timeout.
+    #[tokio::test]
+    async fn coordinator_cancellation_shuts_down_relay_and_actor() {
+        let coordinator = CancellationCoordinator::new();
+        let (policy_tx, _policy_rx) = async_channel::bounded::<SamplingPolicy>(10);
+        let handle = spawn_policy_actor(policy_tx, &coordinator);
+
+        handle.add_policies(vec![test_policy(1)]).await.unwrap();
+
+        coordinator.request_cancellation("test shutdown");
+        let completed = coordinator.wait_for_drain(Duration::from_secs(5)).await;
+        assert!(completed);
+        assert_eq!(coordinator.tracker().active_count(), 0);
+    }
+
+    /// Once the actor has exited (coordinator cancelled + drained),
+    /// `add_policies` must return an error rather than hanging forever.
+    #[tokio::test]
+    async fn handle_returns_error_after_actor_exits() {
+        let coordinator = CancellationCoordinator::new();
+        let (policy_tx, _policy_rx) = async_channel::bounded::<SamplingPolicy>(10);
+        let handle = spawn_policy_actor(policy_tx, &coordinator);
+
+        coordinator.request_cancellation("shutdown");
+        let drained = coordinator.wait_for_drain(Duration::from_secs(5)).await;
+        assert!(drained, "tasks must drain within timeout");
+
+        // With the actor gone its rx has been dropped, so any new send
+        // fails with a closed-channel error.
+        let result = handle.add_policies(vec![test_policy(1)]).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "policy actor closed");
+    }
+
     /// Startup restore regression test: even when the downstream
     /// bounded channel has capacity 1 and no consumer is draining, the
     /// actor must remain responsive to other commands. A prior design
