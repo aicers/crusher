@@ -1549,39 +1549,41 @@ mod tests {
     }
 
     // =========================================================================
-    // Regression tests for time-related behavior (issue #321)
+    // Time-handling contracts (issue #321)
     //
     // These tests pin down the externally observable contracts of the
     // time-handling code so that the subsequent removal of `chrono` can be
     // validated against a stable baseline. They prefer integer Unix timestamps
-    // and literal RFC3339 strings over chrono-derived expected values.
+    // and literal expected values over chrono-derived ones.
     // =========================================================================
-    mod regressions {
+    mod time_handling_contracts {
         use super::*;
 
         // Reference Unix timestamps used as fixed inputs:
         // - 0                : 1970-01-01T00:00:00Z (Unix epoch)
         // - 1                : 1970-01-01T00:00:01Z (smallest positive)
+        // - -1               : 1969-12-31T23:59:59Z (one second before epoch)
         // - 1_700_000_000    : 2023-11-14T22:13:20Z (mid-range)
         // - 253_402_300_799  : 9999-12-31T23:59:59Z (large but safe endpoint)
         const TS_EPOCH: i64 = 0;
         const TS_EPOCH_PLUS_ONE: i64 = 1;
+        const TS_EPOCH_MINUS_ONE: i64 = -1;
         const TS_2023_11_14_221320Z: i64 = 1_700_000_000;
         const TS_9999_12_31_235959Z: i64 = 253_402_300_799;
-
-        // Helper: build a DateTime from an integer Unix timestamp without
-        // parsing chrono date/time strings.
-        fn dt(ts: i64) -> DateTime<Utc> {
-            DateTime::from_timestamp(ts, 0).expect("valid integer timestamp")
-        }
 
         #[test]
         fn time_slot_at_unix_epoch_is_zero() {
             // Period: 1 day, Interval: 1 hour => 24 slots, offset 0.
-            let policy = create_policy(1, 86_400, 3_600, 0, None);
-            assert_eq!(time_slot(&policy, dt(TS_EPOCH)).unwrap(), 0);
+            let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 0, None);
+            assert_eq!(
+                time_slot(&policy, datetime_from_timestamp(TS_EPOCH)).unwrap(),
+                0,
+            );
             // 1 second past epoch is still slot 0.
-            assert_eq!(time_slot(&policy, dt(TS_EPOCH_PLUS_ONE)).unwrap(), 0);
+            assert_eq!(
+                time_slot(&policy, datetime_from_timestamp(TS_EPOCH_PLUS_ONE)).unwrap(),
+                0,
+            );
         }
 
         #[test]
@@ -1591,8 +1593,11 @@ mod tests {
             // as a literal: 1_700_000_000 % 86400 = 80_000s of day, and
             // 80_000 / 3600 = 22 (integer division). Pin this directly so
             // the assertion does not depend on a chrono-computed value.
-            let policy = create_policy(1, 86_400, 3_600, 0, None);
-            assert_eq!(time_slot(&policy, dt(TS_2023_11_14_221320Z)).unwrap(), 22);
+            let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 0, None);
+            assert_eq!(
+                time_slot(&policy, datetime_from_timestamp(TS_2023_11_14_221320Z)).unwrap(),
+                22,
+            );
         }
 
         #[test]
@@ -1600,50 +1605,75 @@ mod tests {
             // 9999-12-31T23:59:59Z = 253_402_300_799 seconds.
             // 253_402_300_799 % 86400 = 86_399 (last second of the day),
             // 86_399 / 3600 = 23 => last hour-slot.
-            let policy = create_policy(1, 86_400, 3_600, 0, None);
-            assert_eq!(time_slot(&policy, dt(TS_9999_12_31_235959Z)).unwrap(), 23);
-        }
-
-        #[test]
-        fn time_slot_normalizes_offset_with_utc_strings() {
-            // RFC3339 strings expressed in different timezones referring to
-            // the same instant must produce the same slot. We use literal
-            // Unix timestamps as the canonical representation:
-            //   "2023-11-14T22:13:20Z"      = 1_700_000_000
-            //   "2023-11-14T23:13:20+01:00" = 1_700_000_000 (same instant)
-            //   "2023-11-14T17:13:20-05:00" = 1_700_000_000 (same instant)
-            let policy = create_policy(1, 86_400, 3_600, 0, None);
-            let same_instants = [1_700_000_000_i64, 1_700_000_000, 1_700_000_000];
-            let mut slots = same_instants
-                .iter()
-                .map(|&ts| time_slot(&policy, dt(ts)).expect("time_slot should succeed"));
-            let first = slots.next().unwrap();
-            for other in slots {
-                assert_eq!(other, first, "same instant must yield the same slot");
-            }
-            assert_eq!(first, 22);
-        }
-
-        #[test]
-        fn timestamp_ordering_strictly_increases() {
-            // Older timestamps must compare strictly less than newer ones.
-            // Stable ordering is a contract that any time backend must keep.
-            let mut timestamps: Vec<i64> = vec![
-                TS_9999_12_31_235959Z,
-                TS_EPOCH,
-                TS_2023_11_14_221320Z,
-                TS_EPOCH_PLUS_ONE,
-            ];
-            timestamps.sort_unstable();
+            let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 0, None);
             assert_eq!(
-                timestamps,
-                vec![
-                    TS_EPOCH,
-                    TS_EPOCH_PLUS_ONE,
-                    TS_2023_11_14_221320Z,
-                    TS_9999_12_31_235959Z,
-                ]
+                time_slot(&policy, datetime_from_timestamp(TS_9999_12_31_235959Z)).unwrap(),
+                23,
             );
+        }
+
+        #[test]
+        fn time_slot_negative_timestamp_aligns_to_last_hour_slot() {
+            // -1s is 1969-12-31T23:59:59Z. With period=1 day and interval=1
+            // hour, that lands in slot 23 (last hour of the day). This is
+            // the edge that integer-arithmetic ports of chrono are most
+            // likely to mis-handle (e.g. by truncating toward zero).
+            let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 0, None);
+            assert_eq!(
+                time_slot(&policy, datetime_from_timestamp(TS_EPOCH_MINUS_ONE)).unwrap(),
+                23,
+            );
+        }
+
+        #[test]
+        fn start_time_negative_timestamp_aligns_to_negative_3600() {
+            // -1s sits in the period [-3600, 0). With period=1h and offset=0
+            // start_time must align to -3600 — pin this to defend against
+            // truncation bugs across the chrono swap.
+            let policy = create_policy(1, SECS_PER_HOUR, SECS_PER_MINUTE, 0, None);
+            let aligned = start_time(&policy, datetime_from_timestamp(TS_EPOCH_MINUS_ONE))
+                .expect("start_time should succeed");
+            assert_eq!(aligned.timestamp(), -i64::try_from(SECS_PER_HOUR).unwrap());
+        }
+
+        #[serial]
+        #[tokio::test]
+        async fn fill_at_exact_period_boundary_does_not_reset() {
+            // The reset condition in `fill` uses `>` (strict), not `>=`. An
+            // event at exactly start + period must therefore land in the
+            // current series, not trigger a reset. Pin this so any rewrite
+            // preserves the inclusive lower / exclusive upper convention.
+            reset_ingest_channel().await;
+            let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+
+            let start_ts = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+            let mut series = create_test_series("1", 4, start_ts);
+            let (sender, receiver) = async_channel::bounded::<TimeSeries>(4);
+
+            // time - start = 3600, which is NOT > 3600.
+            let boundary = datetime_from_utc("2024/1/15 01:00:00");
+            series
+                .fill(&policy, boundary, &Event::Conn(create_test_conn()), &sender)
+                .await
+                .expect("fill should succeed at the exact boundary");
+
+            assert!(
+                receiver.try_recv().is_err(),
+                "no series should be sent at the exact period boundary",
+            );
+            assert_eq!(series.start.timestamp(), start_ts);
+            assert_eq!(series.series[0], 1.0);
+
+            // One second past the boundary triggers send + reset (3601 > 3600).
+            let past = datetime_from_utc("2024/1/15 01:00:01");
+            series
+                .fill(&policy, past, &Event::Conn(create_test_conn()), &sender)
+                .await
+                .expect("fill should succeed");
+            let sent = receiver
+                .try_recv()
+                .expect("series should be sent past the boundary");
+            assert_eq!(sent.series[0], 1.0);
         }
 
         #[test]
@@ -1654,12 +1684,12 @@ mod tests {
             // chrono without changing the wire format.
             let series_a = TimeSeries {
                 sampling_policy_id: "42".to_string(),
-                start: dt(TS_EPOCH),
+                start: datetime_from_timestamp(TS_EPOCH),
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
             let series_b = TimeSeries {
                 sampling_policy_id: "42".to_string(),
-                start: dt(TS_9999_12_31_235959Z),
+                start: datetime_from_timestamp(TS_9999_12_31_235959Z),
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
 
@@ -1674,18 +1704,18 @@ mod tests {
 
         #[test]
         fn time_series_bincode_round_trip_preserves_observable_fields() {
-            // The id and series payload must round-trip byte-for-byte.
+            // The id and series payload must round-trip byte-for-byte. The
+            // `start` field is skipped on the wire and is not part of the
+            // external contract.
             let original = TimeSeries {
                 sampling_policy_id: "policy-1".to_string(),
-                start: dt(TS_2023_11_14_221320Z),
+                start: datetime_from_timestamp(TS_2023_11_14_221320Z),
                 series: vec![0.0, 1.5, -2.25, 3.125],
             };
             let bytes = bincode::serialize(&original).expect("bincode serialize");
             let decoded: TimeSeries = bincode::deserialize(&bytes).expect("bincode deserialize");
             assert_eq!(decoded.sampling_policy_id, "policy-1");
             assert_eq!(decoded.series, vec![0.0, 1.5, -2.25, 3.125]);
-            // `start` is skipped on the wire and decodes to the Default.
-            assert_eq!(decoded.start, DateTime::<Utc>::default());
         }
 
         // Unique-per-test prefix prevents interference with concurrent tests
@@ -1715,7 +1745,6 @@ mod tests {
             let dir = tempdir().expect("tempdir");
             let path = dir.path().join("time_data.json");
 
-            // Write fixed JSON content with integer timestamps as literals.
             let payload = format!(
                 "{{\"{k0}\":{TS_EPOCH},\
                   \"{k1}\":{TS_EPOCH_PLUS_ONE},\
@@ -1746,7 +1775,10 @@ mod tests {
                 sender.send((id.clone(), ts)).await.expect("send");
             }
             drop(sender);
-            let _ = writer.await;
+            writer
+                .await
+                .expect("writer task joined")
+                .expect("writer ran successfully");
 
             let raw = std::fs::read_to_string(&path).expect("read file");
             let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse json");
@@ -1829,8 +1861,8 @@ mod tests {
             let policy = SamplingPolicy {
                 id: policy_id,
                 kind: SamplingKind::Conn,
-                interval: Duration::from_mins(1),
-                period: Duration::from_hours(1),
+                interval: Duration::from_secs(SECS_PER_MINUTE),
+                period: Duration::from_secs(SECS_PER_HOUR),
                 offset: 0,
                 src_ip: None,
                 dst_ip: None,
@@ -1867,8 +1899,8 @@ mod tests {
             let policy = SamplingPolicy {
                 id: policy_id,
                 kind: SamplingKind::Conn,
-                interval: Duration::from_mins(1),
-                period: Duration::from_hours(1),
+                interval: Duration::from_secs(SECS_PER_MINUTE),
+                period: Duration::from_secs(SECS_PER_HOUR),
                 offset: 0,
                 src_ip: None,
                 dst_ip: None,
