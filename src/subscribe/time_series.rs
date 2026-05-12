@@ -1630,6 +1630,22 @@ mod tests {
         }
 
         #[test]
+        fn pre_epoch_offsets_result_in_negative_unix_timestamp() {
+            let policy = create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, -2, None);
+
+            let aligned = start_time(&policy, datetime_from_timestamp(TS_EPOCH_PLUS_ONE))
+                .expect("start_time should succeed");
+
+            // Applying the -2s policy offset to timestamp +1 yields timestamp -1,
+            // i.e. 1969-12-31T23:59:59Z in offset-adjusted time.
+            //
+            // For a 1-day period, the adjusted day starts at timestamp -86_400.
+            // `start_time` then converts that boundary back to UTC by subtracting
+            // the policy offset: -86_400 - (-2) = -86_398.
+            assert_eq!(aligned.timestamp(), -86_398);
+        }
+
+        #[test]
         fn start_time_negative_timestamp_aligns_to_negative_3600() {
             // -1s sits in the period [-3600, 0). With period=1h and offset=0
             // start_time must align to -3600
@@ -1643,6 +1659,78 @@ mod tests {
             let aligned = start_time(&policy, datetime_from_timestamp(TS_EPOCH_MINUS_ONE))
                 .expect("start_time should succeed");
             assert_eq!(aligned.timestamp(), -i64::try_from(SECS_PER_HOUR).unwrap());
+        }
+
+        #[test]
+        fn midnight_rollover_kst_consistency() {
+            // `time_slot` uses `period` as the modulo window. Use a day-sized period
+            // to expose hour-of-day slots: 0..=23.
+            let slot_policy =
+                create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
+
+            // `start_time` aligns to `period` boundaries. Use an hour-sized period
+            // to pin the start of the current hour.
+            let start_policy = create_policy(
+                TEST_POLICY_ID,
+                SECS_PER_HOUR,
+                SECS_PER_HOUR,
+                NO_OFFSET,
+                None,
+            );
+
+            // Choose an instant near the UTC day boundary: 23:30:00 UTC.
+            let utc = i64::try_from(SECS_PER_DAY - SECS_PER_MINUTE * 30).unwrap();
+            let kst_offset = i64::try_from(9 * SECS_PER_HOUR).unwrap();
+
+            // Same instant expressed as naive local seconds since the Unix epoch.
+            // KST is UTC+09:00, so 23:30 UTC becomes next-day 08:30 KST.
+            let kst_repr = utc + kst_offset;
+
+            // Pin the concrete arithmetic inputs used by the assertions below.
+            assert_eq!(utc, 84_600); // 86400 - 1800
+            assert_eq!(kst_offset, 32_400);
+            assert_eq!(kst_repr, 117_000);
+
+            // UTC 23:30 belongs to hour slot 23, and its hourly start is 23:00.
+            assert_eq!(
+                time_slot(&slot_policy, datetime_from_timestamp(utc)).unwrap(),
+                23,
+            );
+            assert_eq!(
+                start_time(&start_policy, datetime_from_timestamp(utc))
+                    .expect("start_time should succeed")
+                    .timestamp(),
+                i64::try_from(23 * SECS_PER_HOUR).unwrap(),
+            );
+
+            // The naive KST representation is next-day 08:30. Integer timestamps may
+            // exceed one day here, so the hourly start is day 1 + 08:00 = 115_200.
+            assert_eq!(
+                time_slot(&slot_policy, datetime_from_timestamp(kst_repr)).unwrap(),
+                8,
+            );
+            assert_eq!(
+                start_time(&start_policy, datetime_from_timestamp(kst_repr))
+                    .expect("start_time should succeed")
+                    .timestamp(),
+                i64::try_from(SECS_PER_DAY + 8 * SECS_PER_HOUR).unwrap(),
+            );
+
+            // Converting the naive local integer back to UTC by subtracting the KST
+            // offset must recover the same UTC slot and hourly start boundary.
+            let normalized_utc = kst_repr - kst_offset;
+            assert_eq!(normalized_utc, utc);
+
+            assert_eq!(
+                time_slot(&slot_policy, datetime_from_timestamp(normalized_utc)).unwrap(),
+                time_slot(&slot_policy, datetime_from_timestamp(utc)).unwrap(),
+            );
+            assert_eq!(
+                start_time(&start_policy, datetime_from_timestamp(normalized_utc))
+                    .expect("normalized start_time should succeed"),
+                start_time(&start_policy, datetime_from_timestamp(utc))
+                    .expect("utc start_time should succeed"),
+            );
         }
 
         #[serial]
