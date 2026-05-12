@@ -242,7 +242,7 @@ pub(crate) fn spawn_policy_actor(
                     let combined = active_policies
                         .get(&id)
                         .cloned()
-                        .and_then(|p| policy_tokens.get(&id).cloned().map(|token| (p, token)));
+                        .zip(policy_tokens.get(&id).cloned());
                     let _ = reply.send(combined);
                 }
             }

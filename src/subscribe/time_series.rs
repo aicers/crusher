@@ -2110,8 +2110,11 @@ mod tests {
         #[tokio::test]
         async fn json_persistence_delete_preserves_other_integer_timestamps() {
             // Deleting one entry must not perturb the integer values of the
-            // others. Use literal integers so the expected file contents
-            // are independent of any time library.
+            // others. Drive the deletion through the writer actor so the
+            // round trip exercises the production path that rewrites the
+            // on-disk JSON file.
+            cleanup_keys(&["1", "2", "3"]).await;
+
             let dir = tempdir().expect("tempdir");
             let path = dir.path().join("time_data.json");
             ensure_time_data_exists(&path).unwrap();
@@ -2144,7 +2147,7 @@ mod tests {
                 Some(TS_9999_12_31_235959Z),
             );
 
-            LAST_TRANSFER_TIME.write().await.clear();
+            cleanup_keys(&["1", "2", "3"]).await;
         }
 
         #[serial]

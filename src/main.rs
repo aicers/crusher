@@ -169,13 +169,67 @@ pub(crate) fn register_tls_reload_signal_handler(tls_reload: Arc<Notify>) {
     }
 }
 
+/// Registers a process-level SIGINT/SIGTERM handler that requests a
+/// graceful shutdown via the dedicated notifier.
+///
+/// `notify_one()` stores a permit when there is no waiter, so a signal
+/// that lands before the main loop registers a waiter is still
+/// delivered to the next `notified()` call.
+///
+/// On Unix this listens for SIGINT and SIGTERM. On non-Unix targets
+/// only Ctrl-C (which maps to SIGINT semantics) is observed.
+pub(crate) fn register_shutdown_signal_handler(shutdown: Arc<Notify>) {
+    #[cfg(unix)]
+    {
+        let shutdown_for_int = shutdown.clone();
+        tokio::spawn(async move {
+            let mut sig =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Failed to install SIGINT handler: {e}");
+                        return;
+                    }
+                };
+            if sig.recv().await.is_some() {
+                info!("Received SIGINT; requesting graceful shutdown");
+                shutdown_for_int.notify_one();
+            }
+        });
+        tokio::spawn(async move {
+            let mut sig =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Failed to install SIGTERM handler: {e}");
+                        return;
+                    }
+                };
+            if sig.recv().await.is_some() {
+                info!("Received SIGTERM; requesting graceful shutdown");
+                shutdown.notify_one();
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                info!("Received Ctrl-C; requesting graceful shutdown");
+                shutdown.notify_one();
+            }
+        });
+    }
+}
+
 /// Distinguishes the reasons a successful `run()` returns, so the main loop
 /// can decide whether to refresh the Giganto TLS material before the next
-/// rerun.
+/// rerun, or to exit the process entirely after a SIGINT/SIGTERM.
 #[derive(Debug, PartialEq, Eq)]
 enum RerunReason {
     ConfigReload,
     TlsReload,
+    Shutdown,
 }
 
 #[tokio::main]
@@ -187,7 +241,9 @@ async fn main() -> Result<()> {
         async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
     let config_reload = Arc::new(Notify::new());
     let tls_reload = Arc::new(Notify::new());
+    let shutdown = Arc::new(Notify::new());
     register_tls_reload_signal_handler(tls_reload.clone());
+    register_shutdown_signal_handler(shutdown.clone());
     let mut request_client = request::Client::new(
         args.manager_server.rpc_srv_addr,
         args.manager_server.name.clone(),
@@ -205,11 +261,16 @@ async fn main() -> Result<()> {
             request_recv.clone(),
             config_reload.clone(),
             tls_reload.clone(),
+            shutdown.clone(),
             &mut guard,
         )
         .await;
 
         let should_reload_tls = match outcome {
+            Ok(RerunReason::Shutdown) => {
+                info!("Graceful shutdown complete; exiting");
+                return Ok(());
+            }
             Ok(RerunReason::TlsReload) => true,
             Ok(RerunReason::ConfigReload) => false,
             Err(e) => {
@@ -223,12 +284,17 @@ async fn main() -> Result<()> {
                             | ErrorKind::TimedOut
                     )
                 });
-                matches!(
-                    request_client
-                        .enter_idle_mode(health_check, tls_reload.clone())
-                        .await,
-                    IdleExitReason::TlsReload
-                )
+                match request_client
+                    .enter_idle_mode(health_check, tls_reload.clone(), shutdown.clone())
+                    .await
+                {
+                    IdleExitReason::Shutdown => {
+                        info!("Graceful shutdown complete; exiting");
+                        return Ok(());
+                    }
+                    IdleExitReason::TlsReload => true,
+                    IdleExitReason::Resumed => false,
+                }
             }
         };
 
@@ -260,6 +326,7 @@ async fn run(
     request_recv: async_channel::Receiver<SamplingPolicy>,
     config_reload: Arc<Notify>,
     tls_reload: Arc<Notify>,
+    shutdown: Arc<Notify>,
     guard: &mut Option<WorkerGuard>,
 ) -> Result<RerunReason> {
     let (settings, is_local_config) = if let Some(local_config) = args.config.as_deref() {
@@ -337,6 +404,11 @@ async fn run(
             coordinator.request_cancellation("TLS reload");
             info!("Rebuilding the shared Giganto endpoint from reloaded TLS material");
             Ok(RerunReason::TlsReload)
+        },
+        () = shutdown.notified() => {
+            coordinator.request_cancellation("shutdown signal");
+            info!("Shutdown signal received; draining tasks");
+            Ok(RerunReason::Shutdown)
         },
     };
 
@@ -606,10 +678,10 @@ last_timestamp_data = "{}"
             async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
         let config_reload = Arc::new(Notify::new());
         let tls_reload = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
         let request_client = request::Client::new(
             "127.0.0.1:38390".parse().expect("valid manager address"),
             "manager".to_string(),
-            request_send,
             manager_tls,
             config_reload.clone(),
         );
@@ -633,9 +705,11 @@ last_timestamp_data = "{}"
             &args,
             &certs,
             request_client,
+            request_send,
             request_recv,
             config_reload,
             tls_reload,
+            shutdown,
             &mut guard,
         );
         tokio::pin!(run_future);
@@ -650,6 +724,111 @@ last_timestamp_data = "{}"
             .expect("run should complete within timeout")
             .expect("run should return");
         assert_eq!(result, RerunReason::TlsReload);
+    }
+
+    /// Verifies that SIGINT is delivered as a graceful-shutdown
+    /// notification without terminating the process. The handler uses
+    /// `notify_one`, so a signal that lands before a waiter registers
+    /// still wakes the next `notified()` call.
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigint_signals_shutdown_without_exit() {
+        let shutdown = Arc::new(Notify::new());
+        register_shutdown_signal_handler(shutdown.clone());
+
+        // Give the signal stream a moment to install before raising.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // SAFETY: `libc::raise` is safe here; we target only the current
+        // process and make no assumptions about other threads.
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), shutdown.notified())
+            .await
+            .expect("shutdown notification delivered within timeout");
+    }
+
+    /// Verifies that SIGTERM is delivered as a graceful-shutdown
+    /// notification without terminating the process.
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigterm_signals_shutdown_without_exit() {
+        let shutdown = Arc::new(Notify::new());
+        register_shutdown_signal_handler(shutdown.clone());
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // SAFETY: see `sigint_signals_shutdown_without_exit`.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), shutdown.notified())
+            .await
+            .expect("shutdown notification delivered within timeout");
+    }
+
+    /// A SIGINT that lands *before* a waiter registers must still be
+    /// picked up by the next `notified()` call. This covers the
+    /// lost-wakeup window between handler installation and the main
+    /// loop's first wait.
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigint_before_waiter_is_not_lost() {
+        let shutdown = Arc::new(Notify::new());
+        register_shutdown_signal_handler(shutdown.clone());
+
+        // Allow the signal stream to register.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // SAFETY: see `sigint_signals_shutdown_without_exit`.
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+
+        // Give the handler time to call `notify_one` before any waiter
+        // registers.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Only now register a waiter. The stored permit must wake it
+        // immediately.
+        tokio::time::timeout(std::time::Duration::from_secs(2), shutdown.notified())
+            .await
+            .expect("stored permit must wake the next waiter");
+    }
+
+    /// Verifies that the `run()` select converges on a shutdown boundary
+    /// when the shutdown notifier fires, without exiting as an error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_notification_triggers_shutdown_boundary() {
+        let shutdown = Arc::new(Notify::new());
+        let tls_reload = Arc::new(Notify::new());
+        let shutdown_for_select = shutdown.clone();
+        let tls_reload_for_select = tls_reload.clone();
+
+        let runner: tokio::task::JoinHandle<&'static str> = tokio::spawn(async move {
+            tokio::select! {
+                () = tls_reload_for_select.notified() => "tls_reload",
+                () = shutdown_for_select.notified() => "shutdown",
+            }
+        });
+
+        tokio::task::yield_now().await;
+        shutdown.notify_one();
+
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(1), runner)
+            .await
+            .expect("select resolves promptly")
+            .expect("task completes");
+        assert_eq!(reason, "shutdown");
     }
 
     /// Verifies that the `run()` select converges on a rerun boundary when
