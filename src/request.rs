@@ -31,7 +31,8 @@ enum ConnectErrorDisposition {
 }
 
 /// Tells the main loop how `enter_idle_mode` returned so it can decide
-/// whether to refresh the Giganto TLS material before the next rerun.
+/// whether to refresh the Giganto TLS material before the next rerun,
+/// or to exit entirely after a SIGINT/SIGTERM was observed while idle.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IdleExitReason {
     /// The idle wait ended either because the Manager reconnected or
@@ -43,6 +44,10 @@ pub(crate) enum IdleExitReason {
     /// shared Giganto endpoint from fresh TLS material before the next
     /// remote-mode rerun.
     TlsReload,
+    /// A SIGINT/SIGTERM-style shutdown was requested while the client
+    /// was idle. The caller should terminate the main loop instead of
+    /// scheduling another remote-mode rerun.
+    Shutdown,
 }
 
 fn classify_connect_error(error: &anyhow::Error) -> ConnectErrorDisposition {
@@ -244,11 +249,14 @@ impl Client {
     ///
     /// While idle, the method also watches `tls_reload` so that a `SIGHUP`-
     /// driven TLS reload can wake the daemon and drive the next remote-mode
-    /// rerun even when the Manager path is healthy-but-quiet.
+    /// rerun even when the Manager path is healthy-but-quiet, and watches
+    /// `shutdown` so a SIGINT/SIGTERM observed during idle is reported back
+    /// to the main loop instead of being absorbed.
     pub(crate) async fn enter_idle_mode(
         &mut self,
         health_check: bool,
         tls_reload: Arc<Notify>,
+        shutdown: Arc<Notify>,
     ) -> IdleExitReason {
         info_or_print!("Entering idle mode");
         self.status = Status::Idle;
@@ -269,6 +277,7 @@ impl Client {
                 }} => IdleExitReason::Resumed,
             () = config_reload.notified() => IdleExitReason::Resumed,
             () = tls_reload.notified() => IdleExitReason::TlsReload,
+            () = shutdown.notified() => IdleExitReason::Shutdown,
         };
         self.status = Status::Ready;
         reason
@@ -279,6 +288,7 @@ impl Client {
         &mut self,
         health_check: bool,
         tls_reload: Arc<Notify>,
+        shutdown: Arc<Notify>,
         mut try_connect: F,
     ) -> IdleExitReason
     where
@@ -304,6 +314,7 @@ impl Client {
                 }} => IdleExitReason::Resumed,
             () = config_reload.notified() => IdleExitReason::Resumed,
             () = tls_reload.notified() => IdleExitReason::TlsReload,
+            () = shutdown.notified() => IdleExitReason::Shutdown,
         };
         self.status = Status::Ready;
         reason
@@ -922,6 +933,7 @@ mod tests {
         let (mut client, _, _policy_handle) = create_test_client();
         let config_reload = client.config_reload.clone();
         let tls_reload = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
 
         // Spawn a task to notify config reload after a short delay
         let notify_task = tokio::spawn(async move {
@@ -934,7 +946,7 @@ mod tests {
         // This should wait for config reload notification
         let reason = tokio::time::timeout(
             Duration::from_millis(100),
-            client.enter_idle_mode_with_try_connect(false, tls_reload, |_, _| async {
+            client.enter_idle_mode_with_try_connect(false, tls_reload, shutdown, |_, _| async {
                 Err(anyhow::anyhow!("forced failure"))
             }),
         )
@@ -952,6 +964,7 @@ mod tests {
     async fn idle_mode_exits_on_tls_reload() {
         let (mut client, _, _) = create_test_client();
         let tls_reload = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
 
         let notifier = tls_reload.clone();
         let notify_task = tokio::spawn(async move {
@@ -961,7 +974,7 @@ mod tests {
 
         let reason = tokio::time::timeout(
             Duration::from_millis(100),
-            client.enter_idle_mode_with_try_connect(false, tls_reload, |_, _| async {
+            client.enter_idle_mode_with_try_connect(false, tls_reload, shutdown, |_, _| async {
                 Err(anyhow::anyhow!("forced failure"))
             }),
         )
@@ -974,11 +987,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn idle_mode_exits_on_shutdown() {
+        let (mut client, _, _) = create_test_client();
+        let tls_reload = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
+
+        let notifier = shutdown.clone();
+        let notify_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            notifier.notify_one();
+        });
+
+        let reason = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.enter_idle_mode_with_try_connect(false, tls_reload, shutdown, |_, _| async {
+                Err(anyhow::anyhow!("forced failure"))
+            }),
+        )
+        .await
+        .expect("No Timeout");
+        assert_eq!(reason, IdleExitReason::Shutdown);
+        assert!(matches!(client.status, Status::Ready));
+
+        notify_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn idle_mode_health_check_returns_immediately() {
         // Test: health_check=true returns without waiting for config_reload
         let (mut client, _rx, _policy_handle) = create_test_client();
         let config_reload = client.config_reload.clone();
         let tls_reload = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
         let called = Arc::new(AtomicUsize::new(0));
         let called_ref = called.clone();
 
@@ -988,7 +1028,7 @@ mod tests {
 
         let reason = tokio::time::timeout(
             Duration::from_millis(100),
-            client.enter_idle_mode_with_try_connect(true, tls_reload, move |_, _| {
+            client.enter_idle_mode_with_try_connect(true, tls_reload, shutdown, move |_, _| {
                 let called_ref = called_ref.clone();
                 async move {
                     called_ref.fetch_add(1, Ordering::SeqCst);
@@ -1036,6 +1076,7 @@ mod tests {
         let (mut client, _rx, _policy_handle) = create_test_client();
         let config_reload = client.config_reload.clone();
         let tls_reload = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
 
         assert!(matches!(client.status, Status::Ready));
 
@@ -1044,9 +1085,12 @@ mod tests {
 
         let reason = tokio::time::timeout(
             Duration::from_millis(100),
-            client.enter_idle_mode_with_try_connect(false, tls_reload, |_client, _| async {
-                Err(anyhow::anyhow!("forced failure"))
-            }),
+            client.enter_idle_mode_with_try_connect(
+                false,
+                tls_reload,
+                shutdown,
+                |_client, _| async { Err(anyhow::anyhow!("forced failure")) },
+            ),
         )
         .await
         .expect("No Timeout");
