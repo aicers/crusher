@@ -181,33 +181,33 @@ pub(crate) fn register_tls_reload_signal_handler(tls_reload: Arc<Notify>) {
 pub(crate) fn register_shutdown_signal_handler(shutdown: Arc<Notify>) {
     #[cfg(unix)]
     {
-        let shutdown_for_int = shutdown.clone();
         tokio::spawn(async move {
-            let mut sig =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("Failed to install SIGINT handler: {e}");
-                        return;
-                    }
-                };
-            if sig.recv().await.is_some() {
-                info!("Received SIGINT; requesting graceful shutdown");
-                shutdown_for_int.notify_one();
-            }
-        });
-        tokio::spawn(async move {
-            let mut sig =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("Failed to install SIGTERM handler: {e}");
-                        return;
-                    }
-                };
-            if sig.recv().await.is_some() {
-                info!("Received SIGTERM; requesting graceful shutdown");
-                shutdown.notify_one();
+            use tokio::signal::unix::{SignalKind, signal};
+
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    warn!("Failed to install SIGINT handler: {e}");
+                    return;
+                }
+            };
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    warn!("Failed to install SIGTERM handler: {e}");
+                    return;
+                }
+            };
+
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("Received SIGINT; requesting graceful shutdown");
+                    shutdown.notify_one();
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM; requesting graceful shutdown");
+                    shutdown.notify_one();
+                }
             }
         });
     }
@@ -226,7 +226,7 @@ pub(crate) fn register_shutdown_signal_handler(shutdown: Arc<Notify>) {
 /// can decide whether to refresh the Giganto TLS material before the next
 /// rerun, or to exit the process entirely after a SIGINT/SIGTERM.
 #[derive(Debug, PartialEq, Eq)]
-enum RerunReason {
+enum RunExitReason {
     ConfigReload,
     TlsReload,
     Shutdown,
@@ -267,12 +267,12 @@ async fn main() -> Result<()> {
         .await;
 
         let should_reload_tls = match outcome {
-            Ok(RerunReason::Shutdown) => {
+            Ok(RunExitReason::Shutdown) => {
                 info!("Graceful shutdown complete; exiting");
                 return Ok(());
             }
-            Ok(RerunReason::TlsReload) => true,
-            Ok(RerunReason::ConfigReload) => false,
+            Ok(RunExitReason::TlsReload) => true,
+            Ok(RunExitReason::ConfigReload) => false,
             Err(e) => {
                 assert!(args.is_remote_mode(), "{e}");
                 error_or_eprint!("Main processing encountered an error: {e}");
@@ -328,7 +328,7 @@ async fn run(
     tls_reload: Arc<Notify>,
     shutdown: Arc<Notify>,
     guard: &mut Option<WorkerGuard>,
-) -> Result<RerunReason> {
+) -> Result<RunExitReason> {
     let (settings, is_local_config) = if let Some(local_config) = args.config.as_deref() {
         (Settings::from_file(local_config)?, true)
     } else {
@@ -377,7 +377,7 @@ async fn run(
     let mut request_handle =
         tokio::spawn(async move { request_client.run(request_coordinator).await });
 
-    let result: Result<RerunReason> = tokio::select! {
+    let result: Result<RunExitReason> = tokio::select! {
         biased;
         res = &mut subscribe_handle => {
             coordinator.request_cancellation("subscribe exit");
@@ -398,17 +398,17 @@ async fn run(
         () = config_reload.notified(), if args.is_remote_mode() => {
             coordinator.request_cancellation("config reload");
             info!("Reloading the configuration");
-            Ok(RerunReason::ConfigReload)
+            Ok(RunExitReason::ConfigReload)
         },
         () = tls_reload.notified() => {
             coordinator.request_cancellation("TLS reload");
             info!("Rebuilding the shared Giganto endpoint from reloaded TLS material");
-            Ok(RerunReason::TlsReload)
+            Ok(RunExitReason::TlsReload)
         },
         () = shutdown.notified() => {
             coordinator.request_cancellation("shutdown signal");
             info!("Shutdown signal received; draining tasks");
-            Ok(RerunReason::Shutdown)
+            Ok(RunExitReason::Shutdown)
         },
     };
 
