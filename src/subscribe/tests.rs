@@ -1703,7 +1703,7 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
 
     // Drive the main-loop rerun boundary: shutdown the existing shared
     // endpoint, reload TLS material from disk, and rebuild the shared
-    // subscribe::Client. This mirrors the `RerunReason::TlsReload` branch
+    // subscribe::Client. This mirrors the `RunExitReason::TlsReload` branch
     // in `main::main`.
     coordinator_1.request_cancellation("TLS reload rerun");
     let _ = client_handle_1.await;
