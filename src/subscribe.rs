@@ -26,7 +26,7 @@ use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
 use review_protocol::types::{SamplingKind, SamplingPolicy};
 use time_series::{
-    SamplingPolicyExt, TimeSeries, Timestamp, delete_last_timestamp, write_last_timestamp,
+    SECOND_TO_NANO, SamplingPolicyExt, TimeSeries, delete_last_timestamp, write_last_timestamp,
 };
 use tokio::{
     sync::{Mutex, Notify, RwLock},
@@ -501,7 +501,7 @@ async fn receiver(
             }
             if let Ok((raw_event, timestamp)) = receive_time_series_generator_data(&mut recv).await
             {
-                let time = Timestamp::from_timestamp_nanos(timestamp);
+                let time = timestamp.div_euclid(SECOND_TO_NANO);
                 let Ok(event) = Event::try_new(policy.kind, &raw_event) else {
                     warn!(
                         "Failed to deserialize raw_event for sampling kind: {:?}",
@@ -552,7 +552,7 @@ async fn send_time_series(
     send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
 
     let serde_series = bincode::serialize(&series)?;
-    let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
+    let timesatmp = series.start.checked_mul(SECOND_TO_NANO).unwrap_or(i64::MAX);
     send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
 
     // Receive start time of giganto last saved time series.
@@ -566,7 +566,7 @@ async fn send_time_series(
     // Data transmission after the first time (only series data)
     while let Ok(series) = recv_channel.recv().await {
         let serde_series = bincode::serialize(&series)?;
-        let timesatmp = series.start.timestamp_nanos_opt().unwrap_or(i64::MAX);
+        let timesatmp = series.start.checked_mul(SECOND_TO_NANO).unwrap_or(i64::MAX);
         send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
     }
     Ok(())

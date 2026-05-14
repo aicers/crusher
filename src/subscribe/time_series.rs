@@ -17,43 +17,12 @@ use tracing::info;
 
 use super::{Event, INGEST_CHANNEL};
 
-const SECOND_TO_NANO: i64 = 1_000_000_000;
+pub(super) const SECOND_TO_NANO: i64 = 1_000_000_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 
 // A hashmap for last series timestamp
 static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
-
-#[cfg_attr(test, derive(serde::Deserialize))]
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct Timestamp {
-    seconds: i64,
-    nanos: u32,
-}
-
-impl Timestamp {
-    pub(super) fn from_timestamp_nanos(nanos: i64) -> Self {
-        let seconds = nanos.div_euclid(SECOND_TO_NANO);
-        let Ok(nanos) = u32::try_from(nanos.rem_euclid(SECOND_TO_NANO)) else {
-            unreachable!("nanosecond remainder must fit in u32");
-        };
-        Self { seconds, nanos }
-    }
-
-    pub(super) fn from_timestamp(seconds: i64) -> Self {
-        Self { seconds, nanos: 0 }
-    }
-
-    pub(super) fn timestamp(self) -> i64 {
-        self.seconds
-    }
-
-    pub(super) fn timestamp_nanos_opt(self) -> Option<i64> {
-        self.seconds
-            .checked_mul(SECOND_TO_NANO)?
-            .checked_add(i64::from(self.nanos))
-    }
-}
 
 #[async_trait]
 pub(super) trait SamplingPolicyExt {
@@ -82,7 +51,7 @@ impl SamplingPolicyExt for SamplingPolicy {
 pub(super) struct TimeSeries {
     pub(super) sampling_policy_id: String,
     #[serde(skip)]
-    pub(super) start: Timestamp,
+    pub(super) start: i64,
     pub(super) series: Vec<f64>,
 }
 
@@ -115,7 +84,7 @@ impl TimeSeries {
             bail!("period must be a multiple of interval");
         }
 
-        let start = Timestamp::from_timestamp_nanos(policy.start_timestamp().await?);
+        let start = policy.start_timestamp().await?.div_euclid(SECOND_TO_NANO);
         let len = usize::try_from(period_secs / interval_secs)?;
         let series = vec![0_f64; len];
         Ok(TimeSeries {
@@ -128,12 +97,12 @@ impl TimeSeries {
     pub(super) async fn fill(
         &mut self,
         policy: &SamplingPolicy,
-        time: Timestamp,
+        time: i64,
         event: &Event,
         send_channel: &Sender<TimeSeries>,
     ) -> Result<()> {
         let period = i64::try_from(policy.period.as_secs())?;
-        let Some(elapsed) = time.timestamp().checked_sub(self.start.timestamp()) else {
+        let Some(elapsed) = time.checked_sub(self.start) else {
             bail!("failed to calculate elapsed time");
         };
 
@@ -157,8 +126,8 @@ impl TimeSeries {
     }
 }
 
-fn time_slot(policy: &SamplingPolicy, time: Timestamp) -> Result<usize> {
-    let Some(offset_time) = time.timestamp().checked_add(i64::from(policy.offset)) else {
+fn time_slot(policy: &SamplingPolicy, time: i64) -> Result<usize> {
+    let Some(offset_time) = time.checked_add(i64::from(policy.offset)) else {
         bail!("failed to apply policy offset to timestamp");
     };
     let seconds_of_day = offset_time.rem_euclid(SECONDS_PER_DAY);
@@ -175,9 +144,9 @@ fn event_value(sum_column: Option<u32>, event: &Event) -> f64 {
     event.column_value(column)
 }
 
-fn start_time(policy: &SamplingPolicy, time: Timestamp) -> Result<Timestamp> {
+fn start_time(policy: &SamplingPolicy, time: i64) -> Result<i64> {
     let offset = i64::from(policy.offset);
-    let Some(offset_time) = time.timestamp().checked_add(offset) else {
+    let Some(offset_time) = time.checked_add(offset) else {
         bail!("failed to apply policy offset to timestamp");
     };
 
@@ -193,7 +162,7 @@ fn start_time(policy: &SamplingPolicy, time: Timestamp) -> Result<Timestamp> {
         bail!("failed to convert period start timestamp to UTC");
     };
 
-    Ok(Timestamp::from_timestamp(start_time))
+    Ok(start_time)
 }
 
 pub(super) async fn write_last_timestamp(
@@ -326,19 +295,13 @@ mod tests {
         create_policy(id, period_secs, interval_secs, offset, column)
     }
 
-    /// Helper to create a `Timestamp` from unix timestamp seconds
-    fn datetime_from_timestamp(timestamp: i64) -> Timestamp {
-        Timestamp::from_timestamp(timestamp)
-    }
-
-    /// Helper to create a `Timestamp` from a specific UTC date/time string
-    fn datetime_from_utc(input: &str) -> Timestamp {
+    /// Helper to create a Unix timestamp (seconds) from a specific UTC
+    /// date/time string
+    fn datetime_from_utc(input: &str) -> i64 {
         let naive = NaiveDateTime::parse_from_str(input, "%Y/%m/%d %H:%M:%S")
             .or_else(|_| NaiveDateTime::parse_from_str(input, "%Y/%-m/%-d %H:%M:%S"))
             .expect("valid datetime");
-        Timestamp::from_timestamp(
-            DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp(),
-        )
+        DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp()
     }
 
     // =========================================================================
@@ -535,7 +498,7 @@ mod tests {
         // For KST 00:30 (UTC 15:30), start is KST midnight (UTC 15:00)
         let kst_0030_utc = datetime_from_utc("2024/1/14 15:30:00");
         let start = start_time(&policy, kst_0030_utc).unwrap();
-        assert_eq!(start.timestamp(), kst_midnight_utc.timestamp());
+        assert_eq!(start, kst_midnight_utc);
     }
 
     // =========================================================================
@@ -941,7 +904,7 @@ mod tests {
     fn create_test_series(policy_id: &str, num_slots: usize, start_timestamp: i64) -> TimeSeries {
         TimeSeries {
             sampling_policy_id: policy_id.to_string(),
-            start: datetime_from_timestamp(start_timestamp),
+            start: start_timestamp,
             series: vec![0_f64; num_slots],
         }
     }
@@ -963,7 +926,7 @@ mod tests {
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
         // Create a time series starting at midnight
-        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -991,7 +954,7 @@ mod tests {
         // column: None => count events
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1022,7 +985,7 @@ mod tests {
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1070,7 +1033,7 @@ mod tests {
         // column: Some(5) => sum duration values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(5));
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1108,7 +1071,7 @@ mod tests {
         // column: Some(7) => sum orig_bytes values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(7));
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1150,7 +1113,7 @@ mod tests {
         // column: Some(9) => sum orig_pkts values
         let policy = create_policy(1, SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 0, Some(9));
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         let mut series = create_test_series("1", 2, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1205,7 +1168,7 @@ mod tests {
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1247,7 +1210,7 @@ mod tests {
         // Period: 1 day, Interval: 15 min => 96 slots
         // Offset: +9 hours (KST)
         let policy = create_policy(1, SECS_PER_DAY, 15 * SECS_PER_MINUTE, 32_400, None);
-        let midnight = datetime_from_utc("2022/11/17 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2022/11/17 00:00:00");
         let mut series = create_test_series("1", 96, midnight);
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(1);
 
@@ -1280,7 +1243,7 @@ mod tests {
         // Offset: +9 hours (32400s) - KST adjustment
         let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
 
-        let kst_midnight_utc = datetime_from_utc("2024/1/14 15:00:00").timestamp();
+        let kst_midnight_utc = datetime_from_utc("2024/1/14 15:00:00");
         let mut series = create_test_series("1", 24, kst_midnight_utc);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1310,7 +1273,7 @@ mod tests {
         // Period: 1 hour, Interval: 10 min => 6 slots
         let policy = create_policy(1, SECS_PER_HOUR, 10 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         let mut series = create_test_series("1", 6, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1346,7 +1309,7 @@ mod tests {
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+        let midnight = datetime_from_utc("2024/1/15 00:00:00");
         let mut series = create_test_series("1", 4, midnight);
 
         let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
@@ -1611,15 +1574,9 @@ mod tests {
             // Period: 1 day, Interval: 1 hour => 24 slots, offset 0.
             let policy =
                 create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
-            assert_eq!(
-                time_slot(&policy, datetime_from_timestamp(TS_EPOCH)).unwrap(),
-                0,
-            );
+            assert_eq!(time_slot(&policy, TS_EPOCH).unwrap(), 0,);
             // 1 second past epoch is still slot 0.
-            assert_eq!(
-                time_slot(&policy, datetime_from_timestamp(TS_EPOCH_PLUS_ONE)).unwrap(),
-                0,
-            );
+            assert_eq!(time_slot(&policy, TS_EPOCH_PLUS_ONE).unwrap(), 0,);
         }
 
         #[test]
@@ -1630,10 +1587,7 @@ mod tests {
             // 80_000 / 3600 = 22 (integer division).
             let policy =
                 create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
-            assert_eq!(
-                time_slot(&policy, datetime_from_timestamp(TS_2023_11_14_221320Z)).unwrap(),
-                22,
-            );
+            assert_eq!(time_slot(&policy, TS_2023_11_14_221320Z).unwrap(), 22,);
         }
 
         #[test]
@@ -1643,10 +1597,7 @@ mod tests {
             // 86_399 / 3600 = 23 => last hour-slot.
             let policy =
                 create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
-            assert_eq!(
-                time_slot(&policy, datetime_from_timestamp(TS_9999_12_31_235959Z)).unwrap(),
-                23,
-            );
+            assert_eq!(time_slot(&policy, TS_9999_12_31_235959Z).unwrap(), 23,);
         }
 
         #[test]
@@ -1655,18 +1606,15 @@ mod tests {
             // that lands in slot 23 (last hour of the day).
             let policy =
                 create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
-            assert_eq!(
-                time_slot(&policy, datetime_from_timestamp(TS_EPOCH_MINUS_ONE)).unwrap(),
-                23,
-            );
+            assert_eq!(time_slot(&policy, TS_EPOCH_MINUS_ONE).unwrap(), 23,);
         }
 
         #[test]
         fn pre_epoch_offsets_result_in_negative_unix_timestamp() {
             let policy = create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, -2, None);
 
-            let aligned = start_time(&policy, datetime_from_timestamp(TS_EPOCH_PLUS_ONE))
-                .expect("start_time should succeed");
+            let aligned =
+                start_time(&policy, TS_EPOCH_PLUS_ONE).expect("start_time should succeed");
 
             // Applying the -2s policy offset to timestamp +1 yields timestamp -1,
             // i.e. 1969-12-31T23:59:59Z in offset-adjusted time.
@@ -1674,7 +1622,7 @@ mod tests {
             // For a 1-day period, the adjusted day starts at timestamp -86_400.
             // `start_time` then converts that boundary back to UTC by subtracting
             // the policy offset: -86_400 - (-2) = -86_398.
-            assert_eq!(aligned.timestamp(), -86_398);
+            assert_eq!(aligned, -86_398);
         }
 
         #[test]
@@ -1688,9 +1636,9 @@ mod tests {
                 NO_OFFSET,
                 None,
             );
-            let aligned = start_time(&policy, datetime_from_timestamp(TS_EPOCH_MINUS_ONE))
-                .expect("start_time should succeed");
-            assert_eq!(aligned.timestamp(), -i64::try_from(SECS_PER_HOUR).unwrap());
+            let aligned =
+                start_time(&policy, TS_EPOCH_MINUS_ONE).expect("start_time should succeed");
+            assert_eq!(aligned, -i64::try_from(SECS_PER_HOUR).unwrap());
         }
 
         #[test]
@@ -1724,27 +1672,17 @@ mod tests {
             assert_eq!(kst_repr, 117_000);
 
             // UTC 23:30 belongs to hour slot 23, and its hourly start is 23:00.
+            assert_eq!(time_slot(&slot_policy, utc).unwrap(), 23,);
             assert_eq!(
-                time_slot(&slot_policy, datetime_from_timestamp(utc)).unwrap(),
-                23,
-            );
-            assert_eq!(
-                start_time(&start_policy, datetime_from_timestamp(utc))
-                    .expect("start_time should succeed")
-                    .timestamp(),
+                start_time(&start_policy, utc).expect("start_time should succeed"),
                 i64::try_from(23 * SECS_PER_HOUR).unwrap(),
             );
 
             // The naive KST representation is next-day 08:30. Integer timestamps may
             // exceed one day here, so the hourly start is day 1 + 08:00 = 115_200.
+            assert_eq!(time_slot(&slot_policy, kst_repr).unwrap(), 8,);
             assert_eq!(
-                time_slot(&slot_policy, datetime_from_timestamp(kst_repr)).unwrap(),
-                8,
-            );
-            assert_eq!(
-                start_time(&start_policy, datetime_from_timestamp(kst_repr))
-                    .expect("start_time should succeed")
-                    .timestamp(),
+                start_time(&start_policy, kst_repr).expect("start_time should succeed"),
                 i64::try_from(SECS_PER_DAY + 8 * SECS_PER_HOUR).unwrap(),
             );
 
@@ -1754,14 +1692,13 @@ mod tests {
             assert_eq!(normalized_utc, utc);
 
             assert_eq!(
-                time_slot(&slot_policy, datetime_from_timestamp(normalized_utc)).unwrap(),
-                time_slot(&slot_policy, datetime_from_timestamp(utc)).unwrap(),
+                time_slot(&slot_policy, normalized_utc).unwrap(),
+                time_slot(&slot_policy, utc).unwrap(),
             );
             assert_eq!(
-                start_time(&start_policy, datetime_from_timestamp(normalized_utc))
+                start_time(&start_policy, normalized_utc)
                     .expect("normalized start_time should succeed"),
-                start_time(&start_policy, datetime_from_timestamp(utc))
-                    .expect("utc start_time should succeed"),
+                start_time(&start_policy, utc).expect("utc start_time should succeed"),
             );
         }
 
@@ -1781,7 +1718,7 @@ mod tests {
                 None,
             );
 
-            let start_ts = datetime_from_utc("2024/1/15 00:00:00").timestamp();
+            let start_ts = datetime_from_utc("2024/1/15 00:00:00");
             let mut series = create_test_series(TEST_POLICY_ID.to_string().as_ref(), 4, start_ts);
             let (sender, receiver) = async_channel::bounded::<TimeSeries>(4);
 
@@ -1796,7 +1733,7 @@ mod tests {
                 receiver.try_recv().is_err(),
                 "no series should be sent at the exact period boundary",
             );
-            assert_eq!(series.start.timestamp(), start_ts);
+            assert_eq!(series.start, start_ts);
             assert_eq!(series.series[0], 1.0);
 
             // One second past the boundary triggers send + reset (3601 > 3600).
@@ -1818,12 +1755,12 @@ mod tests {
             // their start time.
             let series_a = TimeSeries {
                 sampling_policy_id: "42".to_string(),
-                start: datetime_from_timestamp(TS_EPOCH),
+                start: TS_EPOCH,
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
             let series_b = TimeSeries {
                 sampling_policy_id: "42".to_string(),
-                start: datetime_from_timestamp(TS_9999_12_31_235959Z),
+                start: TS_9999_12_31_235959Z,
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
 
@@ -1843,14 +1780,14 @@ mod tests {
             // external contract.
             let original = TimeSeries {
                 sampling_policy_id: "policy-1".to_string(),
-                start: datetime_from_timestamp(TS_2023_11_14_221320Z),
+                start: TS_2023_11_14_221320Z,
                 series: vec![0.0, 1.5, -2.25, 3.125],
             };
             let bytes = bincode::serialize(&original).expect("bincode serialize");
             let decoded: TimeSeries = bincode::deserialize(&bytes).expect("bincode deserialize");
             assert_eq!(decoded.sampling_policy_id, "policy-1");
             assert_eq!(decoded.series, vec![0.0, 1.5, -2.25, 3.125]);
-            assert_eq!(decoded.start, datetime_from_timestamp(i64::default()));
+            assert_eq!(decoded.start, i64::default());
         }
 
         // Unique-per-test prefix prevents interference with concurrent tests

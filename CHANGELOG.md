@@ -19,6 +19,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Removed `chrono` from production code in the application crate. Time handling
   now uses an internal timestamp type, while `chrono` remains available for
   tests only.
+- Removed `chrono` from production code in the application crate. Time series
+  timestamps are now handled as plain `i64` values, while `chrono` remains
+  available for tests only.
 
 ## [0.8.0] - 2026-05-05
 
