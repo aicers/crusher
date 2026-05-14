@@ -2110,9 +2110,8 @@ mod tests {
         #[tokio::test]
         async fn json_persistence_delete_preserves_other_integer_timestamps() {
             // Deleting one entry must not perturb the integer values of the
-            // others. Drive the deletion through the writer actor so the
-            // round trip exercises the production path that rewrites the
-            // on-disk JSON file.
+            // others. Use literal integers so the expected file contents
+            // are independent of any time library.
             cleanup_keys(&["1", "2", "3"]).await;
 
             let dir = tempdir().expect("tempdir");
