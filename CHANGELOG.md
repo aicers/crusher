@@ -24,7 +24,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Refactored async policy/stream/timestamp handling to improve
   cancellation safety and avoid partial state loss during shutdown.
-- Updated `review-protocol` dependency to rev `c284fa6`.
 
 ### Changed
 
