@@ -16,6 +16,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Align the default stdout and file logging levels to INFO when
   `RUST_LOG` is not set.
+- Removed `chrono` from production code in the application crate. Time handling
+  now uses an internal timestamp type, while `chrono` remains available for
+  tests only.
 
 ## [0.8.0] - 2026-05-05
 

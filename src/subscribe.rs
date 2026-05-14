@@ -8,7 +8,6 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Result, bail};
 use async_channel::{Receiver, Sender};
-use chrono::{TimeZone, Utc};
 use giganto_client::{
     RawEventKind,
     connection::client_handshake,
@@ -26,7 +25,9 @@ use giganto_client::{
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
 use review_protocol::types::{SamplingKind, SamplingPolicy};
-use time_series::{SamplingPolicyExt, TimeSeries, delete_last_timestamp, write_last_timestamp};
+use time_series::{
+    SamplingPolicyExt, TimeSeries, Timestamp, delete_last_timestamp, write_last_timestamp,
+};
 use tokio::{
     sync::{Mutex, Notify, RwLock},
     task,
@@ -500,7 +501,7 @@ async fn receiver(
             }
             if let Ok((raw_event, timestamp)) = receive_time_series_generator_data(&mut recv).await
             {
-                let time = Utc.timestamp_nanos(timestamp);
+                let time = Timestamp::from_timestamp_nanos(timestamp);
                 let Ok(event) = Event::try_new(policy.kind, &raw_event) else {
                     warn!(
                         "Failed to deserialize raw_event for sampling kind: {:?}",
@@ -588,8 +589,7 @@ async fn receive_time_series_timestamp(
             Ok(timestamp) => {
                 debug!(
                     "The time of the timeseries last sent by {}. : {}",
-                    sampling_policy_id,
-                    Utc.timestamp_nanos(timestamp)
+                    sampling_policy_id, timestamp
                 );
                 time_sender
                     .send((sampling_policy_id.clone(), timestamp))

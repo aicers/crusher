@@ -9,7 +9,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Timelike, Utc};
 use review_protocol::types::SamplingPolicy;
 use serde::Serialize;
 use serde_json::Value;
@@ -19,10 +18,42 @@ use tracing::info;
 use super::{Event, INGEST_CHANNEL};
 
 const SECOND_TO_NANO: i64 = 1_000_000_000;
+const SECONDS_PER_DAY: i64 = 86_400;
 
 // A hashmap for last series timestamp
 static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[cfg_attr(test, derive(serde::Deserialize))]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(super) struct Timestamp {
+    seconds: i64,
+    nanos: u32,
+}
+
+impl Timestamp {
+    pub(super) fn from_timestamp_nanos(nanos: i64) -> Self {
+        let seconds = nanos.div_euclid(SECOND_TO_NANO);
+        let Ok(nanos) = u32::try_from(nanos.rem_euclid(SECOND_TO_NANO)) else {
+            unreachable!("nanosecond remainder must fit in u32");
+        };
+        Self { seconds, nanos }
+    }
+
+    pub(super) fn from_timestamp(seconds: i64) -> Self {
+        Self { seconds, nanos: 0 }
+    }
+
+    pub(super) fn timestamp(self) -> i64 {
+        self.seconds
+    }
+
+    pub(super) fn timestamp_nanos_opt(self) -> Option<i64> {
+        self.seconds
+            .checked_mul(SECOND_TO_NANO)?
+            .checked_add(i64::from(self.nanos))
+    }
+}
 
 #[async_trait]
 pub(super) trait SamplingPolicyExt {
@@ -51,7 +82,7 @@ impl SamplingPolicyExt for SamplingPolicy {
 pub(super) struct TimeSeries {
     pub(super) sampling_policy_id: String,
     #[serde(skip)]
-    pub(super) start: DateTime<Utc>,
+    pub(super) start: Timestamp,
     pub(super) series: Vec<f64>,
 }
 
@@ -84,7 +115,7 @@ impl TimeSeries {
             bail!("period must be a multiple of interval");
         }
 
-        let start = Utc.timestamp_nanos(policy.start_timestamp().await?);
+        let start = Timestamp::from_timestamp_nanos(policy.start_timestamp().await?);
         let len = usize::try_from(period_secs / interval_secs)?;
         let series = vec![0_f64; len];
         Ok(TimeSeries {
@@ -97,13 +128,16 @@ impl TimeSeries {
     pub(super) async fn fill(
         &mut self,
         policy: &SamplingPolicy,
-        time: DateTime<Utc>,
+        time: Timestamp,
         event: &Event,
         send_channel: &Sender<TimeSeries>,
     ) -> Result<()> {
         let period = i64::try_from(policy.period.as_secs())?;
+        let Some(elapsed) = time.timestamp().checked_sub(self.start.timestamp()) else {
+            bail!("failed to calculate elapsed time");
+        };
 
-        if time.timestamp() - self.start.timestamp() > period {
+        if elapsed > period {
             if let Some(sender) = INGEST_CHANNEL.read().await.get(&self.sampling_policy_id) {
                 sender.send(self.clone()).await?;
             } else {
@@ -123,17 +157,14 @@ impl TimeSeries {
     }
 }
 
-fn time_slot(policy: &SamplingPolicy, time: DateTime<Utc>) -> Result<usize> {
-    let offset_time = time.timestamp() + i64::from(policy.offset);
-    let Some(offset_time) = DateTime::from_timestamp(offset_time, 0) else {
-        bail!("failed to create DateTime<Utc> from timestamp");
+fn time_slot(policy: &SamplingPolicy, time: Timestamp) -> Result<usize> {
+    let Some(offset_time) = time.timestamp().checked_add(i64::from(policy.offset)) else {
+        bail!("failed to apply policy offset to timestamp");
     };
-
-    let seconds_of_day =
-        offset_time.hour() * 3600 + offset_time.minute() * 60 + offset_time.second();
+    let seconds_of_day = offset_time.rem_euclid(SECONDS_PER_DAY);
     let interval = u32::try_from(policy.interval.as_secs())?;
     let period = u32::try_from(policy.period.as_secs())?;
-    let time_slot = seconds_of_day % period / interval;
+    let time_slot = u32::try_from(seconds_of_day)? % period / interval;
     Ok(usize::try_from(time_slot)?)
 }
 
@@ -144,26 +175,25 @@ fn event_value(sum_column: Option<u32>, event: &Event) -> f64 {
     event.column_value(column)
 }
 
-fn start_time(policy: &SamplingPolicy, time: DateTime<Utc>) -> Result<DateTime<Utc>> {
+fn start_time(policy: &SamplingPolicy, time: Timestamp) -> Result<Timestamp> {
     let offset = i64::from(policy.offset);
-    let offset_time = time.timestamp() + offset;
-    let Some(offset_time) = DateTime::from_timestamp(offset_time, 0) else {
-        bail!("failed to create DateTime<Utc> from timestamp");
+    let Some(offset_time) = time.timestamp().checked_add(offset) else {
+        bail!("failed to apply policy offset to timestamp");
     };
 
-    let seconds_of_day =
-        offset_time.hour() * 3600 + offset_time.minute() * 60 + offset_time.second();
-    let timestamp_of_midnight = offset_time.timestamp() - i64::from(seconds_of_day);
+    let seconds_of_day = offset_time.rem_euclid(SECONDS_PER_DAY);
+    let timestamp_of_midnight = offset_time - seconds_of_day;
 
-    let period = u32::try_from(policy.period.as_secs())?;
+    let period = i64::try_from(policy.period.as_secs())?;
     let start_of_period = seconds_of_day / period * period;
-    let start_offset_time = timestamp_of_midnight + i64::from(start_of_period);
-
-    let Some(datetime) = DateTime::from_timestamp(start_offset_time - offset, 0) else {
-        bail!("failed to create DateTime<Utc> from timestamp");
+    let Some(start_offset_time) = timestamp_of_midnight.checked_add(start_of_period) else {
+        bail!("failed to calculate period start timestamp");
+    };
+    let Some(start_time) = start_offset_time.checked_sub(offset) else {
+        bail!("failed to convert period start timestamp to UTC");
     };
 
-    Ok(datetime)
+    Ok(Timestamp::from_timestamp(start_time))
 }
 
 pub(super) async fn write_last_timestamp(
@@ -256,7 +286,7 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
-    use chrono::NaiveDateTime;
+    use chrono::{DateTime, NaiveDateTime, Utc};
     use review_protocol::types::{SamplingKind, SamplingPolicy};
     use serial_test::serial;
     use tempfile::tempdir;
@@ -296,17 +326,19 @@ mod tests {
         create_policy(id, period_secs, interval_secs, offset, column)
     }
 
-    /// Helper to create `DateTime`<Utc> from unix timestamp
-    fn datetime_from_timestamp(timestamp: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(timestamp, 0).expect("valid timestamp")
+    /// Helper to create a `Timestamp` from unix timestamp seconds
+    fn datetime_from_timestamp(timestamp: i64) -> Timestamp {
+        Timestamp::from_timestamp(timestamp)
     }
 
-    /// Helper to create `DateTime`<Utc> from a specific UTC date/time string
-    fn datetime_from_utc(input: &str) -> DateTime<Utc> {
+    /// Helper to create a `Timestamp` from a specific UTC date/time string
+    fn datetime_from_utc(input: &str) -> Timestamp {
         let naive = NaiveDateTime::parse_from_str(input, "%Y/%m/%d %H:%M:%S")
             .or_else(|_| NaiveDateTime::parse_from_str(input, "%Y/%-m/%-d %H:%M:%S"))
             .expect("valid datetime");
-        DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
+        Timestamp::from_timestamp(
+            DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp(),
+        )
     }
 
     // =========================================================================
