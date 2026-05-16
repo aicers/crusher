@@ -20,29 +20,30 @@ use super::{Event, INGEST_CHANNEL};
 pub(super) const SECOND_TO_NANO: i64 = 1_000_000_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 
-// A hashmap for last series timestamp
+// Stores the last transferred time-series timestamp in nanoseconds by sampling policy ID.
 static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[async_trait]
 pub(super) trait SamplingPolicyExt {
-    async fn start_timestamp(&self) -> Result<i64>;
+    /// Returns the next stream start timestamp in nanoseconds.
+    async fn start_timestamp_nanos(&self) -> Result<i64>;
 }
 
 #[async_trait]
 impl SamplingPolicyExt for SamplingPolicy {
-    async fn start_timestamp(&self) -> Result<i64> {
-        let mut start: i64 = 0;
+    async fn start_timestamp_nanos(&self) -> Result<i64> {
+        let mut start_timestamp_nanos: i64 = 0;
         if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&self.id.to_string()) {
-            let period = i64::try_from(self.period.as_secs())?;
-            let Some(period_nano) = period.checked_mul(SECOND_TO_NANO) else {
+            let period_secs = i64::try_from(self.period.as_secs())?;
+            let Some(period_nanos) = period_secs.checked_mul(SECOND_TO_NANO) else {
                 bail!("Failed to convert period to nanoseconds");
             };
-            if let Some(last_timestamp) = last_time.checked_add(period_nano) {
-                start = last_timestamp;
+            if let Some(last_timestamp_nanos) = last_time.checked_add(period_nanos) {
+                start_timestamp_nanos = last_timestamp_nanos;
             }
         }
-        Ok(start)
+        Ok(start_timestamp_nanos)
     }
 }
 
@@ -51,7 +52,7 @@ impl SamplingPolicyExt for SamplingPolicy {
 pub(super) struct TimeSeries {
     pub(super) sampling_policy_id: String,
     #[serde(skip)]
-    pub(super) start: i64,
+    pub(super) start_secs: i64,
     pub(super) series: Vec<f64>,
 }
 
@@ -84,12 +85,15 @@ impl TimeSeries {
             bail!("period must be a multiple of interval");
         }
 
-        let start = policy.start_timestamp().await?.div_euclid(SECOND_TO_NANO);
+        let start_secs = policy
+            .start_timestamp_nanos()
+            .await?
+            .div_euclid(SECOND_TO_NANO);
         let len = usize::try_from(period_secs / interval_secs)?;
         let series = vec![0_f64; len];
         Ok(TimeSeries {
             sampling_policy_id: policy.id.to_string(),
-            start,
+            start_secs,
             series,
         })
     }
@@ -97,14 +101,14 @@ impl TimeSeries {
     pub(super) async fn fill(
         &mut self,
         policy: &SamplingPolicy,
-        time: i64,
+        time_secs: i64,
         event: &Event,
         send_channel: &Sender<TimeSeries>,
     ) -> Result<()> {
         let period = i64::try_from(policy.period.as_secs())?;
-        let Some(elapsed) = time.checked_sub(self.start) else {
-            bail!("failed to calculate elapsed time");
-        };
+        let elapsed = time_secs
+            .checked_sub(self.start_secs)
+            .context("failed to calculate elapsed time")?;
 
         if elapsed > period {
             if let Some(sender) = INGEST_CHANNEL.read().await.get(&self.sampling_policy_id) {
@@ -112,11 +116,11 @@ impl TimeSeries {
             } else {
                 send_channel.send(self.clone()).await?;
             }
-            self.start = start_time(policy, time)?;
+            self.start_secs = start_time(policy, time_secs)?;
             self.series.fill(0_f64);
         }
 
-        let time_slot = time_slot(policy, time)?;
+        let time_slot = time_slot(policy, time_secs)?;
         let Some(value) = self.series.get_mut(time_slot) else {
             bail!("cannot access the time slot");
         };
@@ -126,14 +130,14 @@ impl TimeSeries {
     }
 }
 
-fn time_slot(policy: &SamplingPolicy, time: i64) -> Result<usize> {
-    let Some(offset_time) = time.checked_add(i64::from(policy.offset)) else {
+fn time_slot(policy: &SamplingPolicy, time_secs: i64) -> Result<usize> {
+    let Some(offset_time) = time_secs.checked_add(i64::from(policy.offset)) else {
         bail!("failed to apply policy offset to timestamp");
     };
-    let seconds_of_day = offset_time.rem_euclid(SECONDS_PER_DAY);
-    let interval = u32::try_from(policy.interval.as_secs())?;
-    let period = u32::try_from(policy.period.as_secs())?;
-    let time_slot = u32::try_from(seconds_of_day)? % period / interval;
+    let seconds_of_day = u64::try_from(offset_time.rem_euclid(SECONDS_PER_DAY))?;
+    let interval = policy.interval.as_secs();
+    let period = policy.period.as_secs();
+    let time_slot = seconds_of_day % period / interval;
     Ok(usize::try_from(time_slot)?)
 }
 
@@ -144,9 +148,9 @@ fn event_value(sum_column: Option<u32>, event: &Event) -> f64 {
     event.column_value(column)
 }
 
-fn start_time(policy: &SamplingPolicy, time: i64) -> Result<i64> {
-    let offset = i64::from(policy.offset);
-    let Some(offset_time) = time.checked_add(offset) else {
+fn start_time(policy: &SamplingPolicy, time_secs: i64) -> Result<i64> {
+    let offset_secs = i64::from(policy.offset);
+    let Some(offset_time) = time_secs.checked_add(offset_secs) else {
         bail!("failed to apply policy offset to timestamp");
     };
 
@@ -154,13 +158,13 @@ fn start_time(policy: &SamplingPolicy, time: i64) -> Result<i64> {
     let timestamp_of_midnight = offset_time - seconds_of_day;
 
     let period = i64::try_from(policy.period.as_secs())?;
-    let start_of_period = seconds_of_day / period * period;
-    let Some(start_offset_time) = timestamp_of_midnight.checked_add(start_of_period) else {
-        bail!("failed to calculate period start timestamp");
-    };
-    let Some(start_time) = start_offset_time.checked_sub(offset) else {
-        bail!("failed to convert period start timestamp to UTC");
-    };
+    let start_of_period = seconds_of_day.div_euclid(period) * period;
+    let start_offset_time = timestamp_of_midnight
+        .checked_add(start_of_period)
+        .context("failed to calculate period start timestamp")?;
+    let start_time = start_offset_time
+        .checked_sub(offset_secs)
+        .context("failed to convert period start timestamp to UTC")?;
 
     Ok(start_time)
 }
@@ -169,8 +173,8 @@ pub(super) async fn write_last_timestamp(
     last_series_time_path: PathBuf,
     time_receiver: Receiver<(String, i64)>,
 ) -> Result<()> {
-    while let Ok((id, timestamp)) = time_receiver.recv().await {
-        LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
+    while let Ok((id, timestamp_nanos)) = time_receiver.recv().await {
+        LAST_TRANSFER_TIME.write().await.insert(id, timestamp_nanos);
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -218,10 +222,13 @@ pub(super) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<
         let Value::Number(value) = val else {
             bail!("Failed to parse timestamp data, invalid json format");
         };
-        let Some(timestamp) = value.as_i64() else {
+        let Some(timestamp_nanos) = value.as_i64() else {
             bail!("Failed to convert timestamp data, invalid time data");
         };
-        LAST_TRANSFER_TIME.write().await.insert(key, timestamp);
+        LAST_TRANSFER_TIME
+            .write()
+            .await
+            .insert(key, timestamp_nanos);
     }
     Ok(())
 }
@@ -904,7 +911,7 @@ mod tests {
     fn create_test_series(policy_id: &str, num_slots: usize, start_timestamp: i64) -> TimeSeries {
         TimeSeries {
             sampling_policy_id: policy_id.to_string(),
-            start: start_timestamp,
+            start_secs: start_timestamp,
             series: vec![0_f64; num_slots],
         }
     }
@@ -1336,7 +1343,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_timestamp_no_last_transmission() {
         // When there is no last transmission timestamp in LAST_TRANSFER_TIME,
-        // start_timestamp() should return 0
+        // start_timestamp_nanos() should return 0
 
         // Use a unique policy ID that won't conflict with other tests
         let policy_id = 999_999_u32;
@@ -1358,15 +1365,18 @@ mod tests {
             .await
             .remove(&policy_id.to_string());
 
-        // start_timestamp should return 0 when no last timestamp exists
-        let start = policy.start_timestamp().await.expect("should succeed");
+        // start_timestamp_nanos should return 0 when no last timestamp exists
+        let start = policy
+            .start_timestamp_nanos()
+            .await
+            .expect("should succeed");
         assert_eq!(start, 0);
     }
 
     #[serial]
     #[tokio::test]
     async fn test_start_timestamp_with_last_transmission() {
-        // When there is a last transmission timestamp, start_timestamp() should
+        // When there is a last transmission timestamp, start_timestamp_nanos() should
         // return last_time + period (in nanoseconds)
 
         // Use a unique policy ID to avoid interference
@@ -1390,10 +1400,13 @@ mod tests {
             .await
             .insert(policy_id.to_string(), last_timestamp_ns);
 
-        // start_timestamp should return last_time + period_in_nanos
+        // start_timestamp_nanos should return last_time + period_in_nanos
         // period = 3600 seconds = 3_600_000_000_000 nanoseconds
         let expected = last_timestamp_ns + 3600 * SECOND_TO_NANO;
-        let start = policy.start_timestamp().await.expect("should succeed");
+        let start = policy
+            .start_timestamp_nanos()
+            .await
+            .expect("should succeed");
         assert_eq!(start, expected);
 
         // Cleanup
@@ -1407,7 +1420,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_timestamp_period_conversion_overflow() {
         // When the period is too large to convert to nanoseconds (overflow),
-        // start_timestamp() should return an error
+        // start_timestamp_nanos() should return an error
 
         // Use a unique policy ID
         let policy_id = 777_777_u32;
@@ -1433,8 +1446,8 @@ mod tests {
             .await
             .insert(policy_id.to_string(), last_timestamp_ns);
 
-        // start_timestamp should fail due to overflow in period conversion
-        let result = policy.start_timestamp().await;
+        // start_timestamp_nanos should fail due to overflow in period conversion
+        let result = policy.start_timestamp_nanos().await;
         assert!(
             result.is_err(),
             "Expected error due to period conversion overflow"
@@ -1733,7 +1746,7 @@ mod tests {
                 receiver.try_recv().is_err(),
                 "no series should be sent at the exact period boundary",
             );
-            assert_eq!(series.start, start_ts);
+            assert_eq!(series.start_secs, start_ts);
             assert_eq!(series.series[0], 1.0);
 
             // One second past the boundary triggers send + reset (3601 > 3600).
@@ -1750,17 +1763,17 @@ mod tests {
 
         #[test]
         fn time_series_bincode_serialization_is_chrono_independent() {
-            // The `start` field is `#[serde(skip)]`, so the bincode payload
+            // The `start_secs` field is `#[serde(skip)]`, so the bincode payload
             // must be byte-identical for two TimeSeries that differ only in
             // their start time.
             let series_a = TimeSeries {
                 sampling_policy_id: "42".to_string(),
-                start: TS_EPOCH,
+                start_secs: TS_EPOCH,
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
             let series_b = TimeSeries {
                 sampling_policy_id: "42".to_string(),
-                start: TS_9999_12_31_235959Z,
+                start_secs: TS_9999_12_31_235959Z,
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
 
@@ -1769,25 +1782,25 @@ mod tests {
 
             assert_eq!(
                 bytes_a, bytes_b,
-                "TimeSeries bincode bytes must not depend on the `start` field",
+                "TimeSeries bincode bytes must not depend on the `start_secs` field",
             );
         }
 
         #[test]
         fn time_series_bincode_round_trip_preserves_observable_fields() {
             // The id and series payload must round-trip byte-for-byte. The
-            // `start` field is skipped on the wire and is not part of the
+            // `start_secs` field is skipped on the wire and is not part of the
             // external contract.
             let original = TimeSeries {
                 sampling_policy_id: "policy-1".to_string(),
-                start: TS_2023_11_14_221320Z,
+                start_secs: TS_2023_11_14_221320Z,
                 series: vec![0.0, 1.5, -2.25, 3.125],
             };
             let bytes = bincode::serialize(&original).expect("bincode serialize");
             let decoded: TimeSeries = bincode::deserialize(&bytes).expect("bincode deserialize");
             assert_eq!(decoded.sampling_policy_id, "policy-1");
             assert_eq!(decoded.series, vec![0.0, 1.5, -2.25, 3.125]);
-            assert_eq!(decoded.start, i64::default());
+            assert_eq!(decoded.start_secs, i64::default());
         }
 
         // Unique-per-test prefix prevents interference with concurrent tests
@@ -1920,7 +1933,7 @@ mod tests {
         #[serial]
         #[tokio::test]
         async fn start_timestamp_arithmetic_uses_integer_nanoseconds() {
-            // start_timestamp() is documented to add the policy's period
+            // start_timestamp_nanos() is documented to add the policy's period
             // (in nanoseconds) to the last transmission time. Pin this
             // arithmetic against literal integers so any future swap of
             // the time backend keeps producing exact i64 nanoseconds.
@@ -1946,7 +1959,10 @@ mod tests {
                 .await
                 .insert(policy_id.to_string(), last_ns);
 
-            let next = policy.start_timestamp().await.expect("start_timestamp");
+            let next = policy
+                .start_timestamp_nanos()
+                .await
+                .expect("start_timestamp_nanos");
             // period = 3_600s = 3_600_000_000_000ns; expected = literal sum.
             let expected: i64 = 1_700_000_000_000_000_000 + 3_600_000_000_000;
             assert_eq!(next, expected);
@@ -1981,7 +1997,7 @@ mod tests {
                 .write()
                 .await
                 .remove(&policy_id.to_string());
-            assert_eq!(policy.start_timestamp().await.unwrap(), 0_i64);
+            assert_eq!(policy.start_timestamp_nanos().await.unwrap(), 0_i64);
         }
     }
 }

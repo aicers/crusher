@@ -437,9 +437,9 @@ async fn process_network_stream(
     delete_policy_ids: Arc<RwLock<Vec<u32>>>,
     last_series_time_path: PathBuf,
 ) -> Result<()> {
-    let start = policy.start_timestamp().await?;
+    let start_timestamp_nanos = policy.start_timestamp_nanos().await?;
     let req_msg = RequestTimeSeriesGeneratorStream {
-        start,
+        start: start_timestamp_nanos,
         id: policy.id.to_string(),
         src_ip: policy.src_ip,
         dst_ip: policy.dst_ip,
@@ -499,9 +499,10 @@ async fn receiver(
                     .retain(|&delete_id| delete_id != id);
                 break;
             }
-            if let Ok((raw_event, timestamp)) = receive_time_series_generator_data(&mut recv).await
+            if let Ok((raw_event, timestamp_nanos)) =
+                receive_time_series_generator_data(&mut recv).await
             {
-                let time = timestamp.div_euclid(SECOND_TO_NANO);
+                let time_secs = timestamp_nanos.div_euclid(SECOND_TO_NANO);
                 let Ok(event) = Event::try_new(policy.kind, &raw_event) else {
                     warn!(
                         "Failed to deserialize raw_event for sampling kind: {:?}",
@@ -509,7 +510,7 @@ async fn receiver(
                     );
                     continue;
                 };
-                if let Err(e) = series.fill(&policy, time, &event, &sender).await {
+                if let Err(e) = series.fill(&policy, time_secs, &event, &sender).await {
                     warn!("Failed to generate time series: {}", e);
                 }
             } else {
@@ -552,8 +553,11 @@ async fn send_time_series(
     send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
 
     let serde_series = bincode::serialize(&series)?;
-    let timesatmp = series.start.checked_mul(SECOND_TO_NANO).unwrap_or(i64::MAX);
-    send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
+    let timestamp_nanos = series
+        .start_secs
+        .checked_mul(SECOND_TO_NANO)
+        .unwrap_or(i64::MAX);
+    send_event_in_batch(&mut series_sender, &[(timestamp_nanos, serde_series)]).await?;
 
     // Receive start time of giganto last saved time series.
     tokio::spawn(receive_time_series_timestamp(
@@ -566,8 +570,11 @@ async fn send_time_series(
     // Data transmission after the first time (only series data)
     while let Ok(series) = recv_channel.recv().await {
         let serde_series = bincode::serialize(&series)?;
-        let timesatmp = series.start.checked_mul(SECOND_TO_NANO).unwrap_or(i64::MAX);
-        send_event_in_batch(&mut series_sender, &[(timesatmp, serde_series)]).await?;
+        let timestamp_nanos = series
+            .start_secs
+            .checked_mul(SECOND_TO_NANO)
+            .unwrap_or(i64::MAX);
+        send_event_in_batch(&mut series_sender, &[(timestamp_nanos, serde_series)]).await?;
     }
     Ok(())
 }
@@ -586,13 +593,13 @@ async fn receive_time_series_timestamp(
 ) -> Result<()> {
     loop {
         match receive_ack_timestamp(&mut receiver).await {
-            Ok(timestamp) => {
+            Ok(timestamp_nanos) => {
                 debug!(
                     "The time of the timeseries last sent by {}. : {}",
-                    sampling_policy_id, timestamp
+                    sampling_policy_id, timestamp_nanos
                 );
                 time_sender
-                    .send((sampling_policy_id.clone(), timestamp))
+                    .send((sampling_policy_id.clone(), timestamp_nanos))
                     .await?;
             }
             Err(RecvError::ReadError(quinn::ReadExactError::FinishedEarly(_))) => {

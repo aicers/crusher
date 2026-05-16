@@ -33,7 +33,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4" }
 serial_test = "3"
 tempfile = "3"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
