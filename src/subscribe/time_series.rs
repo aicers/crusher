@@ -33,17 +33,17 @@ pub(super) trait SamplingPolicyExt {
 #[async_trait]
 impl SamplingPolicyExt for SamplingPolicy {
     async fn start_timestamp_nanos(&self) -> Result<i64> {
-        let mut start_timestamp_nanos: i64 = 0;
+        let mut start: i64 = 0;
         if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&self.id.to_string()) {
             let period_secs = i64::try_from(self.period.as_secs())?;
-            let Some(period_nanos) = period_secs.checked_mul(SECOND_TO_NANO) else {
-                bail!("Failed to convert period to nanoseconds");
-            };
+            let period_nanos = period_secs
+                .checked_mul(SECOND_TO_NANO)
+                .context("Failed to convert period to nanoseconds")?;
             if let Some(last_timestamp_nanos) = last_time.checked_add(period_nanos) {
-                start_timestamp_nanos = last_timestamp_nanos;
+                start = last_timestamp_nanos;
             }
         }
-        Ok(start_timestamp_nanos)
+        Ok(start)
     }
 }
 
@@ -158,7 +158,7 @@ fn start_time(policy: &SamplingPolicy, time_secs: i64) -> Result<i64> {
     let timestamp_of_midnight = offset_time - seconds_of_day;
 
     let period = i64::try_from(policy.period.as_secs())?;
-    let start_of_period = seconds_of_day.div_euclid(period) * period;
+    let start_of_period = seconds_of_day - seconds_of_day.rem_euclid(period);
     let start_offset_time = timestamp_of_midnight
         .checked_add(start_of_period)
         .context("failed to calculate period start timestamp")?;
