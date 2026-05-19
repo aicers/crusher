@@ -12,6 +12,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Prerequisites, Configuration, Operations, and Troubleshooting, and registered
   them with the i18n nav(including Korean nav translations) in `mkdocs.yml`.
 
+### Changed
+
+- Align the default stdout and file logging levels to INFO when
+  `RUST_LOG` is not set.
+
 ## [0.8.0] - 2026-05-05
 
 ### Added

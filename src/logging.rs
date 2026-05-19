@@ -11,6 +11,10 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::Subs
 /// If `log_path` is `None`, logs will be printed to stdout.
 ///
 pub(crate) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<WorkerGuard> {
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+
     let (layer, guard) = if let Some(log_path) = log_path {
         let file = OpenOptions::new()
             .create(true)
@@ -23,11 +27,7 @@ pub(crate) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<WorkerGuar
                 .with_ansi(false)
                 .with_target(false)
                 .with_writer(non_blocking)
-                .with_filter(
-                    EnvFilter::builder()
-                        .with_default_directive(LevelFilter::INFO.into())
-                        .from_env_lossy(),
-                ),
+                .with_filter(filter),
             file_guard,
         )
     } else {
@@ -36,7 +36,7 @@ pub(crate) fn init_tracing(log_path: Option<&Path>) -> anyhow::Result<WorkerGuar
             fmt::Layer::default()
                 .with_ansi(true)
                 .with_writer(stdout_writer)
-                .with_filter(EnvFilter::from_default_env()),
+                .with_filter(filter),
             stdout_guard,
         )
     };
