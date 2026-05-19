@@ -19,6 +19,7 @@ use super::{Event, INGEST_CHANNEL};
 
 pub(super) const SECOND_TO_NANO: i64 = 1_000_000_000;
 const SECONDS_PER_DAY: i64 = 86_400;
+const DEFAULT_START_TIMESTAMP_NANOS: i64 = 0;
 
 // Stores the last transferred time-series timestamp in nanoseconds by sampling policy ID.
 static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
@@ -33,16 +34,21 @@ pub(super) trait SamplingPolicyExt {
 #[async_trait]
 impl SamplingPolicyExt for SamplingPolicy {
     async fn start_timestamp_nanos(&self) -> Result<i64> {
-        let mut start: i64 = 0;
-        if let Some(last_time) = LAST_TRANSFER_TIME.read().await.get(&self.id.to_string()) {
+        let id = self.id.to_string();
+        let last_transfer_time = LAST_TRANSFER_TIME.read().await;
+
+        let start: i64 = if let Some(last_time) = last_transfer_time.get(&id) {
             let period_secs = i64::try_from(self.period.as_secs())?;
             let period_nanos = period_secs
                 .checked_mul(SECOND_TO_NANO)
                 .context("Failed to convert period to nanoseconds")?;
-            if let Some(last_timestamp_nanos) = last_time.checked_add(period_nanos) {
-                start = last_timestamp_nanos;
-            }
-        }
+            last_time
+                .checked_add(period_nanos)
+                .unwrap_or(DEFAULT_START_TIMESTAMP_NANOS)
+        } else {
+            DEFAULT_START_TIMESTAMP_NANOS
+        };
+
         Ok(start)
     }
 }
@@ -150,9 +156,9 @@ fn event_value(sum_column: Option<u32>, event: &Event) -> f64 {
 
 fn start_time(policy: &SamplingPolicy, time_secs: i64) -> Result<i64> {
     let offset_secs = i64::from(policy.offset);
-    let Some(offset_time) = time_secs.checked_add(offset_secs) else {
-        bail!("failed to apply policy offset to timestamp");
-    };
+    let offset_time = time_secs
+        .checked_add(offset_secs)
+        .context("failed to apply policy offset to timestamp")?;
 
     let seconds_of_day = offset_time.rem_euclid(SECONDS_PER_DAY);
     let timestamp_of_midnight = offset_time - seconds_of_day;
