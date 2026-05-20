@@ -24,9 +24,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Refactored async policy/stream/timestamp handling to improve
   cancellation safety and avoid partial state loss during shutdown.
-
-### Changed
-
 - Align the default stdout and file logging levels to INFO when
   `RUST_LOG` is not set.
 - Removed `chrono` from the application crate, including the test helpers.
