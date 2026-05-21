@@ -16,9 +16,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Align the default stdout and file logging levels to INFO when
   `RUST_LOG` is not set.
-- Removed `chrono` from production code in the application crate. Time series
-  timestamps are now handled as plain `i64` values, while `chrono` remains
-  available for tests only.
+- Removed `chrono` from the application crate, including the test helpers.
+  Time series timestamps are now handled as plain `i64` values, and the test
+  helpers now use fixed integer timestamps and `time`-based date parsing.
 
 ## [0.8.0] - 2026-05-05
 

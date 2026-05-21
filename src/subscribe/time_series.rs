@@ -268,10 +268,10 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
-    use chrono::{DateTime, NaiveDateTime, Utc};
     use review_protocol::types::{SamplingKind, SamplingPolicy};
     use serial_test::serial;
     use tempfile::tempdir;
+    use time::{Date, Month};
 
     use super::*;
 
@@ -311,10 +311,48 @@ mod tests {
     /// Helper to create a Unix timestamp (seconds) from a specific UTC
     /// date/time string
     fn datetime_from_utc(input: &str) -> i64 {
-        let naive = NaiveDateTime::parse_from_str(input, "%Y/%m/%d %H:%M:%S")
-            .or_else(|_| NaiveDateTime::parse_from_str(input, "%Y/%-m/%-d %H:%M:%S"))
-            .expect("valid datetime");
-        DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp()
+        let (date, time) = input.split_once(' ').expect("datetime contains a space");
+        let mut date_parts = date.split('/');
+        let year: i32 = date_parts
+            .next()
+            .expect("year is present")
+            .parse()
+            .expect("year is valid");
+        let month: u8 = date_parts
+            .next()
+            .expect("month is present")
+            .parse()
+            .expect("month is valid");
+        let day: u8 = date_parts
+            .next()
+            .expect("day is present")
+            .parse()
+            .expect("day is valid");
+
+        let mut time_parts = time.split(':');
+        let hour: u8 = time_parts
+            .next()
+            .expect("hour is present")
+            .parse()
+            .expect("hour is valid");
+        let minute: u8 = time_parts
+            .next()
+            .expect("minute is present")
+            .parse()
+            .expect("minute is valid");
+        let second: u8 = time_parts
+            .next()
+            .expect("second is present")
+            .parse()
+            .expect("second is valid");
+
+        let month = Month::try_from(month).expect("month is in range");
+        Date::from_calendar_date(year, month, day)
+            .expect("date is valid")
+            .with_hms(hour, minute, second)
+            .expect("time is valid")
+            .assume_utc()
+            .unix_timestamp()
     }
 
     // =========================================================================
@@ -1566,9 +1604,8 @@ mod tests {
     // Time-handling contracts
     //
     // These tests pin down the externally observable contracts of the
-    // time-handling code so that the subsequent removal of `chrono` can be
-    // validated against a stable baseline. They prefer integer Unix timestamps
-    // and literal expected values over chrono-derived ones.
+    // time-handling code against a stable baseline. They prefer integer Unix
+    // timestamps and literal expected values over runtime-derived ones.
     // =========================================================================
     mod time_handling_contracts {
         use super::*;
@@ -1768,7 +1805,7 @@ mod tests {
         }
 
         #[test]
-        fn time_series_bincode_serialization_is_chrono_independent() {
+        fn time_series_bincode_serialization_ignores_start_time() {
             // The `start_secs` field is `#[serde(skip)]`, so the bincode payload
             // must be byte-identical for two TimeSeries that differ only in
             // their start time.

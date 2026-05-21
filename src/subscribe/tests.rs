@@ -7,7 +7,6 @@ use std::{
     sync::Arc,
 };
 
-use chrono::Utc;
 use giganto_client::{
     connection::server_handshake,
     frame::{recv_raw, send_bytes, send_raw},
@@ -41,6 +40,7 @@ const HOST: &str = "localhost";
 const SECS_PER_MINUTE: u64 = 60;
 const SECS_PER_DAY: u64 = 86_400;
 const DEFAULT_POLICY_ID: u32 = 1;
+const BASE_TS_NANOS: i64 = 1_700_000_000_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionPath {
@@ -248,7 +248,7 @@ async fn handle_publish_connection(
         let _ = send_raw(&mut uni, policy_id.as_bytes()).await;
 
         for idx in 0..repeat_count {
-            let ts = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+            let ts = BASE_TS_NANOS + i64::try_from(idx).expect("test repeat count fits in i64");
             let _ = send_bytes(&mut uni, &ts.to_le_bytes()).await;
             let _ = send_raw(&mut uni, &record_bytes).await;
             if idx + 1 < repeat_count {
@@ -706,8 +706,6 @@ fn cert_key() -> Certs {
 }
 
 fn gen_conn() -> Conn {
-    let tmp_dur = chrono::Duration::nanoseconds(12345);
-
     Conn {
         orig_addr: "192.168.4.76".parse::<IpAddr>().unwrap(),
         resp_addr: "192.168.4.76".parse::<IpAddr>().unwrap(),
@@ -717,7 +715,7 @@ fn gen_conn() -> Conn {
         service: String::new(),
         conn_state: "OK".to_string(),
         start_time: 500,
-        duration: tmp_dur.num_nanoseconds().unwrap(),
+        duration: 12_345,
         orig_bytes: 77,
         resp_bytes: 295,
         orig_pkts: 397,
