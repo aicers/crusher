@@ -434,11 +434,12 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc};
+    use std::{fs, sync::Arc, time::Duration};
 
     use serial_test::serial;
     use tempfile::tempdir;
     use tokio::sync::Notify;
+    use tracing_appender::non_blocking::WorkerGuard;
 
     use super::*;
 
@@ -484,6 +485,93 @@ last_timestamp_data = "{}"
         )
         .expect("write local config");
         config_path.to_str().expect("utf-8 config path").to_string()
+    }
+
+    /// Prevents `run()` from installing a global tracing subscriber (which
+    /// would panic on subsequent `run()`-based tests in the same process).
+    fn test_tracing_guard() -> WorkerGuard {
+        let (_writer, guard) = tracing_appender::non_blocking(std::io::sink());
+        guard
+    }
+
+    /// Local-config harness for `run()` integration tests (no external services).
+    struct RunTestHarness {
+        _temp_dir: tempfile::TempDir,
+        args: CmdLineArgs,
+        certs: Certs,
+        request_client: request::Client,
+        request_send: async_channel::Sender<SamplingPolicy>,
+        request_recv: async_channel::Receiver<SamplingPolicy>,
+        config_reload: Arc<Notify>,
+        tls_reload: Arc<Notify>,
+        shutdown: Arc<Notify>,
+    }
+
+    impl RunTestHarness {
+        /// Returns `None` when the environment cannot build a QUIC endpoint.
+        fn try_new() -> Option<Self> {
+            let temp_dir = tempdir().expect("tempdir");
+            let config_path = write_local_config(&temp_dir);
+            let (certs, tls_bytes) = load_test_tls();
+            if let Err(e) = crate::client::config(&certs) {
+                if e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                }) {
+                    return None;
+                }
+                panic!("test endpoint preflight failed: {e:#}");
+            }
+            let args = CmdLineArgs {
+                config: Some(config_path),
+                cert: "tests/cert.pem".to_string(),
+                key: "tests/key.pem".to_string(),
+                ca_certs: vec!["tests/ca_cert.pem".to_string()],
+                manager_server: "manager@[::1]:9".parse().expect("valid manager address"),
+            };
+            let manager_tls = SharedTlsBytes::new(tls_bytes);
+            let request_client = request::Client::new(
+                args.manager_server.rpc_srv_addr,
+                args.manager_server.name.clone(),
+                manager_tls,
+                Arc::new(Notify::new()),
+            );
+            let (request_send, request_recv) =
+                async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
+            Some(Self {
+                _temp_dir: temp_dir,
+                args,
+                certs,
+                request_client,
+                request_send,
+                request_recv,
+                config_reload: Arc::new(Notify::new()),
+                tls_reload: Arc::new(Notify::new()),
+                shutdown: Arc::new(Notify::new()),
+            })
+        }
+
+        async fn run(&self, guard: &mut Option<WorkerGuard>) -> Result<RunExitReason> {
+            run(
+                &self.args,
+                &self.certs,
+                self.request_client.clone(),
+                self.request_send.clone(),
+                self.request_recv.clone(),
+                self.config_reload.clone(),
+                self.tls_reload.clone(),
+                self.shutdown.clone(),
+                guard,
+            )
+            .await
+        }
+    }
+
+    async fn notify_shutdown_after_startup_delay(shutdown: Arc<Notify>) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.notify_one();
     }
 
     fn write_rotated_material(
@@ -914,63 +1002,67 @@ last_timestamp_data = "{}"
         assert_eq!(reason, "shutdown");
     }
 
+    /// Verifies that `run()` selects the shutdown branch while active, joins
+    /// top-level tasks, and drains tracked child tasks without hanging.
     #[serial]
     #[tokio::test(flavor = "current_thread")]
     async fn run_shutdown_drains_top_level_and_tracked_tasks() {
-        let temp_dir = tempdir().expect("tempdir");
-        let config_path = write_local_config(&temp_dir);
-        let (certs, tls_bytes) = load_test_tls();
-        if let Err(e) = crate::client::config(&certs) {
-            if e.chain().any(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
-            }) {
-                return;
-            }
-            panic!("test endpoint preflight failed: {e:#}");
-        }
-        let args = CmdLineArgs {
-            config: Some(config_path),
-            cert: "tests/cert.pem".to_string(),
-            key: "tests/key.pem".to_string(),
-            ca_certs: vec!["tests/ca_cert.pem".to_string()],
-            manager_server: "manager@[::1]:9".parse().expect("valid manager address"),
+        let Some(harness) = RunTestHarness::try_new() else {
+            return;
         };
-        let manager_tls = SharedTlsBytes::new(tls_bytes);
-        let request_client = request::Client::new(
-            args.manager_server.rpc_srv_addr,
-            args.manager_server.name.clone(),
-            manager_tls,
-            Arc::new(Notify::new()),
-        );
-        let (request_send, request_recv) =
-            async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
-        let config_reload = Arc::new(Notify::new());
-        let tls_reload = Arc::new(Notify::new());
-        let shutdown = Arc::new(Notify::new());
-        let mut guard = None;
+        let mut guard = Some(test_tracing_guard());
+        let shutdown = harness.shutdown.clone();
+        tokio::spawn(notify_shutdown_after_startup_delay(shutdown));
 
-        shutdown.notify_one();
-        let reason = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            run(
-                &args,
-                &certs,
-                request_client,
-                request_send,
-                request_recv,
-                config_reload,
-                tls_reload,
-                shutdown,
-                &mut guard,
-            ),
-        )
-        .await
-        .expect("main run should exit promptly on shutdown")
-        .expect("main run should complete cleanly");
+        let reason = tokio::time::timeout(Duration::from_secs(3), harness.run(&mut guard))
+            .await
+            .expect("main run should exit promptly on shutdown")
+            .expect("main run should complete cleanly");
 
         assert_eq!(reason, RunExitReason::Shutdown);
+    }
+
+    #[cfg(unix)]
+    async fn assert_signal_reaches_run_shutdown_branch(signal: libc::c_int) {
+        let Some(harness) = RunTestHarness::try_new() else {
+            return;
+        };
+        register_shutdown_signal_handler(harness.shutdown.clone());
+        let mut guard = Some(test_tracing_guard());
+
+        let run_fut = harness.run(&mut guard);
+        tokio::pin!(run_fut);
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // SAFETY: `libc::raise` only targets the current process.
+        unsafe {
+            libc::raise(signal);
+        }
+
+        let reason = tokio::time::timeout(Duration::from_secs(3), run_fut)
+            .await
+            .expect("main run should exit promptly after signal-driven shutdown")
+            .expect("main run should complete cleanly");
+
+        assert_eq!(reason, RunExitReason::Shutdown);
+    }
+
+    /// Verifies SIGINT reaches the `run()` shutdown branch (not only `Notify`).
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigint_reaches_main_run_shutdown_branch() {
+        assert_signal_reaches_run_shutdown_branch(libc::SIGINT).await;
+    }
+
+    /// Verifies SIGTERM reaches the `run()` shutdown branch (not only `Notify`).
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigterm_reaches_main_run_shutdown_branch() {
+        assert_signal_reaches_run_shutdown_branch(libc::SIGTERM).await;
     }
 
     /// Verifies that the `run()` select converges on a rerun boundary when
