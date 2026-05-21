@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::future::Future;
 use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
 
@@ -110,16 +109,7 @@ impl Client {
     }
 
     pub(crate) async fn run(&mut self, coordinator: CancellationCoordinator) -> Result<()> {
-        tokio::select! {
-            biased;
-            () = coordinator.cancelled() => {
-                info!("Shutting down request handler");
-            }
-            Err(e) = self.handle_incoming() => {
-                bail!(e);
-            }
-        };
-        Ok(())
+        run_until_cancelled(coordinator, self.handle_incoming()).await
     }
 
     async fn sync_sampling_policies(&mut self) {
@@ -332,6 +322,22 @@ impl Client {
         review_protocol::request::handle(&mut idle_mode_handler, &mut send, &mut recv).await?;
         Ok(())
     }
+}
+
+async fn run_until_cancelled<F>(coordinator: CancellationCoordinator, incoming: F) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::select! {
+        biased;
+        () = coordinator.cancelled() => {
+            info!("Shutting down request handler");
+        }
+        Err(e) = incoming => {
+            bail!(e);
+        }
+    };
+    Ok(())
 }
 
 #[async_trait]
@@ -1168,6 +1174,29 @@ mod tests {
         coordinator.request_cancellation("test");
 
         let result = client.run(coordinator).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_exits_promptly_while_incoming_handler_is_in_retry_sleep() {
+        let coordinator = CancellationCoordinator::new();
+        let coordinator_for_task = coordinator.clone();
+        let retrying_incoming = async {
+            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+            bail!("retry sleep completed before cancellation")
+        };
+
+        let handle = tokio::spawn(async move {
+            run_until_cancelled(coordinator_for_task, retrying_incoming).await
+        });
+
+        tokio::task::yield_now().await;
+        coordinator.request_cancellation("test retry sleep cancellation");
+
+        let result = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("run should exit promptly after cancellation")
+            .expect("run task should not panic");
         assert!(result.is_ok());
     }
 

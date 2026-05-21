@@ -373,6 +373,7 @@ pub(super) async fn clear_last_transfer_time() {
     clippy::float_cmp
 )]
 mod tests {
+    use std::collections::HashMap;
     use std::io::Write;
     use std::time::Duration;
 
@@ -786,6 +787,53 @@ mod tests {
 
         // Cleanup: remove our key from the global state
         LAST_TRANSFER_TIME.write().await.remove(&key);
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn write_last_timestamp_drain_timeout_flushes_collected_timestamps() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("timestamps.json");
+        let key = format!(
+            "drain_timeout_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let (sender, receiver) = async_channel::bounded::<TimestampCommand>(1);
+        let coord = crate::cancellation::CancellationCoordinator::new();
+        let writer = tokio::spawn(write_last_timestamp(
+            file_path.clone(),
+            receiver,
+            coord.clone(),
+        ));
+
+        sender
+            .send(TimestampCommand::Write {
+                id: key.clone(),
+                timestamp: 42,
+            })
+            .await
+            .expect("send collected timestamp");
+        tokio::task::yield_now().await;
+
+        coord.request_cancellation("test writer drain timeout");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(4), writer)
+            .await
+            .expect("writer exits after drain timeout")
+            .expect("writer task should not panic");
+        assert!(result.is_ok());
+
+        let contents = std::fs::read_to_string(&file_path).expect("read timestamp file");
+        let persisted: HashMap<String, i64> =
+            serde_json::from_str(&contents).expect("timestamp file is valid JSON");
+        assert_eq!(persisted.get(&key), Some(&42));
+
+        LAST_TRANSFER_TIME.write().await.remove(&key);
+        drop(sender);
     }
 
     #[serial]

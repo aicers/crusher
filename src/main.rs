@@ -434,7 +434,7 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fs, sync::Arc};
 
     use serial_test::serial;
     use tempfile::tempdir;
@@ -456,6 +456,34 @@ mod tests {
                 .parse()
                 .expect("valid manager address"),
         }
+    }
+
+    fn load_test_tls() -> (Certs, TlsBytes) {
+        let cert_pem = fs::read("tests/cert.pem").expect("read cert");
+        let key_pem = fs::read("tests/key.pem").expect("read key");
+        let ca_certs_pem = vec![fs::read("tests/ca_cert.pem").expect("read ca cert")];
+        let ca_slices = ca_certs_pem.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let certs = Certs::try_new(&cert_pem, &key_pem, &ca_slices).expect("parse certs");
+        (certs, TlsBytes::new(cert_pem, key_pem, ca_certs_pem))
+    }
+
+    fn write_local_config(dir: &tempfile::TempDir) -> String {
+        let last_timestamp_data = dir.path().join("time_data.json");
+        let config_path = dir.path().join("crusher.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+giganto_name = "localhost"
+giganto_ingest_srv_addr = "[::1]:9"
+giganto_publish_srv_addr = "[::1]:9"
+last_timestamp_data = "{}"
+"#,
+                last_timestamp_data.display()
+            ),
+        )
+        .expect("write local config");
+        config_path.to_str().expect("utf-8 config path").to_string()
     }
 
     fn write_rotated_material(
@@ -774,6 +802,61 @@ last_timestamp_data = "{}"
             .expect("shutdown notification delivered within timeout");
     }
 
+    #[cfg(unix)]
+    async fn shutdown_signal_cancels_coordinator_and_drains_tracked_task(signal: libc::c_int) {
+        let shutdown = Arc::new(Notify::new());
+        register_shutdown_signal_handler(shutdown.clone());
+
+        let coordinator = CancellationCoordinator::new();
+        let task_coordinator = coordinator.clone();
+        let started = Arc::new(Notify::new());
+        let started_for_task = started.clone();
+        coordinator.tracker().spawn(async move {
+            started_for_task.notify_one();
+            task_coordinator.cancelled().await;
+        });
+
+        started.notified().await;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // SAFETY: see `sigint_signals_shutdown_without_exit`.
+        unsafe {
+            libc::raise(signal);
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), shutdown.notified())
+            .await
+            .expect("shutdown notification delivered within timeout");
+        coordinator.request_cancellation("signal integration test");
+
+        assert!(coordinator.is_cancelled());
+        assert!(
+            coordinator
+                .wait_for_drain(std::time::Duration::from_secs(2))
+                .await,
+            "tracked task should drain after signal-driven cancellation"
+        );
+        assert_eq!(
+            coordinator.phase(),
+            crate::cancellation::CancellationPhase::Completed
+        );
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigint_shutdown_notification_cancels_coordinator_and_drains_tracked_task() {
+        shutdown_signal_cancels_coordinator_and_drains_tracked_task(libc::SIGINT).await;
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigterm_shutdown_notification_cancels_coordinator_and_drains_tracked_task() {
+        shutdown_signal_cancels_coordinator_and_drains_tracked_task(libc::SIGTERM).await;
+    }
+
     /// A SIGINT that lands *before* a waiter registers must still be
     /// picked up by the next `notified()` call. This covers the
     /// lost-wakeup window between handler installation and the main
@@ -829,6 +912,65 @@ last_timestamp_data = "{}"
             .expect("select resolves promptly")
             .expect("task completes");
         assert_eq!(reason, "shutdown");
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_shutdown_drains_top_level_and_tracked_tasks() {
+        let temp_dir = tempdir().expect("tempdir");
+        let config_path = write_local_config(&temp_dir);
+        let (certs, tls_bytes) = load_test_tls();
+        if let Err(e) = crate::client::config(&certs) {
+            if e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+            }) {
+                return;
+            }
+            panic!("test endpoint preflight failed: {e:#}");
+        }
+        let args = CmdLineArgs {
+            config: Some(config_path),
+            cert: "tests/cert.pem".to_string(),
+            key: "tests/key.pem".to_string(),
+            ca_certs: vec!["tests/ca_cert.pem".to_string()],
+            manager_server: "manager@[::1]:9".parse().expect("valid manager address"),
+        };
+        let manager_tls = SharedTlsBytes::new(tls_bytes);
+        let request_client = request::Client::new(
+            args.manager_server.rpc_srv_addr,
+            args.manager_server.name.clone(),
+            manager_tls,
+            Arc::new(Notify::new()),
+        );
+        let (request_send, request_recv) =
+            async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
+        let config_reload = Arc::new(Notify::new());
+        let tls_reload = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
+        let mut guard = None;
+
+        shutdown.notify_one();
+        let reason = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run(
+                &args,
+                &certs,
+                request_client,
+                request_send,
+                request_recv,
+                config_reload,
+                tls_reload,
+                shutdown,
+                &mut guard,
+            ),
+        )
+        .await
+        .expect("main run should exit promptly on shutdown")
+        .expect("main run should complete cleanly");
+
+        assert_eq!(reason, RunExitReason::Shutdown);
     }
 
     /// Verifies that the `run()` select converges on a rerun boundary when
