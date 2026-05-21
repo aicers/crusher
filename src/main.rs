@@ -109,31 +109,22 @@ fn read_cert_pems(args: &CmdLineArgs) -> Result<CertPems> {
     Ok((cert_pem, key_pem, ca_certs_pem))
 }
 
-/// Reads, parses, and validates TLS cert/key/CA material from disk.
-///
-/// The candidate certs are validated by building the same QUIC client
-/// configuration that `subscribe::Client::new` uses, so that mismatched
-/// cert/key pairs are rejected here (returning an error) rather than
-/// panicking later when the shared endpoint is rebuilt.
+#[cfg(test)]
+pub(crate) fn load_tls_material(args: &CmdLineArgs) -> Result<Certs> {
+    load_tls_material_with_bytes(args).map(|(certs, _)| certs)
+}
+
+/// Reads, parses, and validates TLS cert/key/CA material from disk, and
+/// returns the raw PEM bytes so the manager/control reconnect path can swap
+/// in rotated material without a second disk read. Validation happens once
+/// against the staged bytes; on success both the parsed `Certs` and the raw
+/// bytes are known good and may be published together.
 ///
 /// # Errors
 ///
 /// Returns an error if any cert/key/CA file cannot be read, the private key
 /// does not match the certificate, the CA bundle cannot be parsed, or the
 /// client/endpoint configuration cannot be built from the candidate certs.
-pub(crate) fn load_tls_material(args: &CmdLineArgs) -> Result<Certs> {
-    load_tls_material_with_bytes(args).map(|(certs, _)| certs)
-}
-
-/// Like [`load_tls_material`], but also returns the raw PEM bytes so the
-/// manager/control reconnect path can swap in rotated material without a
-/// second disk read. Validation happens once against the staged bytes; on
-/// success both the parsed `Certs` and the raw bytes are known good and
-/// may be published together.
-///
-/// # Errors
-///
-/// Returns the same errors as [`load_tls_material`].
 pub(crate) fn load_tls_material_with_bytes(args: &CmdLineArgs) -> Result<(Certs, TlsBytes)> {
     let (cert_pem, key_pem, ca_certs_pem) = read_cert_pems(args)?;
     let certs = Certs::try_new(
