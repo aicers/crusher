@@ -309,7 +309,10 @@ mod tests {
     }
 
     /// Helper to create a Unix timestamp (seconds) from a specific UTC
-    /// date/time string
+    /// date/time string in `YYYY/M/D HH:MM:SS` format.
+    ///
+    /// Example: `datetime_from_utc("2024/1/15 00:00:00")` returns `1705276800`
+    /// (2024-01-15 00:00:00 UTC).
     fn datetime_from_utc(input: &str) -> i64 {
         let (date, time) = input.split_once(' ').expect("datetime contains a space");
         let mut date_parts = date.split('/');
