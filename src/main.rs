@@ -575,6 +575,17 @@ last_timestamp_data = "{}"
         shutdown.notify_one();
     }
 
+    #[cfg(unix)]
+    async fn raise_signal_after_startup_delay(signal: libc::c_int) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // SAFETY: `libc::raise` only targets the current process.
+        unsafe {
+            libc::raise(signal);
+        }
+    }
+
     fn write_rotated_material(
         dir: &std::path::Path,
         cert_pem: &[u8],
@@ -943,18 +954,9 @@ last_timestamp_data = "{}"
         register_shutdown_signal_handler(harness.shutdown.clone());
         let mut guard = Some(test_tracing_guard());
 
-        let run_fut = harness.run(&mut guard);
-        tokio::pin!(run_fut);
+        tokio::spawn(raise_signal_after_startup_delay(signal));
 
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // SAFETY: `libc::raise` only targets the current process.
-        unsafe {
-            libc::raise(signal);
-        }
-
-        let reason = tokio::time::timeout(Duration::from_secs(3), run_fut)
+        let reason = tokio::time::timeout(Duration::from_secs(3), harness.run(&mut guard))
             .await
             .expect("main run should exit promptly after signal-driven shutdown")
             .expect("main run should complete cleanly");
