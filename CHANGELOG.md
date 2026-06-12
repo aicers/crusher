@@ -14,6 +14,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Made `giganto_name` required and removed the fallback that used the Giganto
+  address IP as the TLS server name.
 - Align the default stdout and file logging levels to INFO when
   `RUST_LOG` is not set.
 - Removed `chrono` from the application crate, including the test helpers.
