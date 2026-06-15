@@ -997,7 +997,7 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
         .await
         .unwrap();
 
-    let mut certs = crate::load_tls_material(&args).expect("initial load");
+    let (mut certs, _raw_tls) = crate::load_tls_material_with_bytes(&args).expect("initial load");
     let initial_client_leaf_der = certs
         .certs
         .first()
@@ -1053,7 +1053,7 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
         peer_cert_send.clone(),
     );
 
-    certs = crate::load_tls_material(&args).expect("valid material reloads");
+    (certs, _) = crate::load_tls_material_with_bytes(&args).expect("valid material reloads");
     assert_eq!(
         certs.certs.first().expect("reloaded client leaf").as_ref(),
         rotated.client_leaf_der.as_slice(),
@@ -1093,7 +1093,7 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
 
     // The main-loop would attempt to load the rotated material; this call
     // must fail and the caller must keep the last-known-good `certs`.
-    let reload_err = crate::load_tls_material(&args)
+    let reload_err = crate::load_tls_material_with_bytes(&args)
         .err()
         .expect("mismatched material must be rejected");
     assert!(

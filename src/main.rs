@@ -103,31 +103,22 @@ fn read_cert_pems(args: &CmdLineArgs) -> Result<CertPems> {
     Ok((cert_pem, key_pem, ca_certs_pem))
 }
 
-/// Reads, parses, and validates TLS cert/key/CA material from disk.
+/// Reads, parses, and validates TLS cert/key/CA material from disk, and
+/// returns the raw PEM bytes so the manager/control reconnect path can swap
+/// in rotated material without a second disk read.
 ///
 /// The candidate certs are validated by building the same QUIC client
 /// configuration that `subscribe::Client::new` uses, so that mismatched
 /// cert/key pairs are rejected here (returning an error) rather than
-/// panicking later when the shared endpoint is rebuilt.
+/// panicking later when the shared endpoint is rebuilt. Validation happens
+/// once against the staged bytes; on success both the parsed `Certs` and
+/// the raw bytes are known good and may be published together.
 ///
 /// # Errors
 ///
 /// Returns an error if any cert/key/CA file cannot be read, the private key
 /// does not match the certificate, the CA bundle cannot be parsed, or the
 /// client/endpoint configuration cannot be built from the candidate certs.
-pub(crate) fn load_tls_material(args: &CmdLineArgs) -> Result<Certs> {
-    load_tls_material_with_bytes(args).map(|(certs, _)| certs)
-}
-
-/// Like [`load_tls_material`], but also returns the raw PEM bytes so the
-/// manager/control reconnect path can swap in rotated material without a
-/// second disk read. Validation happens once against the staged bytes; on
-/// success both the parsed `Certs` and the raw bytes are known good and
-/// may be published together.
-///
-/// # Errors
-///
-/// Returns the same errors as [`load_tls_material`].
 pub(crate) fn load_tls_material_with_bytes(args: &CmdLineArgs) -> Result<(Certs, TlsBytes)> {
     let (cert_pem, key_pem, ca_certs_pem) = read_cert_pems(args)?;
     let certs = Certs::try_new(
@@ -388,13 +379,13 @@ mod tests {
             vec![ca_path.to_str().expect("utf-8 ca path").to_string()],
         );
 
-        let certs = load_tls_material(&args).expect("load certs from disk");
+        let (certs, _raw_tls) = load_tls_material_with_bytes(&args).expect("load certs from disk");
         assert!(!certs.certs.is_empty());
         assert!(!certs.ca_certs.is_empty());
     }
 
     fn expect_load_err(args: &CmdLineArgs) -> anyhow::Error {
-        match load_tls_material(args) {
+        match load_tls_material_with_bytes(args) {
             Ok(_) => panic!("expected TLS reload to fail"),
             Err(e) => e,
         }
@@ -570,7 +561,7 @@ mod tests {
     /// last-known-good `Certs` value and must not propagate an error.
     #[test]
     fn failed_reload_preserves_last_known_good_certs() {
-        let good = load_tls_material(&args_with_paths(
+        let (good, _raw_tls) = load_tls_material_with_bytes(&args_with_paths(
             "tests/cert.pem",
             "tests/key.pem",
             vec!["tests/ca_cert.pem".to_string()],
@@ -586,7 +577,7 @@ mod tests {
 
         // Simulate the main-loop reload branch: on failure, keep `good`.
         let mut current = good;
-        if let Ok(new_certs) = load_tls_material(&args) {
+        if let Ok((new_certs, _raw_tls)) = load_tls_material_with_bytes(&args) {
             current = new_certs;
         }
 
@@ -616,7 +607,8 @@ mod tests {
 
         // Initial load succeeds; validated material also drives a real
         // endpoint the way `subscribe::Client::new` would.
-        let current = load_tls_material(&args).expect("initial load succeeds");
+        let (current, _raw_tls) =
+            load_tls_material_with_bytes(&args).expect("initial load succeeds");
         let initial_leaf_count = current.certs.len();
         client::config(&current)
             .expect("initial certs build an endpoint")
@@ -629,7 +621,7 @@ mod tests {
 
         // Reload attempt must fail and the caller must keep the previous
         // certs (mirroring the main-loop reload branch).
-        match load_tls_material(&args) {
+        match load_tls_material_with_bytes(&args) {
             Ok(_) => panic!("mismatched material must not be accepted by the loader"),
             Err(e) => {
                 assert!(
@@ -649,7 +641,8 @@ mod tests {
         // A subsequent valid rotation (write a fresh but matching pair)
         // swaps the material cleanly.
         std::fs::write(&key_path, &key_pem).expect("restore matching key");
-        let refreshed = load_tls_material(&args).expect("valid rotation loads");
+        let (refreshed, _raw_tls) =
+            load_tls_material_with_bytes(&args).expect("valid rotation loads");
         assert_eq!(refreshed.certs.len(), initial_leaf_count);
     }
 
