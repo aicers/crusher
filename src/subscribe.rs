@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
 
-pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.27.0";
+pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.28.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 
