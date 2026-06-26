@@ -5,7 +5,7 @@
 <!-- markdownlint-disable MD013 -->
 | Configuration | Description | Default |
 | --- | --- | --- |
-| giganto_name | Giganto server name (used as the TLS server name) | - |
+| giganto_name | Giganto server name (used as the TLS server name; required) | - |
 | giganto_ingest_srv_addr | Address of the server to which aggregated data is sent | - |
 | giganto_publish_srv_addr | Address of the server from which event data is received | - |
 | last_timestamp_data | File path for storing the last processed timestamp (required) | - |

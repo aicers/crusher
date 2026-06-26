@@ -275,11 +275,10 @@ async fn run(
         .context("Failed to initialize last timestamp data file")?;
     read_last_timestamp(&settings.last_timestamp_data).await?;
 
-    let giganto_name = settings.resolve_giganto_name()?;
     let subscribe_client = subscribe::Client::new(
         settings.giganto_ingest_srv_addr,
         settings.giganto_publish_srv_addr,
-        giganto_name,
+        settings.giganto_name,
         settings.last_timestamp_data,
         certs,
         request_recv,
@@ -526,6 +525,92 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), tls_reload.notified())
             .await
             .expect("stored permit must wake the next waiter");
+    }
+
+    /// Exercises the local-config path in `run()` so `settings.giganto_name`
+    /// is passed through to `subscribe::Client::new`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_local_config_uses_giganto_name_from_settings() {
+        use std::io::Write;
+
+        use tempfile::Builder;
+
+        let dir = tempdir().expect("tempdir");
+        let timestamp_path = dir.path().join("timestamp.dat");
+        let config = format!(
+            r#"
+giganto_name = "test-giganto-host"
+giganto_ingest_srv_addr = "127.0.0.1:38370"
+giganto_publish_srv_addr = "127.0.0.1:38371"
+last_timestamp_data = "{}"
+"#,
+            timestamp_path.display()
+        );
+
+        let mut config_file = Builder::new()
+            .suffix(".toml")
+            .tempfile_in(dir.path())
+            .expect("config file");
+        config_file
+            .write_all(config.as_bytes())
+            .expect("write config body");
+
+        let (certs, tls_bytes) = load_tls_material_with_bytes(&args_with_paths(
+            "tests/cert.pem",
+            "tests/key.pem",
+            vec!["tests/ca_cert.pem".to_string()],
+        ))
+        .expect("load certs");
+
+        let manager_tls = SharedTlsBytes::new(tls_bytes);
+        let (request_send, request_recv) =
+            async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
+        let config_reload = Arc::new(Notify::new());
+        let tls_reload = Arc::new(Notify::new());
+        let request_client = request::Client::new(
+            "127.0.0.1:38390".parse().expect("valid manager address"),
+            "manager".to_string(),
+            request_send,
+            manager_tls,
+            config_reload.clone(),
+        );
+
+        let mut args = args_with_paths(
+            "tests/cert.pem",
+            "tests/key.pem",
+            vec!["tests/ca_cert.pem".to_string()],
+        );
+        args.config = Some(
+            config_file
+                .path()
+                .to_str()
+                .expect("utf-8 config path")
+                .to_string(),
+        );
+
+        let mut guard = None;
+        let tls_reload_for_test = tls_reload.clone();
+        let run_future = run(
+            &args,
+            &certs,
+            request_client,
+            request_recv,
+            config_reload,
+            tls_reload,
+            &mut guard,
+        );
+        tokio::pin!(run_future);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tls_reload_for_test.notify_one();
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run_future)
+            .await
+            .expect("run should complete within timeout")
+            .expect("run should return");
+        assert_eq!(result, RerunReason::TlsReload);
     }
 
     /// Verifies that the `run()` select converges on a rerun boundary when

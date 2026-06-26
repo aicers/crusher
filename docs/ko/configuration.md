@@ -4,7 +4,7 @@
 
 | 설정 항목 | 설명 | 기본값 |
 | --- | --- | --- |
-| giganto_name | Giganto 서버 이름. TLS 연결 시 서버 이름으로 사용 | - |
+| giganto_name | Giganto 서버 이름. TLS 연결 시 서버 이름으로 사용 (필수) | - |
 | giganto_ingest_srv_addr | 집계 결과를 전송할 서버 주소 | - |
 | giganto_publish_srv_addr | 이벤트 데이터를 받아올 서버 주소 | - |
 | last_timestamp_data | 마지막 전송 시각 저장 파일 경로 (필수) | - |
