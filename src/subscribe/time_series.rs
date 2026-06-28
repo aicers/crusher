@@ -237,10 +237,8 @@ pub(super) async fn write_last_timestamp(
                         Ok(Err(_)) | Err(_) => break,
                     }
                 }
-                atomic_write_timestamp_file(
-                    &last_series_time_path,
-                    &*LAST_TRANSFER_TIME.read().await,
-                )?;
+                let snapshot = LAST_TRANSFER_TIME.write().await.clone();
+                atomic_write_timestamp_file(&last_series_time_path, &snapshot)?;
                 tracing::info!("write_last_timestamp flushed and shutting down");
                 return Ok(());
             }
@@ -248,12 +246,8 @@ pub(super) async fn write_last_timestamp(
         };
         match item {
             Ok(cmd) => {
-                let changed = apply_command(cmd, &mut tombstones).await;
-                if changed {
-                    atomic_write_timestamp_file(
-                        &last_series_time_path,
-                        &*LAST_TRANSFER_TIME.read().await,
-                    )?;
+                if let Some(snapshot) = apply_command(cmd, &mut tombstones).await {
+                    atomic_write_timestamp_file(&last_series_time_path, &snapshot)?;
                 }
             }
             Err(_) => break,
@@ -263,24 +257,31 @@ pub(super) async fn write_last_timestamp(
 }
 
 /// Applies a single [`TimestampCommand`] to in-memory state. Returns
-/// `true` when the on-disk representation needs to be rewritten.
-async fn apply_command(cmd: TimestampCommand, tombstones: &mut HashSet<String>) -> bool {
+/// a snapshot of the map when the on-disk representation needs to be
+/// rewritten. The snapshot is taken while holding the write lock so
+/// concurrent `read_last_timestamp` calls cannot observe a torn map.
+async fn apply_command(
+    cmd: TimestampCommand,
+    tombstones: &mut HashSet<String>,
+) -> Option<HashMap<String, i64>> {
     match cmd {
         TimestampCommand::Write { id, timestamp } => {
             if tombstones.contains(&id) {
-                return false;
+                return None;
             }
-            LAST_TRANSFER_TIME.write().await.insert(id, timestamp);
-            true
+            let mut map = LAST_TRANSFER_TIME.write().await;
+            map.insert(id, timestamp);
+            Some(map.clone())
         }
         TimestampCommand::Delete { id } => {
             let id_str = id.to_string();
             tombstones.insert(id_str.clone());
-            LAST_TRANSFER_TIME.write().await.remove(&id_str).is_some()
+            let mut map = LAST_TRANSFER_TIME.write().await;
+            map.remove(&id_str).is_some().then(|| map.clone())
         }
         TimestampCommand::Reset { id } => {
             tombstones.remove(&id.to_string());
-            false
+            None
         }
     }
 }
