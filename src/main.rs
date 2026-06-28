@@ -767,6 +767,7 @@ last_timestamp_data = "{}"
 
     /// Exercises the local-config path in `run()` so `settings.giganto_name`
     /// is passed through to `subscribe::Client::new`.
+    #[serial]
     #[tokio::test(flavor = "current_thread")]
     async fn run_local_config_uses_giganto_name_from_settings() {
         use std::io::Write;
@@ -850,7 +851,7 @@ last_timestamp_data = "{}"
             .await
             .expect("run should complete within timeout")
             .expect("run should return");
-        assert_eq!(result, RerunReason::TlsReload);
+        assert_eq!(result, RunExitReason::TlsReload);
     }
 
     /// Verifies that SIGINT is delivered as a graceful-shutdown
