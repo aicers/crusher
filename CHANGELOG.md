@@ -10,6 +10,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Made `giganto_name` required and removed the fallback that used the Giganto
   address IP as the TLS server name.
+- Made the docs-theme source selector explicit in `docs/theme.toml`: use
+  `version` for releases or `rev` for pre-release testing, but not both.
+  `scripts/fetch-theme.sh` now requires exactly one active selector.
 
 ### Added
 
