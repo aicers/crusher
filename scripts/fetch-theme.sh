@@ -72,7 +72,7 @@ fi
 if [[ -n "$REV_ACTIVE" ]]; then
   REV="$(
     echo "$REV_ACTIVE" \
-      | sed -E 's/^[[:space:]]*rev[[:space:]]*=[[:space:]]*"?([^"]+)"?.*/\1/' \
+      | sed -E 's/^[[:space:]]*rev[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/' \
       | head -1
   )"
   REV="${REV//[[:space:]]/}"
@@ -84,9 +84,10 @@ if [[ -n "$REV_ACTIVE" ]]; then
 else
   VERSION="$(
     echo "$VERSION_ACTIVE" \
-      | sed -E 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"?([^"]+)"?.*/\1/' \
+      | sed -E 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/' \
       | head -1
   )"
+  VERSION="${VERSION//[[:space:]]/}"
   REV=""
   if [[ -z "$VERSION" ]]; then
     echo "Error: version must be a non-empty string when active in docs/theme.toml" >&2
