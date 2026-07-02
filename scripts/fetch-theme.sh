@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Fetch a docs-theme release (or an unreleased commit) and install it into
 # docs/.theme.
-# Reads docs/theme.toml for repo, template, version, and optional rev.
+# Reads docs/theme.toml for repo, template, and exactly one source selector:
+# version (released docs-theme) or rev (pre-release commit SHA for testing).
 # Skips the download when the installed metadata already matches.
 #
-# When rev is set in docs/theme.toml, the script downloads that commit SHA via
-# gh api for local/pre-release testing. Keep the rev comment on its own line
-# in theme.toml (see the example there).
-# When rev is unset, the script downloads the release identified by version.
+# version and rev are mutually exclusive — docs/theme.toml must activate
+# exactly one. Use version for releases; comment out version and set rev only
+# when testing an unreleased commit (see the commented example in theme.toml).
+#
+# When rev is active, the script downloads that commit SHA via gh api.
+# When version is active, the script downloads the release identified by
+# version.
 #
 # Requirements: gh (GitHub CLI), tar
 set -euo pipefail
@@ -27,24 +31,66 @@ read_toml() {
   grep "^${1} " "$CONFIG" | sed 's/.*= *"\(.*\)"/\1/'
 }
 
-read_toml_optional() {
-  grep "^${1} " "$CONFIG" | sed 's/.*= *"\(.*\)"/\1/' || true
-}
+# Active source selectors: uncommented version= or rev= lines only.
+VERSION_ACTIVE=$(
+  grep -E '^[[:space:]]*version[[:space:]]*=' "$CONFIG" \
+    | grep -Ev '^[[:space:]]*#' || true
+)
+REV_ACTIVE=$(
+  grep -E '^[[:space:]]*rev[[:space:]]*=' "$CONFIG" \
+    | grep -Ev '^[[:space:]]*#' || true
+)
 
-REPO="$(read_toml repo)"
-TEMPLATE="$(read_toml template)"
-VERSION="$(read_toml version)"
-REV="$(read_toml_optional rev)"
+VERSION_COUNT=0
+REV_COUNT=0
+[[ -n "$VERSION_ACTIVE" ]] && VERSION_COUNT=1
+[[ -n "$REV_ACTIVE" ]] && REV_COUNT=1
+SELECTOR_COUNT=$((VERSION_COUNT + REV_COUNT))
 
-if [[ -z "$REPO" || -z "$TEMPLATE" || -z "$VERSION" ]]; then
-  echo "Error: docs/theme.toml must define repo, template, and version" >&2
+if [[ "$SELECTOR_COUNT" -ne 1 ]]; then
+  cat >&2 <<EOF
+Error: docs/theme.toml must have exactly one active source selector: either 'version' (for released docs-theme) or 'rev' (for pre-release testing). Found $SELECTOR_COUNT active selectors.
+
+Expected default config:
+
+  repo = "aicers/docs-theme"
+  template = "manual"
+  version = "0.1.0"
+  # rev = "COMMIT_SHA"  # use instead of version for pre-release testing
+EOF
   exit 1
 fi
 
-if [[ -n "$REV" ]]; then
+REPO="$(read_toml repo)"
+TEMPLATE="$(read_toml template)"
+
+if [[ -z "$REPO" || -z "$TEMPLATE" ]]; then
+  echo "Error: docs/theme.toml must define repo and template" >&2
+  exit 1
+fi
+
+if [[ -n "$REV_ACTIVE" ]]; then
+  REV="$(
+    echo "$REV_ACTIVE" \
+      | sed -E 's/^[[:space:]]*rev[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/' \
+      | head -1
+  )"
   REV="${REV//[[:space:]]/}"
   if [[ -z "$REV" ]]; then
-    echo "Error: rev must be a non-empty string when set in docs/theme.toml" >&2
+    echo "Error: rev must be a non-empty string when active in docs/theme.toml" >&2
+    exit 1
+  fi
+  VERSION=""
+else
+  VERSION="$(
+    echo "$VERSION_ACTIVE" \
+      | sed -E 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/' \
+      | head -1
+  )"
+  VERSION="${VERSION//[[:space:]]/}"
+  REV=""
+  if [[ -z "$VERSION" ]]; then
+    echo "Error: version must be a non-empty string when active in docs/theme.toml" >&2
     exit 1
   fi
 fi
