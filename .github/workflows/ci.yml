@@ -44,7 +44,12 @@ jobs:
 
   check:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    # Fail closed. A bare `docs_only != 'true'` lets a *failing* `changes` job
+    # skip its dependants, and GitHub counts a skipped required check as a
+    # pass -- so a broken filter would wave an untested change through.
+    # `!cancelled()` runs the job whenever the filter did not positively
+    # report docs-only, a failed filter included.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Install Rust
@@ -58,6 +63,16 @@ jobs:
         run: cargo clippy --tests -- -D warnings
       - name: Detect Cargo.lock changes
         run: git diff-index --quiet HEAD --
+
+  # Ungated, deliberately. This used to be the last step of `check`, which is
+  # gated on the path filter -- so a docs-only change skipped `check` and took
+  # the Markdown lint down with it. The one change that most needs this lint
+  # was the one change that did not get it.
+  markdown:
+    name: Markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
       - name: markdownlint
         uses: DavidAnson/markdownlint-cli2-action@v23
         with:
@@ -65,7 +80,12 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    # Fail closed. A bare `docs_only != 'true'` lets a *failing* `changes` job
+    # skip its dependants, and GitHub counts a skipped required check as a
+    # pass -- so a broken filter would wave an untested change through.
+    # `!cancelled()` runs the job whenever the filter did not positively
+    # report docs-only, a failed filter included.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
