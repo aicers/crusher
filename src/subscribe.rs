@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_channel::{Receiver, Sender};
 use giganto_client::{
     RawEventKind,
@@ -31,18 +31,21 @@ use time_series::{
 };
 use tokio::{
     sync::{Notify, RwLock, oneshot},
-    time::{Duration, sleep},
+    time::{Duration, sleep, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::cancellation::CancellationCoordinator;
+#[cfg(test)]
+use crate::cancellation::SHUTDOWN_TIMEOUT as SHUTDOWN_DRAIN_TIMEOUT;
 use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
 use crate::policy::PolicyHandle;
 
 pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.28.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
+const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// A request sent to the `SendStream` actor task. The actor owns the
 /// `SendStream` so no lock is needed across an await point.
@@ -150,6 +153,9 @@ impl Client {
         })
     }
 
+    // Keeps the shutdown stages together so resource ownership and endpoint
+    // close ordering remain explicit.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn run(
         self,
         policy_handle: PolicyHandle,
@@ -163,15 +169,14 @@ impl Client {
         // policies from resurrecting timestamps.
         let (time_sender, time_receiver) =
             async_channel::bounded::<TimestampCommand>(LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE);
-        coordinator.tracker().spawn(write_last_timestamp(
+        let mut writer_handle = coordinator.tracker().spawn(write_last_timestamp(
             self.last_series_time_path.clone(),
             time_receiver,
-            coordinator.clone(),
         ));
 
         let connection_notify = Arc::new(Notify::new());
-        tokio::select! {
-            Err(e) = async {tokio::try_join!(
+        let mut connection_controls = Box::pin(async {
+            tokio::try_join!(
                 ingest_connection_control(
                     receiver,
                     self.ingest_addr,
@@ -195,16 +200,117 @@ impl Client {
                     connection_notify.clone(),
                     coordinator.clone(),
                 )
-            )} => {
-                self.endpoint.close(0u32.into(), &[]);
-                bail!("Data store's connection error occurred: {e}");
-            }
+            )
+        });
+
+        let mut controls_completed = false;
+        let mut writer_completed = false;
+        let mut result = tokio::select! {
+            biased;
             () = coordinator.cancelled() => {
-                info!("Closing the connection to data store endpoint");
-                self.endpoint.close(0u32.into(), &[]);
                 Ok(())
             }
+            controls = &mut connection_controls => {
+                controls_completed = true;
+                coordinator.request_cancellation("data store connection control exit");
+                match controls {
+                    Ok(_) => Err(anyhow::anyhow!(
+                        "Data store connection controls ended unexpectedly"
+                    )),
+                    Err(e) => Err(e).context("Data store's connection error occurred"),
+                }
+            }
+            writer = &mut writer_handle => {
+                writer_completed = true;
+                coordinator.request_cancellation("timestamp writer exit");
+                match writer {
+                    Ok(Ok(())) => Err(anyhow::anyhow!(
+                        "timestamp writer ended unexpectedly"
+                    )),
+                    Ok(Err(e)) => Err(e).context("timestamp writer failed"),
+                    Err(e) => Err(anyhow::anyhow!("timestamp writer task panicked: {e}")),
+                }
+            }
+        };
+
+        let shutdown_deadline = coordinator
+            .shutdown_deadline()
+            .context("shutdown deadline was not initialized")?;
+        let graceful_deadline = shutdown_deadline
+            .checked_sub(FORCED_DRAIN_GRACE)
+            .expect("forced drain grace is shorter than the shutdown timeout");
+
+        if !controls_completed {
+            let controls_result = timeout_at(graceful_deadline, connection_controls.as_mut()).await;
+            match controls_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    if result.is_ok() {
+                        result =
+                            Err(e).context("Data store connection control failed during shutdown");
+                    } else {
+                        warn!("Data store connection control also failed during shutdown: {e:#}");
+                    }
+                }
+                Err(_) => {
+                    warn!("Timed out while stopping data store connection controls");
+                }
+            }
         }
+        // Dropping a timed-out control future cancels both control loops
+        // and releases their remaining channel endpoints.
+        drop(connection_controls);
+
+        // Drop the final producer owned by this supervisor. The writer
+        // exits only after ACK receivers have dropped their clones and
+        // all queued timestamp commands have been persisted.
+        drop(time_sender);
+
+        let mut drained = coordinator.wait_for_drain_until(graceful_deadline).await;
+
+        let mut endpoint_closed = false;
+        if !drained {
+            warn!(
+                "Graceful data store drain timed out; closing the endpoint to release ACK receivers"
+            );
+            self.endpoint.close(0u32.into(), &[]);
+            endpoint_closed = true;
+
+            drained = coordinator.wait_for_drain_until(shutdown_deadline).await;
+            if !drained {
+                warn!("Forced data store and timestamp drain timed out");
+                if result.is_ok() {
+                    result = Err(anyhow::anyhow!(
+                        "Timed out while draining data store and timestamp tasks"
+                    ));
+                }
+            }
+        }
+
+        if drained && endpoint_closed {
+            info!("Forced data store drain completed within the shutdown deadline");
+        }
+
+        // A successful graceful or forced drain proves that the tracked
+        // writer has completed, so collecting its JoinHandle result cannot
+        // block.
+        if drained && !writer_completed {
+            let writer_result = match writer_handle.await {
+                Ok(result) => result.context("timestamp writer failed"),
+                Err(e) => Err(anyhow::anyhow!("timestamp writer task panicked: {e}")),
+            };
+            if let Err(e) = writer_result
+                && result.is_ok()
+            {
+                result = Err(e);
+            }
+        }
+
+        if !endpoint_closed {
+            info!("Closing the connection to data store endpoint");
+            self.endpoint.close(0u32.into(), &[]);
+        }
+        result
     }
 }
 
@@ -222,7 +328,12 @@ async fn ingest_connection_control(
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = connection_notify.clone();
-        match ingest_connect(endpoint, server_addr, server_name, version).await {
+        let connect_result = tokio::select! {
+            biased;
+            () = coordinator.cancelled() => return Ok(()),
+            result = ingest_connect(endpoint, server_addr, server_name, version) => result,
+        };
+        match connect_result {
             Ok(conn) => {
                 let arc_conn = Arc::new(conn);
 
@@ -230,6 +341,21 @@ async fn ingest_connection_control(
                     tokio::select! {
                         biased;
                         () = coordinator.cancelled() => {
+                            // Producers observe the same cancellation and
+                            // drop their senders. Keep receiving until the
+                            // outer queue closes so a series already queued
+                            // at the shutdown boundary is still handed to an
+                            // ingest worker.
+                            while let Ok(series) = series_recv.recv().await {
+                                spawn_time_series_sender(
+                                    &coordinator,
+                                    arc_conn.clone(),
+                                    series,
+                                    CancellationToken::new(),
+                                    time_sender.clone(),
+                                    connection_notify.clone(),
+                                );
+                            }
                             return Ok(());
                         }
                         () = connection_notify.notified() => {
@@ -254,14 +380,14 @@ async fn ingest_connection_control(
                                 continue;
                             };
                             let connection = arc_conn.clone();
-                            coordinator.tracker().spawn(send_time_series(
+                            spawn_time_series_sender(
+                                &coordinator,
                                 connection,
                                 series,
                                 policy_token,
                                 time_sender.clone(),
                                 connection_notify.clone(),
-                                coordinator.clone(),
-                            ));
+                            );
                         }
                     }
                 }
@@ -337,7 +463,12 @@ async fn publish_connection_control(
 ) -> Result<()> {
     'connection: loop {
         let connection_notify = connection_notify.clone();
-        match publish_connect(endpoint, server_addr, server_name, version).await {
+        let connect_result = tokio::select! {
+            biased;
+            () = coordinator.cancelled() => return Ok(()),
+            result = publish_connect(endpoint, server_addr, server_name, version) => result,
+        };
+        match connect_result {
             Ok((conn, mut send)) => {
                 // Spawn an actor task that owns the SendStream.
                 // Callers send payloads through the channel, avoiding
@@ -385,7 +516,9 @@ async fn publish_connection_control(
                         if !opened_policy_ids.insert(policy.id) {
                             continue;
                         }
-                        if let Err(e) = process_network_stream(policy, stream_tx.clone()).await {
+                        if let Err(e) =
+                            process_network_stream(policy, stream_tx.clone(), &coordinator).await
+                        {
                             dispatcher_handle.abort();
                             if let Some(action) = classify_stream_error(&e) {
                                 match action {
@@ -408,7 +541,9 @@ async fn publish_connection_control(
                         if !opened_policy_ids.insert(policy.id) {
                             continue;
                         }
-                        if let Err(e) = process_network_stream(policy, stream_tx.clone()).await {
+                        if let Err(e) =
+                            process_network_stream(policy, stream_tx.clone(), &coordinator).await
+                        {
                             dispatcher_handle.abort();
                             if let Some(action) = classify_stream_error(&e) {
                                 match action {
@@ -424,6 +559,10 @@ async fn publish_connection_control(
                 }
                 loop {
                     tokio::select! {
+                        biased;
+                        () = coordinator.cancelled() => {
+                            return Ok(());
+                        }
                         () = connection_notify.notified() => {
                             drop(connection_notify);
                             dispatcher_handle.abort();
@@ -454,7 +593,12 @@ async fn publish_connection_control(
                         }
                         Ok(policy) = request_recv.recv() => {
                             info!("Stream's policy : {:?}", policy);
-                            if let Err(e) = process_network_stream(policy, stream_tx.clone()).await
+                            if let Err(e) = process_network_stream(
+                                policy,
+                                stream_tx.clone(),
+                                &coordinator,
+                            )
+                            .await
                             {
                                 dispatcher_handle.abort();
                                 if let Some(action) = classify_stream_error(&e) {
@@ -536,6 +680,7 @@ async fn publish_connect(
 async fn process_network_stream(
     policy: SamplingPolicy,
     stream_tx: tokio::sync::mpsc::Sender<StreamSendRequest>,
+    coordinator: &CancellationCoordinator,
 ) -> Result<()> {
     let start_timestamp_nanos = policy.start_timestamp_nanos().await?;
     let req_msg = RequestTimeSeriesGeneratorStream {
@@ -552,13 +697,20 @@ async fn process_network_stream(
     // Send the payload to the actor task that owns the SendStream.
     // This avoids holding any lock across an await point.
     let (reply_tx, reply_rx) = oneshot::channel();
-    stream_tx
-        .send((payload, reply_tx))
-        .await
-        .map_err(|_| anyhow::anyhow!("SendStream actor closed"))?;
-    reply_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("SendStream actor dropped reply"))??;
+    tokio::select! {
+        biased;
+        () = coordinator.cancelled() => return Ok(()),
+        result = stream_tx.send((payload, reply_tx)) => {
+            result.map_err(|_| anyhow::anyhow!("SendStream actor closed"))?;
+        }
+    }
+    tokio::select! {
+        biased;
+        () = coordinator.cancelled() => return Ok(()),
+        result = reply_rx => {
+            result.map_err(|_| anyhow::anyhow!("SendStream actor dropped reply"))??;
+        }
+    }
     Ok(())
 }
 
@@ -616,8 +768,13 @@ async fn run_inbound_dispatcher(
         let sender = sender.clone();
         let time_sender = time_sender.clone();
         let coord = coordinator.clone();
+        let policy_id = policy.id;
         coordinator.tracker().spawn(async move {
-            run_stream_worker(recv, sender, policy, policy_token, time_sender, coord).await
+            if let Err(e) =
+                run_stream_worker(recv, sender, policy, policy_token, time_sender, coord).await
+            {
+                warn!(policy_id, "Stream worker failed: {e:#}");
+            }
         });
     }
 }
@@ -649,7 +806,10 @@ async fn run_stream_worker(
     // the same live publish connection. The writer actor carries a
     // tombstone for deleted ids to reject late ACKs; we clear that
     // tombstone here so fresh Writes on this new stream are accepted.
-    let _ = time_sender.send(TimestampCommand::Reset { id }).await;
+    time_sender
+        .send(TimestampCommand::Reset { id })
+        .await
+        .context("timestamp writer closed while resetting a policy")?;
 
     let mut series = TimeSeries::try_new(&policy).await?;
 
@@ -666,7 +826,10 @@ async fn run_stream_worker(
                 // Route the delete through the writer actor so it remains
                 // the single owner of timestamp-file writes and can set
                 // a tombstone that blocks any late ACKs already in flight.
-                let _ = time_sender.send(TimestampCommand::Delete { id }).await;
+                time_sender
+                    .send(TimestampCommand::Delete { id })
+                    .await
+                    .context("timestamp writer closed while deleting a policy")?;
                 break;
             }
             result = receive_time_series_generator_data(&mut recv) => {
@@ -722,6 +885,35 @@ async fn policy_token_for_series(
         .map(|(_, token)| token)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_time_series_sender(
+    coordinator: &CancellationCoordinator,
+    connection: Arc<Connection>,
+    series: TimeSeries,
+    policy_token: CancellationToken,
+    time_sender: Sender<TimestampCommand>,
+    connection_notify: Arc<Notify>,
+) {
+    let sampling_policy_id = series.sampling_policy_id.clone();
+    let error_notify = connection_notify.clone();
+    let task_coordinator = coordinator.clone();
+    coordinator.tracker().spawn(async move {
+        if let Err(e) = send_time_series(
+            connection,
+            series,
+            policy_token,
+            time_sender,
+            connection_notify,
+            task_coordinator,
+        )
+        .await
+        {
+            warn!(%sampling_policy_id, "Time-series sender failed: {e:#}");
+            error_notify.notify_waiters();
+        }
+    });
+}
+
 async fn send_time_series(
     connection: Arc<Connection>,
     series: TimeSeries,
@@ -749,12 +941,7 @@ async fn send_time_series(
         // First data transmission (record type + series data)
         send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
 
-        let serde_series = bincode::serialize(&series)?;
-        let timestamp_nanos = series
-            .start_secs
-            .checked_mul(SECOND_TO_NANO)
-            .unwrap_or(i64::MAX);
-        send_event_in_batch(&mut series_sender, &[(timestamp_nanos, serde_series)]).await?;
+        send_time_series_record(&mut series_sender, &series).await?;
 
         // Receive start time of giganto last saved time series.
         coordinator.tracker().spawn(receive_time_series_timestamp(
@@ -763,7 +950,6 @@ async fn send_time_series(
             policy_token.clone(),
             time_sender,
             connection_notify,
-            coordinator.clone(),
         ));
 
         // Data transmission after the first time (only series data).
@@ -775,7 +961,13 @@ async fn send_time_series(
             tokio::select! {
                 biased;
                 () = coordinator.cancelled() => {
-                    info!("send_time_series shutting down");
+                    // Stop accepting new work, then transmit everything
+                    // that was already accepted into this policy's queue.
+                    send_channel_token.close();
+                    while let Ok(series) = recv_channel.recv().await {
+                        send_time_series_record(&mut series_sender, &series).await?;
+                    }
+                    info!("send_time_series drained and shutting down");
                     break;
                 }
                 () = policy_token.cancelled() => {
@@ -788,22 +980,16 @@ async fn send_time_series(
                 result = recv_channel.recv() => {
                     match result {
                         Ok(series) => {
-                            let serde_series = bincode::serialize(&series)?;
-                            let timestamp_nanos = series
-                                .start_secs
-                                .checked_mul(SECOND_TO_NANO)
-                                .unwrap_or(i64::MAX);
-                            send_event_in_batch(
-                                &mut series_sender,
-                                &[(timestamp_nanos, serde_series)],
-                            )
-                            .await?;
+                            send_time_series_record(&mut series_sender, &series).await?;
                         }
                         Err(_) => break,
                     }
                 }
             }
         }
+        series_sender
+            .finish()
+            .context("Failed to finish the time series send stream")?;
         Ok(())
     }
     .await;
@@ -824,15 +1010,23 @@ async fn send_time_series(
     result
 }
 
+async fn send_time_series_record(
+    series_sender: &mut SendStream,
+    series: &TimeSeries,
+) -> Result<()> {
+    let serde_series = bincode::serialize(series)?;
+    let timestamp_nanos = series
+        .start_secs
+        .checked_mul(SECOND_TO_NANO)
+        .unwrap_or(i64::MAX);
+    send_event_in_batch(series_sender, &[(timestamp_nanos, serde_series)]).await
+}
+
 async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -> Result<()> {
     let buf = bincode::serialize(&events)?;
     send_raw(send, &buf).await?;
     Ok(())
 }
-
-/// Short grace period for draining remaining ACK/timestamp messages
-/// after cancellation is signalled, so near-shutdown arrivals are not lost.
-const ACK_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 async fn receive_time_series_timestamp(
     mut series_receiver: RecvStream,
@@ -840,8 +1034,7 @@ async fn receive_time_series_timestamp(
     policy_token: CancellationToken,
     time_sender: Sender<TimestampCommand>,
     connection_notify: Arc<Notify>,
-    coordinator: CancellationCoordinator,
-) -> Result<()> {
+) {
     loop {
         let result = tokio::select! {
             biased;
@@ -856,50 +1049,26 @@ async fn receive_time_series_timestamp(
                     %sampling_policy_id,
                     "receive_time_series_timestamp stopping; policy deleted"
                 );
-                return Ok(());
-            }
-            () = coordinator.cancelled() => {
-                info!(
-                    %sampling_policy_id,
-                    "receive_time_series_timestamp draining"
-                );
-                let drain_deadline =
-                    tokio::time::Instant::now() + ACK_DRAIN_TIMEOUT;
-                loop {
-                    let remaining = drain_deadline
-                        .saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    match tokio::time::timeout(
-                        remaining,
-                        receive_ack_timestamp(&mut series_receiver),
-                    )
-                    .await
-                    {
-                        Ok(Ok(ts)) => {
-                            let _ = time_sender
-                                .send(TimestampCommand::Write {
-                                    id: sampling_policy_id.clone(),
-                                    timestamp: ts,
-                                })
-                                .await;
-                        }
-                        _ => break,
-                    }
-                }
-                return Ok(());
+                return;
             }
             result = receive_ack_timestamp(&mut series_receiver) => result,
         };
         match result {
             Ok(timestamp) => {
-                let _ = time_sender
+                if time_sender
                     .send(TimestampCommand::Write {
                         id: sampling_policy_id.clone(),
                         timestamp,
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        %sampling_policy_id,
+                        "Timestamp writer closed while recording an ACK"
+                    );
+                    return;
+                }
             }
             Err(RecvError::ReadError(quinn::ReadExactError::FinishedEarly(_))) => {
                 break;
@@ -914,5 +1083,4 @@ async fn receive_time_series_timestamp(
             }
         }
     }
-    Ok(())
 }

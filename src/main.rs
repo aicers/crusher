@@ -6,15 +6,15 @@ mod request;
 mod settings;
 mod subscribe;
 
+use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use cancellation::CancellationCoordinator;
+use cancellation::{CancellationCoordinator, CancellationPhase};
 use clap::Parser;
 use client::{Certs, SharedTlsBytes, TlsBytes};
 use logging::init_tracing;
@@ -26,9 +26,103 @@ use tokio::sync::Notify;
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
-
 const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
+
+#[derive(Clone, Copy)]
+enum CompletedTopLevelTask {
+    Subscribe,
+    Request,
+}
+
+type TopLevelTaskResult = std::result::Result<Result<()>, tokio::task::JoinError>;
+
+fn top_level_task_error(task_name: &str, result: TopLevelTaskResult) -> Option<anyhow::Error> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.context(format!("{task_name} task failed"))),
+        Err(e) => Some(anyhow::anyhow!("{task_name} task panicked: {e}")),
+    }
+}
+
+async fn collect_top_level_task_results(
+    subscribe_handle: tokio::task::JoinHandle<Result<()>>,
+    request_handle: tokio::task::JoinHandle<Result<()>>,
+    completed: Option<(CompletedTopLevelTask, TopLevelTaskResult)>,
+) -> (TopLevelTaskResult, TopLevelTaskResult) {
+    match completed {
+        Some((CompletedTopLevelTask::Subscribe, subscribe_result)) => {
+            (subscribe_result, request_handle.await)
+        }
+        Some((CompletedTopLevelTask::Request, request_result)) => {
+            (subscribe_handle.await, request_result)
+        }
+        None => tokio::join!(subscribe_handle, request_handle),
+    }
+}
+
+fn resolve_top_level_result(
+    exit_reason: Option<RunExitReason>,
+    completed: Option<CompletedTopLevelTask>,
+    subscribe_result: TopLevelTaskResult,
+    request_result: TopLevelTaskResult,
+) -> Result<RunExitReason> {
+    let subscribe_error = top_level_task_error("subscribe", subscribe_result);
+    let request_error = top_level_task_error("request", request_result);
+
+    let (primary_error, secondary_error) = match completed {
+        Some(CompletedTopLevelTask::Request) => (request_error, subscribe_error),
+        Some(CompletedTopLevelTask::Subscribe) | None => (subscribe_error, request_error),
+    };
+
+    if let Some(error) = primary_error {
+        if let Some(secondary) = secondary_error {
+            warn!("The sibling top-level task also failed during shutdown: {secondary:#}");
+        }
+        return Err(error);
+    }
+    if let Some(error) = secondary_error {
+        return Err(error);
+    }
+
+    match (exit_reason, completed) {
+        (Some(reason), None) => Ok(reason),
+        (None, Some(CompletedTopLevelTask::Subscribe)) => {
+            Err(anyhow::anyhow!("subscribe task ended unexpectedly"))
+        }
+        (None, Some(CompletedTopLevelTask::Request)) => {
+            Err(anyhow::anyhow!("request task ended unexpectedly"))
+        }
+        _ => Err(anyhow::anyhow!(
+            "top-level task completion state is inconsistent"
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct ShutdownFailure(anyhow::Error);
+
+impl fmt::Display for ShutdownFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "graceful shutdown failed: {:#}", self.0)
+    }
+}
+
+impl std::error::Error for ShutdownFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn mark_shutdown_failure(
+    requested_exit: Option<RunExitReason>,
+    result: Result<RunExitReason>,
+) -> Result<RunExitReason> {
+    if requested_exit == Some(RunExitReason::Shutdown) {
+        result.map_err(|error| anyhow::Error::new(ShutdownFailure(error)))
+    } else {
+        result
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManagerServer {
@@ -225,7 +319,7 @@ pub(crate) fn register_shutdown_signal_handler(shutdown: Arc<Notify>) {
 /// Distinguishes the reasons a successful `run()` returns, so the main loop
 /// can decide whether to refresh the Giganto TLS material before the next
 /// rerun, or to exit the process entirely after a SIGINT/SIGTERM.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunExitReason {
     ConfigReload,
     TlsReload,
@@ -274,7 +368,9 @@ async fn main() -> Result<()> {
             Ok(RunExitReason::TlsReload) => true,
             Ok(RunExitReason::ConfigReload) => false,
             Err(e) => {
-                assert!(args.is_remote_mode(), "{e}");
+                if !args.is_remote_mode() || e.downcast_ref::<ShutdownFailure>().is_some() {
+                    return Err(e);
+                }
                 error_or_eprint!("Main processing encountered an error: {e}");
                 let health_check = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
                     matches!(
@@ -377,59 +473,78 @@ async fn run(
     let mut request_handle =
         tokio::spawn(async move { request_client.run(request_coordinator).await });
 
-    let result: Result<RunExitReason> = tokio::select! {
+    let (exit_reason, completed_task): (
+        Option<RunExitReason>,
+        Option<(CompletedTopLevelTask, TopLevelTaskResult)>,
+    ) = tokio::select! {
         biased;
         res = &mut subscribe_handle => {
             coordinator.request_cancellation("subscribe exit");
-            match res {
-                Ok(Err(e)) => Err(e),
-                Ok(Ok(())) => Err(anyhow::anyhow!("subscribe task ended unexpectedly")),
-                Err(e) => Err(anyhow::anyhow!("subscribe task panicked: {e}")),
-            }
+            (None, Some((CompletedTopLevelTask::Subscribe, res)))
         }
         res = &mut request_handle => {
             coordinator.request_cancellation("request exit");
-            match res {
-                Ok(Err(e)) => Err(e),
-                Ok(Ok(())) => Err(anyhow::anyhow!("request task ended unexpectedly")),
-                Err(e) => Err(anyhow::anyhow!("request task panicked: {e}")),
-            }
+            (None, Some((CompletedTopLevelTask::Request, res)))
         }
         () = config_reload.notified(), if args.is_remote_mode() => {
             coordinator.request_cancellation("config reload");
             info!("Reloading the configuration");
-            Ok(RunExitReason::ConfigReload)
+            (Some(RunExitReason::ConfigReload), None)
         },
         () = tls_reload.notified() => {
             coordinator.request_cancellation("TLS reload");
             info!("Rebuilding the shared Giganto endpoint from reloaded TLS material");
-            Ok(RunExitReason::TlsReload)
+            (Some(RunExitReason::TlsReload), None)
         },
         () = shutdown.notified() => {
             coordinator.request_cancellation("shutdown signal");
             info!("Shutdown signal received; draining tasks");
-            Ok(RunExitReason::Shutdown)
+            (Some(RunExitReason::Shutdown), None)
         },
     };
 
-    // Wait for the remaining top-level task to exit cooperatively
-    // via its `coordinator.cancelled()` check — no hard abort.
-    let _ = tokio::join!(subscribe_handle, request_handle);
+    let completed_task_kind = completed_task.as_ref().map(|(task, _)| *task);
+    let shutdown_deadline = coordinator
+        .shutdown_deadline()
+        .expect("every top-level exit branch requests cancellation before draining tasks");
+    // Wait for the remaining top-level task to exit cooperatively, but do
+    // not let a task that ignores cancellation bypass the shared shutdown
+    // deadline fixed by the first cancellation request.
+    let Ok((subscribe_result, request_result)) = tokio::time::timeout_at(
+        shutdown_deadline,
+        collect_top_level_task_results(subscribe_handle, request_handle, completed_task),
+    )
+    .await
+    else {
+        error!("Top-level task drain timed out; aborting to prevent overlapping generations");
+        std::process::exit(1);
+    };
+    let result = resolve_top_level_result(
+        exit_reason,
+        completed_task_kind,
+        subscribe_result,
+        request_result,
+    );
 
-    // Wait for child/background tasks (tracked by TaskTracker).
-    if !coordinator.wait_for_drain(DRAIN_TIMEOUT).await {
+    // Client::run owns the bounded shared-tracker drain, including the
+    // forced endpoint-close grace period. Do not start another full drain
+    // here: that would double the shutdown bound. An incomplete tracker at
+    // this boundary means cleanup already exhausted its deadline, so fail
+    // the process before another generation can start.
+    let drain_completed = coordinator.phase() == CancellationPhase::Completed
+        && coordinator.tracker().active_count() == 0;
+    if !drain_completed {
         error!(
-            "Drain timed out; aborting to prevent \
+            "Drain incomplete after shutdown deadline; aborting to prevent \
              overlapping generations"
         );
-        clear_ingest_channel().await;
         std::process::exit(1);
     }
 
     // Clear stale senders so no previous-run channels leak into a
     // subsequent run (e.g. after a config-reload restart).
     clear_ingest_channel().await;
-    result
+    mark_shutdown_failure(exit_reason, result)
 }
 
 #[cfg(test)]
@@ -828,7 +943,9 @@ last_timestamp_data = "{}"
         );
 
         let mut guard = None;
-        let tls_reload_for_test = tls_reload.clone();
+        // Preload the notification so this local-settings test does not
+        // depend on whatever process may use the fixed Manager test port.
+        tls_reload.notify_one();
         let run_future = run(
             &args,
             &certs,
@@ -841,11 +958,6 @@ last_timestamp_data = "{}"
             &mut guard,
         );
         tokio::pin!(run_future);
-
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            tls_reload_for_test.notify_one();
-        });
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), run_future)
             .await
@@ -1012,6 +1124,159 @@ last_timestamp_data = "{}"
             .expect("select resolves promptly")
             .expect("task completes");
         assert_eq!(reason, "shutdown");
+    }
+
+    #[tokio::test]
+    async fn subscribe_exit_drains_only_request_task() {
+        let mut subscribe_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        let request_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+
+        let subscribe_result = (&mut subscribe_handle).await;
+
+        let (subscribe_result, request_result) = collect_top_level_task_results(
+            subscribe_handle,
+            request_handle,
+            Some((CompletedTopLevelTask::Subscribe, subscribe_result)),
+        )
+        .await;
+        let error = resolve_top_level_result(
+            None,
+            Some(CompletedTopLevelTask::Subscribe),
+            subscribe_result,
+            request_result,
+        )
+        .expect_err("clean task-triggered completion is unexpected");
+        assert!(
+            error
+                .to_string()
+                .contains("subscribe task ended unexpectedly")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_exit_drains_only_subscribe_task() {
+        let subscribe_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        let mut request_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+
+        let request_result = (&mut request_handle).await;
+
+        let (subscribe_result, request_result) = collect_top_level_task_results(
+            subscribe_handle,
+            request_handle,
+            Some((CompletedTopLevelTask::Request, request_result)),
+        )
+        .await;
+        let error = resolve_top_level_result(
+            None,
+            Some(CompletedTopLevelTask::Request),
+            subscribe_result,
+            request_result,
+        )
+        .expect_err("clean task-triggered completion is unexpected");
+        assert!(
+            error
+                .to_string()
+                .contains("request task ended unexpectedly")
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_propagates_subscribe_error() {
+        let subscribe_handle = tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("timestamp writer failed"))
+        });
+        let request_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+
+        let (subscribe_result, request_result) =
+            collect_top_level_task_results(subscribe_handle, request_handle, None).await;
+        let error = resolve_top_level_result(
+            Some(RunExitReason::Shutdown),
+            None,
+            subscribe_result,
+            request_result,
+        )
+        .expect_err("subscribe error should be propagated");
+
+        assert!(
+            format!("{error:#}").contains("timestamp writer failed"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn shutdown_error_is_marked_as_terminal() {
+        let error = mark_shutdown_failure(
+            Some(RunExitReason::Shutdown),
+            Err(anyhow::anyhow!("timestamp writer failed")),
+        )
+        .expect_err("a shutdown writer error must remain an error");
+
+        assert!(error.downcast_ref::<ShutdownFailure>().is_some());
+        assert!(format!("{error:#}").contains("timestamp writer failed"));
+    }
+
+    #[test]
+    fn runtime_error_is_not_marked_as_shutdown_failure() {
+        let error = mark_shutdown_failure(None, Err(anyhow::anyhow!("manager connection failed")))
+            .expect_err("the runtime error must remain an error");
+
+        assert!(error.downcast_ref::<ShutdownFailure>().is_none());
+        assert!(format!("{error:#}").contains("manager connection failed"));
+    }
+
+    #[tokio::test]
+    async fn request_completion_does_not_hide_subscribe_writer_error() {
+        let subscribe_handle = tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("timestamp writer failed"))
+        });
+        let mut request_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        let request_result = (&mut request_handle).await;
+
+        let (subscribe_result, request_result) = collect_top_level_task_results(
+            subscribe_handle,
+            request_handle,
+            Some((CompletedTopLevelTask::Request, request_result)),
+        )
+        .await;
+        let error = resolve_top_level_result(
+            None,
+            Some(CompletedTopLevelTask::Request),
+            subscribe_result,
+            request_result,
+        )
+        .expect_err("the sibling writer error should win over clean request completion");
+
+        assert!(
+            format!("{error:#}").contains("timestamp writer failed"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_completion_does_not_hide_request_error() {
+        let mut subscribe_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        let request_handle =
+            tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("manager failed")) });
+        let subscribe_result = (&mut subscribe_handle).await;
+
+        let (subscribe_result, request_result) = collect_top_level_task_results(
+            subscribe_handle,
+            request_handle,
+            Some((CompletedTopLevelTask::Subscribe, subscribe_result)),
+        )
+        .await;
+        let error = resolve_top_level_result(
+            None,
+            Some(CompletedTopLevelTask::Subscribe),
+            subscribe_result,
+            request_result,
+        )
+        .expect_err("the sibling request error should win over clean subscribe completion");
+
+        assert!(
+            format!("{error:#}").contains("manager failed"),
+            "unexpected error: {error:#}"
+        );
     }
 
     /// Verifies that `run()` selects the shutdown branch while active, joins

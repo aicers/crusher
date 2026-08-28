@@ -202,57 +202,20 @@ pub(super) enum TimestampCommand {
 pub(super) async fn write_last_timestamp(
     last_series_time_path: PathBuf,
     time_receiver: Receiver<TimestampCommand>,
-    coordinator: crate::cancellation::CancellationCoordinator,
 ) -> Result<()> {
     let mut tombstones: HashSet<String> = HashSet::new();
-    loop {
-        let item = tokio::select! {
-            biased;
-            () = coordinator.cancelled() => {
-                // Drain remaining commands in the channel before exiting
-                // so timestamps are flushed to disk.  Wait for channel
-                // closure (all `receive_time_series_timestamp` senders
-                // dropped after their own drain) with a safety timeout
-                // to guarantee the writer outlasts the ACK receivers.
-                const WRITER_DRAIN_TIMEOUT: tokio::time::Duration =
-                    tokio::time::Duration::from_secs(2);
-                let drain_deadline =
-                    tokio::time::Instant::now() + WRITER_DRAIN_TIMEOUT;
-                loop {
-                    let remaining = drain_deadline
-                        .saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        tracing::warn!(
-                            "write_last_timestamp drain timed out; \
-                             flushing what was collected"
-                        );
-                        break;
-                    }
-                    match tokio::time::timeout(remaining, time_receiver.recv()).await {
-                        Ok(Ok(cmd)) => {
-                            apply_command(cmd, &mut tombstones).await;
-                        }
-                        // Channel closed (all senders dropped) — drain
-                        // complete.  Timeout — safety net exhausted.
-                        Ok(Err(_)) | Err(_) => break,
-                    }
-                }
-                let snapshot = LAST_TRANSFER_TIME.write().await.clone();
-                atomic_write_timestamp_file(&last_series_time_path, &snapshot)?;
-                tracing::info!("write_last_timestamp flushed and shutting down");
-                return Ok(());
-            }
-            result = time_receiver.recv() => result,
-        };
-        match item {
-            Ok(cmd) => {
-                if let Some(snapshot) = apply_command(cmd, &mut tombstones).await {
-                    atomic_write_timestamp_file(&last_series_time_path, &snapshot)?;
-                }
-            }
-            Err(_) => break,
+    while let Ok(cmd) = time_receiver.recv().await {
+        if let Some(snapshot) = apply_command(cmd, &mut tombstones).await {
+            write_timestamp_file(&last_series_time_path, snapshot).await?;
         }
     }
+
+    // Channel closure proves that every timestamp producer and ACK
+    // receiver has finished. Persist one final snapshot before reporting
+    // writer completion to the shutdown supervisor.
+    let snapshot = LAST_TRANSFER_TIME.read().await.clone();
+    write_timestamp_file(&last_series_time_path, snapshot).await?;
+    tracing::info!("write_last_timestamp flushed and shutting down");
     Ok(())
 }
 
@@ -290,6 +253,13 @@ async fn apply_command(
 /// to a temporary file in the same directory, flushing to disk, and
 /// then renaming over the target path. This prevents partial writes
 /// on crash.
+async fn write_timestamp_file(path: &Path, data: HashMap<String, i64>) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || atomic_write_timestamp_file(&path, &data))
+        .await
+        .context("timestamp file writer task panicked")?
+}
+
 fn atomic_write_timestamp_file(path: &Path, data: &HashMap<String, i64>) -> Result<()> {
     use std::io::Write;
 
@@ -690,8 +660,7 @@ mod tests {
         let (sender, receiver) = async_channel::bounded::<TimestampCommand>(10);
 
         // Start the writer task
-        let coord = crate::cancellation::CancellationCoordinator::new();
-        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver, coord));
+        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver));
 
         // Send some timestamps
         sender
@@ -751,9 +720,8 @@ mod tests {
         let (sender, receiver) = async_channel::bounded::<TimestampCommand>(10);
 
         let path_clone = file_path.clone();
-        let coord = crate::cancellation::CancellationCoordinator::new();
         let writer_handle =
-            tokio::spawn(async move { write_last_timestamp(path_clone, receiver, coord).await });
+            tokio::spawn(async move { write_last_timestamp(path_clone, receiver).await });
 
         // Send initial timestamp
         sender
@@ -792,7 +760,7 @@ mod tests {
 
     #[serial]
     #[tokio::test]
-    async fn write_last_timestamp_drain_timeout_flushes_collected_timestamps() {
+    async fn write_last_timestamp_waits_for_channel_close_and_flushes() {
         let dir = tempdir().expect("failed to create temp dir");
         let file_path = dir.path().join("timestamps.json");
         let key = format!(
@@ -805,12 +773,7 @@ mod tests {
         );
 
         let (sender, receiver) = async_channel::bounded::<TimestampCommand>(1);
-        let coord = crate::cancellation::CancellationCoordinator::new();
-        let writer = tokio::spawn(write_last_timestamp(
-            file_path.clone(),
-            receiver,
-            coord.clone(),
-        ));
+        let mut writer = tokio::spawn(write_last_timestamp(file_path.clone(), receiver));
 
         sender
             .send(TimestampCommand::Write {
@@ -821,10 +784,17 @@ mod tests {
             .expect("send collected timestamp");
         tokio::task::yield_now().await;
 
-        coord.request_cancellation("test writer drain timeout");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut writer)
+                .await
+                .is_err(),
+            "writer must remain alive while a timestamp sender exists"
+        );
+
+        drop(sender);
         let result = tokio::time::timeout(std::time::Duration::from_secs(4), writer)
             .await
-            .expect("writer exits after drain timeout")
+            .expect("writer exits after channel closure")
             .expect("writer task should not panic");
         assert!(result.is_ok());
 
@@ -834,7 +804,6 @@ mod tests {
         assert_eq!(persisted.get(&key), Some(&42));
 
         LAST_TRANSFER_TIME.write().await.remove(&key);
-        drop(sender);
     }
 
     #[serial]
@@ -978,8 +947,7 @@ mod tests {
             .insert(key.clone(), 100_i64);
 
         let (sender, receiver) = async_channel::bounded::<TimestampCommand>(10);
-        let coord = crate::cancellation::CancellationCoordinator::new();
-        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver, coord));
+        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver));
 
         // Delete → tombstone + entry removed on disk.
         sender
@@ -2094,8 +2062,7 @@ mod tests {
             // Now write back through the producer task and verify the
             // file's parsed contents preserve those exact integers.
             let (sender, receiver) = async_channel::bounded::<TimestampCommand>(8);
-            let coord = crate::cancellation::CancellationCoordinator::new();
-            let writer = tokio::spawn(write_last_timestamp(path.clone(), receiver, coord));
+            let writer = tokio::spawn(write_last_timestamp(path.clone(), receiver));
             for (id, ts) in [
                 (&k0, TS_EPOCH),
                 (&k1, TS_EPOCH_PLUS_ONE),
@@ -2175,8 +2142,7 @@ mod tests {
             read_last_timestamp(&path).await.expect("read");
 
             let (sender, receiver) = async_channel::bounded::<TimestampCommand>(4);
-            let coord = crate::cancellation::CancellationCoordinator::new();
-            let writer = tokio::spawn(write_last_timestamp(path.clone(), receiver, coord));
+            let writer = tokio::spawn(write_last_timestamp(path.clone(), receiver));
             sender
                 .send(TimestampCommand::Delete { id: 2 })
                 .await
