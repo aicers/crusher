@@ -1,8 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Tracks active child tasks and allows waiting for all of them to
 /// complete during drain.
@@ -49,13 +53,18 @@ pub(crate) enum CancellationPhase {
     Completed,
 }
 
+struct CancellationState {
+    phase: CancellationPhase,
+    shutdown_deadline: Option<Instant>,
+}
+
 /// Coordinates async task cancellation across the application. Owns a
 /// [`CancellationToken`] and a [`TaskTracker`].
 #[derive(Clone)]
 pub(crate) struct CancellationCoordinator {
     token: CancellationToken,
     tracker: TaskTracker,
-    phase: Arc<std::sync::Mutex<CancellationPhase>>,
+    state: Arc<std::sync::Mutex<CancellationState>>,
 }
 
 impl CancellationCoordinator {
@@ -64,7 +73,10 @@ impl CancellationCoordinator {
         Self {
             token: CancellationToken::new(),
             tracker: TaskTracker::new(),
-            phase: Arc::new(std::sync::Mutex::new(CancellationPhase::Running)),
+            state: Arc::new(std::sync::Mutex::new(CancellationState {
+                phase: CancellationPhase::Running,
+                shutdown_deadline: None,
+            })),
         }
     }
 
@@ -73,14 +85,23 @@ impl CancellationCoordinator {
         &self.tracker
     }
 
-    /// Requests cancellation by cancelling the token.
+    /// Requests cancellation and fixes the shared shutdown deadline.
     pub(crate) fn request_cancellation(&self, reason: &str) {
-        let mut phase = self.phase.lock().expect("phase lock poisoned");
-        if *phase == CancellationPhase::Running {
+        let mut state = self.state.lock().expect("cancellation state lock poisoned");
+        if state.phase == CancellationPhase::Running {
             info!(%reason, "Cancellation requested");
-            *phase = CancellationPhase::Draining;
+            state.phase = CancellationPhase::Draining;
+            state.shutdown_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
             self.token.cancel();
         }
+    }
+
+    /// Returns the deadline fixed by the first cancellation request.
+    pub(crate) fn shutdown_deadline(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .expect("cancellation state lock poisoned")
+            .shutdown_deadline
     }
 
     /// Returns `true` if cancellation has been requested.
@@ -96,17 +117,17 @@ impl CancellationCoordinator {
 
     /// Waits for all tracked tasks to complete after cancellation has
     /// been requested. Returns `true` if drain completed within the
-    /// timeout, `false` if timed out.
+    /// deadline, `false` if timed out.
     ///
     /// # Errors
     ///
     /// This function does not return errors.
-    pub(crate) async fn wait_for_drain(&self, timeout: std::time::Duration) -> bool {
+    pub(crate) async fn wait_for_drain_until(&self, deadline: Instant) -> bool {
         let drain = self.tracker.close_and_wait();
-        let completed = tokio::time::timeout(timeout, drain).await.is_ok();
-        let mut phase = self.phase.lock().expect("phase lock poisoned");
+        let completed = tokio::time::timeout_at(deadline, drain).await.is_ok();
+        let mut state = self.state.lock().expect("cancellation state lock poisoned");
         if completed {
-            *phase = CancellationPhase::Completed;
+            state.phase = CancellationPhase::Completed;
             info!("Drain completed");
         } else {
             warn!(remaining = self.tracker.active_count(), "Drain timed out");
@@ -115,9 +136,16 @@ impl CancellationCoordinator {
     }
 
     /// Returns the current cancellation phase.
-    #[cfg(test)]
     pub(crate) fn phase(&self) -> CancellationPhase {
-        *self.phase.lock().expect("phase lock poisoned")
+        self.state
+            .lock()
+            .expect("cancellation state lock poisoned")
+            .phase
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_drain(&self, timeout: Duration) -> bool {
+        self.wait_for_drain_until(Instant::now() + timeout).await
     }
 }
 
@@ -224,9 +252,31 @@ mod tests {
     async fn multiple_cancellation_requests_are_idempotent() {
         let coord = CancellationCoordinator::new();
         coord.request_cancellation("first");
+        let first_deadline = coord
+            .shutdown_deadline()
+            .expect("the first cancellation request fixes a deadline");
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
         coord.request_cancellation("second");
+
         assert!(coord.is_cancelled());
         assert_eq!(coord.phase(), CancellationPhase::Draining);
+        assert_eq!(
+            coord.shutdown_deadline(),
+            Some(first_deadline),
+            "a repeated cancellation request must not extend the shutdown budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloned_coordinators_share_the_shutdown_deadline() {
+        let coord = CancellationCoordinator::new();
+        let clone = coord.clone();
+
+        clone.request_cancellation("clone");
+
+        assert_eq!(coord.shutdown_deadline(), clone.shutdown_deadline());
+        assert!(coord.shutdown_deadline().is_some());
     }
 
     /// Drain timeout must leave the coordinator in `Draining` phase,

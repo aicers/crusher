@@ -27,11 +27,11 @@ use rustls::{pki_types::CertificateDer, server::WebPkiClientVerifier};
 use serial_test::serial;
 use tempfile::TempDir;
 use tokio::sync::Notify;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
 use super::time_series::clear_last_transfer_time;
 use super::*;
-use crate::cancellation::CancellationCoordinator;
+use crate::cancellation::{CancellationCoordinator, CancellationPhase};
 use crate::client::Certs;
 use crate::policy::{PolicyHandle, spawn_policy_actor};
 
@@ -80,6 +80,15 @@ enum PublishBehavior {
     },
 }
 
+#[derive(Clone)]
+enum IngestBehavior {
+    Default,
+    HoldAckStreamOpen {
+        client_finished: Arc<Notify>,
+        release: Arc<Notify>,
+    },
+}
+
 struct FakeGigantoServer {
     server_config: ServerConfig,
     server_address: SocketAddr,
@@ -88,6 +97,7 @@ struct FakeGigantoServer {
     publish_repeat_count: usize,
     publish_repeat_delay: Duration,
     publish_behavior: PublishBehavior,
+    ingest_behavior: IngestBehavior,
 }
 
 struct TestServerHandlers {
@@ -109,6 +119,7 @@ impl FakeGigantoServer {
             publish_repeat_count: 0,
             publish_repeat_delay: Duration::from_millis(0),
             publish_behavior: PublishBehavior::Default,
+            ingest_behavior: IngestBehavior::Default,
         }
     }
 
@@ -122,6 +133,7 @@ impl FakeGigantoServer {
             publish_repeat_count: 0,
             publish_repeat_delay: Duration::from_millis(0),
             publish_behavior: PublishBehavior::Default,
+            ingest_behavior: IngestBehavior::Default,
         }
     }
 
@@ -136,6 +148,7 @@ impl FakeGigantoServer {
             publish_repeat_count: 3,
             publish_repeat_delay: Duration::from_millis(200),
             publish_behavior: PublishBehavior::Default,
+            ingest_behavior: IngestBehavior::Default,
         }
     }
 
@@ -149,6 +162,7 @@ impl FakeGigantoServer {
             publish_repeat_count: 3,
             publish_repeat_delay: Duration::from_millis(200),
             publish_behavior: PublishBehavior::Default,
+            ingest_behavior: IngestBehavior::Default,
         }
     }
 
@@ -167,20 +181,33 @@ impl FakeGigantoServer {
         self
     }
 
+    fn with_ingest_behavior(mut self, behavior: IngestBehavior) -> Self {
+        self.ingest_behavior = behavior;
+        self
+    }
+
     fn start_ingest(self, shutdown: Arc<Notify>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let endpoint = Endpoint::server(self.server_config, self.server_address).expect("endpoint");
         let local_addr = endpoint.local_addr().expect("local_addr");
         let ingest_notify = self.ingest_notify.clone();
         let peer_cert_notify = self.peer_cert_notify.clone();
+        let behavior = self.ingest_behavior;
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Some(conn) = endpoint.accept() => {
                         let notify = ingest_notify.clone();
                         let peer_cert_notify = peer_cert_notify.clone();
+                        let behavior = behavior.clone();
                         tokio::spawn(async move {
                             if let Ok(connection) = conn.await {
-                                handle_ingest_connection(connection, notify, peer_cert_notify).await;
+                                handle_ingest_connection(
+                                    connection,
+                                    notify,
+                                    peer_cert_notify,
+                                    behavior,
+                                )
+                                .await;
                             }
                         });
                     }
@@ -235,6 +262,7 @@ async fn handle_ingest_connection(
     connection: Connection,
     notify: Option<async_channel::Sender<u32>>,
     peer_cert_notify: Option<async_channel::Sender<PeerCertEvent>>,
+    behavior: IngestBehavior,
 ) {
     notify_peer_cert(
         &connection,
@@ -250,8 +278,9 @@ async fn handle_ingest_connection(
 
     while let Ok((send, recv)) = connection.accept_bi().await {
         let notify = notify.clone();
+        let behavior = behavior.clone();
         tokio::spawn(async move {
-            handle_ingest_stream(send, recv, notify).await;
+            handle_ingest_stream(send, recv, notify, behavior).await;
         });
     }
 }
@@ -459,6 +488,7 @@ async fn handle_ingest_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     notify: Option<async_channel::Sender<u32>>,
+    behavior: IngestBehavior,
 ) {
     let mut header_buf = [0_u8; 4];
     if receive_record_header(&mut recv, &mut header_buf)
@@ -474,6 +504,14 @@ async fn handle_ingest_stream(
     loop {
         let mut buf = Vec::new();
         if recv_raw(&mut recv, &mut buf).await.is_err() {
+            if let IngestBehavior::HoldAckStreamOpen {
+                client_finished,
+                release,
+            } = behavior
+            {
+                client_finished.notify_one();
+                release.notified().await;
+            }
             return;
         }
 
@@ -1100,8 +1138,6 @@ async fn sampling_policy_multiple_streams() {
 #[serial]
 #[tokio::test]
 async fn cancellation_drains_all_tasks() {
-    use crate::cancellation::CancellationPhase;
-
     let policy = new_policy(DEFAULT_POLICY_ID);
     let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
@@ -1217,6 +1253,233 @@ async fn cancellation_drain_captures_inflight_acks() {
         "Final timestamp ({ts_after}) must be >= pre-cancellation ({ts_before}); \
          drain should not lose in-flight ACKs"
     );
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_stream_open_waiting_for_reply() {
+    let coordinator = CancellationCoordinator::new();
+    let task_coordinator = coordinator.clone();
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<StreamSendRequest>(1);
+    let task = tokio::spawn(async move {
+        process_network_stream(new_policy(DEFAULT_POLICY_ID), stream_tx, &task_coordinator).await
+    });
+
+    let (_payload, reply) = timeout(Duration::from_secs(1), stream_rx.recv())
+        .await
+        .expect("stream request is sent")
+        .expect("stream actor channel remains open");
+
+    coordinator.request_cancellation("stream-open reply test");
+    timeout(Duration::from_secs(1), task)
+        .await
+        .expect("stream-open wait observes cancellation")
+        .expect("stream-open task joins")
+        .expect("cancellation is a clean exit");
+    drop(reply);
+}
+
+/// A peer that keeps its ACK direction open after the client finishes its
+/// send direction must not make shutdown unbounded. Closing the endpoint at
+/// the deadline must release the ACK receiver so the timestamp writer can
+/// still perform its final flush.
+#[serial]
+#[tokio::test]
+async fn stalled_ack_stream_recovers_and_writer_flushes_before_return() {
+    reset_last_transfer_time().await;
+    let client_finished = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (ingest_ack_send, ingest_ack_recv) = async_channel::bounded::<u32>(4);
+    let ingest_server = FakeGigantoServer::new_ingest()
+        .with_notify(ingest_ack_send)
+        .with_ingest_behavior(IngestBehavior::HoldAckStreamOpen {
+            client_finished: client_finished.clone(),
+            release: release.clone(),
+        });
+    let publish_server = FakeGigantoServer::new_publish();
+    let ingest_shutdown = Arc::new(Notify::new());
+    let publish_shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = ingest_server.start_ingest(ingest_shutdown.clone());
+    let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
+
+    let coordinator = CancellationCoordinator::new();
+    let (mut request_client, request_recv, timestamp_path, _temp_dir, policy_handle) =
+        setup_request_client(1, &coordinator);
+    let policy = new_policy(DEFAULT_POLICY_ID);
+    request_client
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .expect("policy setup succeeds");
+    let client = Client::new(
+        ingest_addr,
+        publish_addr,
+        HOST.to_string(),
+        timestamp_path.clone(),
+        &cert_key(),
+        request_recv,
+    )
+    .expect("subscribe client");
+    let client_handle = tokio::spawn(client.run(policy_handle, coordinator.clone()));
+
+    timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        .await
+        .expect("initial ACK arrives")
+        .expect("ACK channel remains open");
+    timeout(
+        Duration::from_secs(5),
+        wait_for_policy_ids(&timestamp_path, &[policy.id], true),
+    )
+    .await
+    .expect("initial timestamp is persisted");
+
+    let shutdown_started = Instant::now();
+    coordinator.request_cancellation("stalled ACK test");
+    timeout(Duration::from_secs(5), client_finished.notified())
+        .await
+        .expect("server observes the finished client send stream");
+
+    timeout(Duration::from_secs(12), client_handle)
+        .await
+        .expect("client shutdown remains bounded")
+        .expect("client task joins")
+        .expect("forced endpoint close should recover the graceful timeout");
+    assert!(
+        shutdown_started.elapsed()
+            >= SHUTDOWN_DRAIN_TIMEOUT
+                .checked_sub(FORCED_DRAIN_GRACE)
+                .expect("forced drain grace is shorter than the shutdown timeout"),
+        "the peer should hold the ACK stream through the graceful deadline"
+    );
+
+    assert_eq!(
+        coordinator.phase(),
+        CancellationPhase::Completed,
+        "forced endpoint close must release ACK receivers and flush the writer before returning"
+    );
+    assert_eq!(coordinator.tracker().active_count(), 0);
+    assert!(timestamp_path.exists(), "writer output must remain durable");
+
+    release.notify_waiters();
+    ingest_shutdown.notify_one();
+    publish_shutdown.notify_one();
+    let _ = tokio::join!(ingest_handle, publish_handle);
+    INGEST_CHANNEL.write().await.clear();
+}
+
+/// A series accepted into an existing per-policy ingest queue before
+/// cancellation must still be transmitted before the sender exits.
+#[serial]
+#[tokio::test]
+async fn cancellation_drains_queued_time_series() {
+    INGEST_CHANNEL.write().await.clear();
+    let (ack_send, ack_recv) = async_channel::bounded::<u32>(4);
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_notify(ack_send)
+        .start_ingest(shutdown.clone());
+
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let connection = ingest_connect(&endpoint, ingest_addr, HOST, REQUIRED_GIGANTO_VERSION)
+        .await
+        .expect("ingest connection");
+    let coordinator = CancellationCoordinator::new();
+    let (time_sender, _time_receiver) = async_channel::bounded(4);
+    let policy_id = DEFAULT_POLICY_ID.to_string();
+    let first = TimeSeries {
+        sampling_policy_id: policy_id.clone(),
+        start_secs: 1,
+        series: vec![1.0],
+    };
+    let second = TimeSeries {
+        sampling_policy_id: policy_id.clone(),
+        start_secs: 2,
+        series: vec![2.0],
+    };
+
+    let sender_task = coordinator.tracker().spawn(send_time_series(
+        Arc::new(connection),
+        first,
+        CancellationToken::new(),
+        time_sender,
+        Arc::new(Notify::new()),
+        coordinator.clone(),
+    ));
+
+    let first_ack = timeout(Duration::from_secs(5), ack_recv.recv())
+        .await
+        .expect("first ACK arrives")
+        .expect("ACK channel remains open");
+    assert_eq!(first_ack, DEFAULT_POLICY_ID);
+    wait_for_ingest_channel(&policy_id, true)
+        .await
+        .expect("per-policy queue is registered");
+
+    let queued_sender = INGEST_CHANNEL
+        .read()
+        .await
+        .get(&policy_id)
+        .cloned()
+        .expect("per-policy sender exists");
+    queued_sender
+        .try_send(second)
+        .expect("second series is queued before cancellation");
+    coordinator.request_cancellation("queued-series drain test");
+
+    sender_task
+        .await
+        .expect("sender task joins")
+        .expect("queued series is sent successfully");
+    let second_ack = timeout(Duration::from_secs(5), ack_recv.recv())
+        .await
+        .expect("queued series ACK arrives")
+        .expect("ACK channel remains open");
+    assert_eq!(second_ack, DEFAULT_POLICY_ID);
+    assert!(
+        coordinator.wait_for_drain(Duration::from_secs(5)).await,
+        "ACK receiver drains"
+    );
+
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
+/// The subscribe supervisor must return the timestamp writer's I/O error
+/// instead of reporting a successful drain.
+#[serial]
+#[tokio::test]
+async fn timestamp_writer_failure_is_propagated() {
+    let (_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let invalid_path = temp_dir.path().join("missing-parent/time_data.json");
+    let coordinator = CancellationCoordinator::new();
+    let (request_send, request_recv) = async_channel::bounded(1);
+    let policy_handle = spawn_policy_actor(request_send, &coordinator);
+    let client = Client::new(
+        ingest_addr,
+        publish_addr,
+        HOST.to_string(),
+        invalid_path,
+        &cert_key(),
+        request_recv,
+    )
+    .expect("subscribe client");
+
+    coordinator.request_cancellation("writer failure test");
+    let error = timeout(
+        Duration::from_secs(5),
+        client.run(policy_handle, coordinator.clone()),
+    )
+    .await
+    .expect("client exits after cancellation")
+    .expect_err("timestamp writer error must reach the supervisor");
+    assert!(
+        error.to_string().contains("timestamp writer failed"),
+        "unexpected error: {error:#}"
+    );
+
+    cleanup_server_resources(server_handles).await;
+    INGEST_CHANNEL.write().await.clear();
 }
 
 /// Test: After cancellation + simulated restart, time data is consistent

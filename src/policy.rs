@@ -173,9 +173,15 @@ pub(crate) fn spawn_policy_actor(
                     None => break,
                 },
             };
-            if let Err(e) = policy_send.send(policy).await {
-                warn!("Policy relay to subscribe side failed: {e}");
-                break;
+            tokio::select! {
+                biased;
+                () = relay_coord.cancelled() => break,
+                result = policy_send.send(policy) => {
+                    if let Err(e) = result {
+                        warn!("Policy relay to subscribe side failed: {e}");
+                        break;
+                    }
+                }
             }
         }
     });
@@ -443,6 +449,25 @@ mod tests {
         let completed = coordinator.wait_for_drain(Duration::from_secs(5)).await;
         assert!(completed);
         assert_eq!(coordinator.tracker().active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_relay_blocked_by_backpressure() {
+        let coordinator = CancellationCoordinator::new();
+        let (policy_tx, _policy_rx) = async_channel::bounded::<SamplingPolicy>(1);
+        let handle = spawn_policy_actor(policy_tx, &coordinator);
+
+        handle
+            .add_policies(vec![test_policy(1), test_policy(2)])
+            .await
+            .expect("actor accepts both policies");
+        tokio::task::yield_now().await;
+
+        coordinator.request_cancellation("blocked relay shutdown");
+        assert!(
+            coordinator.wait_for_drain(Duration::from_secs(1)).await,
+            "a relay blocked on a full downstream channel must observe cancellation"
+        );
     }
 
     /// Once the actor has exited (coordinator cancelled + drained),
