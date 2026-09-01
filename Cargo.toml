@@ -16,9 +16,9 @@ giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "
 num_enum = "0.7"
 num-traits = "0.2"
 quinn = { version = "0.11", features = ["ring"] }
-review-protocol = { git = "https://github.com/petabi/review-protocol.git", features = [
+review-protocol = { git = "https://github.com/aicers/review-protocol.git", features = [
     "client",
-], tag = "0.19.0" }
+], rev = "32ed9b0" }
 roxy = { git = "https://github.com/aicers/roxy.git", tag = "0.6.0" }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
@@ -38,9 +38,9 @@ tempfile = "3"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 time = "0.3"
 rstest = "0.26"
-review-protocol = { git = "https://github.com/petabi/review-protocol.git", features = [
+review-protocol = { git = "https://github.com/aicers/review-protocol.git", features = [
     "server",
-], tag = "0.19.0" }
+], rev = "32ed9b0" }
 libc = "0.2"
 
 [lints.clippy]
