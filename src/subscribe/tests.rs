@@ -4,7 +4,10 @@ use std::{
     fs,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use giganto_client::{
@@ -32,7 +35,7 @@ use tokio::time::{Instant, sleep, timeout};
 use super::time_series::clear_last_transfer_time;
 use super::*;
 use crate::cancellation::{CancellationCoordinator, CancellationPhase};
-use crate::client::Certs;
+use crate::client::{Certs, SharedTlsBytes, TlsBytes};
 use crate::policy::{PolicyHandle, spawn_policy_actor};
 
 const CERT_PATH: &str = "tests/cert.pem";
@@ -77,6 +80,10 @@ enum PublishBehavior {
         expected: usize,
         request_received: Arc<Notify>,
         release: Arc<Notify>,
+    },
+    /// Records stream-open requests without opening response streams.
+    RecordRequests {
+        sender: async_channel::Sender<String>,
     },
 }
 
@@ -337,6 +344,15 @@ async fn handle_publish_connection(
                 repeat_delay,
             )
             .await;
+        }
+        PublishBehavior::RecordRequests { sender } => {
+            while let Ok(payload) = receive_stream_request(&mut recv).await {
+                if let StreamRequestPayload::TimeSeriesGenerator { request, .. } = payload
+                    && sender.send(request.id).await.is_err()
+                {
+                    return;
+                }
+            }
         }
     }
 }
@@ -841,6 +857,146 @@ fn config_server() -> ServerConfig {
         .max_concurrent_uni_streams(0_u8.into());
 
     server_config
+}
+
+#[derive(Clone)]
+struct ReloadPolicyManager {
+    calls: Arc<AtomicUsize>,
+    first_policy: SamplingPolicy,
+    sync_events: async_channel::Sender<usize>,
+}
+
+#[async_trait::async_trait]
+impl review_protocol::server::Handler for ReloadPolicyManager {
+    async fn get_sampling_policy_list(&self, _peer: &str) -> Result<Vec<SamplingPolicy>, String> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.sync_events.send(call).await;
+        if call == 1 {
+            Ok(vec![self.first_policy.clone()])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn start_reload_policy_manager(
+    policy: SamplingPolicy,
+) -> (
+    SocketAddr,
+    async_channel::Receiver<usize>,
+    Arc<Notify>,
+    tokio::task::JoinHandle<()>,
+) {
+    let endpoint = Endpoint::server(
+        config_server(),
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+    )
+    .expect("manager endpoint");
+    let address = endpoint.local_addr().expect("manager address");
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_for_task = shutdown.clone();
+    let (sync_send, sync_recv) = async_channel::unbounded();
+    let handler = ReloadPolicyManager {
+        calls: Arc::new(AtomicUsize::new(0)),
+        first_policy: policy,
+        sync_events: sync_send,
+    };
+    let server_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                connecting = endpoint.accept() => {
+                    let Some(connecting) = connecting else {
+                        break;
+                    };
+                    let mut handler = handler.clone();
+                    tokio::spawn(async move {
+                        let Ok(connection) = connecting.await else {
+                            return;
+                        };
+                        let address = connection.remote_address();
+                        if review_protocol::server::handshake(
+                            &connection,
+                            address,
+                            ">=0",
+                            "0.48.0",
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                            let _ = review_protocol::server::handle(
+                                &mut handler,
+                                &mut send,
+                                &mut recv,
+                                "test",
+                            )
+                            .await;
+                        }
+                    });
+                }
+                () = shutdown_for_task.notified() => {
+                    endpoint.close(0_u32.into(), &[]);
+                    break;
+                }
+            }
+        }
+    });
+    (address, sync_recv, shutdown, server_handle)
+}
+
+fn start_stalled_giganto_endpoint() -> (SocketAddr, Arc<Notify>, tokio::task::JoinHandle<()>) {
+    let endpoint = Endpoint::server(
+        config_server(),
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+    )
+    .expect("stalled Giganto endpoint");
+    let address = endpoint.local_addr().expect("stalled Giganto address");
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_for_task = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                connecting = endpoint.accept() => {
+                    let Some(connecting) = connecting else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        if let Ok(connection) = connecting.await {
+                            connection.closed().await;
+                        }
+                    });
+                }
+                () = shutdown_for_task.notified() => {
+                    endpoint.close(0_u32.into(), &[]);
+                    break;
+                }
+            }
+        }
+    });
+    (address, shutdown, handle)
+}
+
+fn write_run_config(
+    path: &Path,
+    timestamp_path: &Path,
+    ingest_addr: SocketAddr,
+    publish_addr: SocketAddr,
+) {
+    fs::write(
+        path,
+        format!(
+            r#"
+giganto_name = "{HOST}"
+giganto_ingest_srv_addr = "{ingest_addr}"
+giganto_publish_srv_addr = "{publish_addr}"
+last_timestamp_data = "{}"
+"#,
+            timestamp_path.display()
+        ),
+    )
+    .expect("write run config");
 }
 
 struct RotatedTlsMaterial {
@@ -1399,6 +1555,7 @@ async fn cancellation_drains_queued_time_series() {
         Arc::new(connection),
         first,
         CancellationToken::new(),
+        ConnectionLifecycle::new(),
         time_sender,
         Arc::new(Notify::new()),
         coordinator.clone(),
@@ -1442,6 +1599,60 @@ async fn cancellation_drains_queued_time_series() {
     shutdown.notify_one();
     ingest_handle.await.expect("ingest server joins");
     INGEST_CHANNEL.write().await.clear();
+}
+
+/// Verifies that connection drain does not return until every task tracked for
+/// the ending connection generation has completed.
+#[serial]
+#[tokio::test]
+async fn connection_generation_drain_waits_for_tracked_children() {
+    let publish_shutdown = Arc::new(Notify::new());
+    let (publish_addr, publish_handle) =
+        FakeGigantoServer::new_publish().start_publish(publish_shutdown.clone());
+    let endpoint = crate::client::config(&cert_key()).expect("client endpoint");
+    let (connection, _send) =
+        publish_connect(&endpoint, publish_addr, HOST, REQUIRED_GIGANTO_VERSION)
+            .await
+            .expect("publish connection");
+
+    let lifecycle = ConnectionLifecycle::new();
+    let child_token = lifecycle.token.clone();
+    let child_started = Arc::new(Notify::new());
+    let child_started_for_task = child_started.clone();
+    let cancellation_observed = Arc::new(Notify::new());
+    let cancellation_observed_for_task = cancellation_observed.clone();
+    let release_child = Arc::new(Notify::new());
+    let release_child_for_task = release_child.clone();
+    let child_handle = lifecycle.tasks.spawn(async move {
+        child_started_for_task.notify_one();
+        child_token.cancelled().await;
+        cancellation_observed_for_task.notify_one();
+        release_child_for_task.notified().await;
+    });
+    child_started.notified().await;
+
+    let drain = drain_connection_generation(&connection, &lifecycle, "test publish");
+    tokio::pin!(drain);
+    tokio::select! {
+        () = cancellation_observed.notified() => {}
+        result = &mut drain => panic!("drain returned before child cancellation: {result:?}"),
+    }
+    assert!(
+        timeout(Duration::from_millis(100), &mut drain)
+            .await
+            .is_err(),
+        "drain must continue waiting while a tracked child is still running",
+    );
+
+    release_child.notify_one();
+    timeout(Duration::from_secs(1), &mut drain)
+        .await
+        .expect("drain completes after child exit")
+        .expect("connection drain succeeds");
+    child_handle.await.expect("tracked child joins");
+
+    publish_shutdown.notify_one();
+    publish_handle.await.expect("publish server joins");
 }
 
 /// The subscribe supervisor must return the timestamp writer's I/O error
@@ -1559,6 +1770,144 @@ async fn restart_state_consistency() {
     );
 
     cleanup_test_resources(coordinator2, client_handle2, server_handles2).await;
+}
+
+/// Verifies that a policy queued in an ending `run()` generation cannot be
+/// consumed by the next generation after reload.
+#[serial]
+#[tokio::test(flavor = "current_thread")]
+async fn reload_does_not_open_policy_queued_by_previous_run() {
+    reset_last_transfer_time().await;
+    let policy = new_policy(DEFAULT_POLICY_ID);
+    let (manager_addr, sync_events, manager_shutdown, manager_handle) =
+        start_reload_policy_manager(policy);
+
+    let (stalled_ingest_addr, stalled_ingest_shutdown, stalled_ingest_handle) =
+        start_stalled_giganto_endpoint();
+    let (stalled_publish_addr, stalled_publish_shutdown, stalled_publish_handle) =
+        start_stalled_giganto_endpoint();
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let config_path = temp_dir.path().join("crusher.toml");
+    let timestamp_path = temp_dir.path().join("time_data.json");
+    write_run_config(
+        &config_path,
+        &timestamp_path,
+        stalled_ingest_addr,
+        stalled_publish_addr,
+    );
+
+    let cert_pem = fs::read(CERT_PATH).expect("read client cert");
+    let key_pem = fs::read(KEY_PATH).expect("read client key");
+    let ca_pem = fs::read(CA_CERT_PATH).expect("read CA cert");
+    let certs = cert_key();
+    let request_client = crate::request::Client::new(
+        manager_addr,
+        HOST.to_string(),
+        SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, vec![ca_pem])),
+        Arc::new(Notify::new()),
+    );
+    let args = crate::CmdLineArgs {
+        config: Some(config_path.to_str().expect("UTF-8 config path").to_string()),
+        cert: CERT_PATH.to_string(),
+        key: KEY_PATH.to_string(),
+        ca_certs: vec![CA_CERT_PATH.to_string()],
+        manager_server: format!("{HOST}@{manager_addr}")
+            .parse()
+            .expect("manager server address"),
+    };
+    let (_writer, tracing_guard) = tracing_appender::non_blocking(std::io::sink());
+    let mut tracing_guard = Some(tracing_guard);
+
+    let first_tls_reload = Arc::new(Notify::new());
+    let first_tls_reload_for_driver = first_tls_reload.clone();
+    let first_run = async {
+        let driver = async {
+            assert_eq!(sync_events.recv().await.expect("first policy sync"), 1);
+            // The manager event is emitted just before its response is returned.
+            // Give the request actor time to enqueue the restored policy while
+            // the stalled publish handshake prevents it from being consumed.
+            sleep(Duration::from_millis(200)).await;
+            first_tls_reload_for_driver.notify_one();
+        };
+        let (result, ()) = tokio::join!(
+            crate::run(
+                &args,
+                &certs,
+                request_client.clone(),
+                Arc::new(Notify::new()),
+                first_tls_reload,
+                Arc::new(Notify::new()),
+                &mut tracing_guard,
+            ),
+            driver,
+        );
+        result
+    };
+    let first_reason = timeout(Duration::from_secs(5), first_run)
+        .await
+        .expect("first run exits after reload")
+        .expect("first run succeeds");
+    assert_eq!(first_reason, crate::RunExitReason::TlsReload);
+
+    stalled_ingest_shutdown.notify_one();
+    stalled_publish_shutdown.notify_one();
+    let _ = tokio::join!(stalled_ingest_handle, stalled_publish_handle);
+
+    let ingest_shutdown = Arc::new(Notify::new());
+    let publish_shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) =
+        FakeGigantoServer::new_ingest().start_ingest(ingest_shutdown.clone());
+    let (open_send, open_recv) = async_channel::bounded(1);
+    let (peer_send, peer_recv) = async_channel::bounded(1);
+    let publish_server = FakeGigantoServer::new_publish()
+        .with_publish_behavior(PublishBehavior::RecordRequests { sender: open_send })
+        .with_peer_cert_notify(peer_send);
+    let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
+    write_run_config(&config_path, &timestamp_path, ingest_addr, publish_addr);
+
+    let second_shutdown = Arc::new(Notify::new());
+    let second_shutdown_for_driver = second_shutdown.clone();
+    let second_run = async {
+        let driver = async {
+            assert_eq!(sync_events.recv().await.expect("second policy sync"), 2);
+            let (path, _) = timeout(Duration::from_secs(3), peer_recv.recv())
+                .await
+                .expect("second publish connection")
+                .expect("peer event channel open");
+            assert_eq!(path, ConnectionPath::Publish);
+            assert!(
+                timeout(Duration::from_millis(300), open_recv.recv())
+                    .await
+                    .is_err(),
+                "the new run must not open a policy queued by the previous run",
+            );
+            second_shutdown_for_driver.notify_one();
+        };
+        let (result, ()) = tokio::join!(
+            crate::run(
+                &args,
+                &certs,
+                request_client,
+                Arc::new(Notify::new()),
+                Arc::new(Notify::new()),
+                second_shutdown,
+                &mut tracing_guard,
+            ),
+            driver,
+        );
+        result
+    };
+    let second_reason = timeout(Duration::from_secs(5), second_run)
+        .await
+        .expect("second run exits after shutdown")
+        .expect("second run succeeds");
+    assert_eq!(second_reason, crate::RunExitReason::Shutdown);
+
+    ingest_shutdown.notify_one();
+    publish_shutdown.notify_one();
+    manager_shutdown.notify_one();
+    let _ = tokio::join!(ingest_handle, publish_handle, manager_handle);
 }
 
 /// Spawns a subscribe client wired to a publish endpoint with the
