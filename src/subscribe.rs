@@ -31,9 +31,10 @@ use time_series::{
 };
 use tokio::{
     sync::{Notify, RwLock, oneshot},
-    time::{Duration, sleep, timeout_at},
+    time::{Duration, sleep, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker as ConnectionTaskTracker;
 use tracing::{info, warn};
 
 use crate::cancellation::CancellationCoordinator;
@@ -46,10 +47,40 @@ pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.28.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const LAST_TIME_SERIES_TIMESTAMP_CHANNEL_SIZE: usize = 1;
 const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A request sent to the `SendStream` actor task. The actor owns the
 /// `SendStream` so no lock is needed across an await point.
 type StreamSendRequest = (StreamRequestPayload, oneshot::Sender<Result<()>>);
+
+#[derive(Clone)]
+struct ConnectionLifecycle {
+    token: CancellationToken,
+    tasks: ConnectionTaskTracker,
+}
+
+impl ConnectionLifecycle {
+    fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            tasks: ConnectionTaskTracker::new(),
+        }
+    }
+}
+
+async fn drain_connection_generation(
+    connection: &Connection,
+    lifecycle: &ConnectionLifecycle,
+    path: &str,
+) -> Result<()> {
+    lifecycle.token.cancel();
+    connection.close(0u32.into(), &[]);
+    lifecycle.tasks.close();
+    timeout(CONNECTION_DRAIN_TIMEOUT, lifecycle.tasks.wait())
+        .await
+        .with_context(|| format!("Timed out while draining {path} connection tasks"))?;
+    Ok(())
+}
 
 // A hashmap for data transfer to an already created asynchronous task
 static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
@@ -336,6 +367,7 @@ async fn ingest_connection_control(
         match connect_result {
             Ok(conn) => {
                 let arc_conn = Arc::new(conn);
+                let connection_lifecycle = ConnectionLifecycle::new();
 
                 loop {
                     tokio::select! {
@@ -352,6 +384,7 @@ async fn ingest_connection_control(
                                     arc_conn.clone(),
                                     series,
                                     CancellationToken::new(),
+                                    connection_lifecycle.clone(),
                                     time_sender.clone(),
                                     connection_notify.clone(),
                                 );
@@ -361,6 +394,12 @@ async fn ingest_connection_control(
                         () = connection_notify.notified() => {
                             drop(connection_notify);
                             INGEST_CHANNEL.write().await.clear();
+                            drain_connection_generation(
+                                arc_conn.as_ref(),
+                                &connection_lifecycle,
+                                "ingest",
+                            )
+                            .await?;
                             warn!(
                                 "Stream channel closed. Retry connection to {}",
                                 server_addr,
@@ -385,6 +424,7 @@ async fn ingest_connection_control(
                                 connection,
                                 series,
                                 policy_token,
+                                connection_lifecycle.clone(),
                                 time_sender.clone(),
                                 connection_notify.clone(),
                             );
@@ -470,18 +510,29 @@ async fn publish_connection_control(
         };
         match connect_result {
             Ok((conn, mut send)) => {
+                let connection_lifecycle = ConnectionLifecycle::new();
                 // Spawn an actor task that owns the SendStream.
                 // Callers send payloads through the channel, avoiding
                 // any lock-across-await on the stream.
                 let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<StreamSendRequest>(1);
-                coordinator.tracker().spawn(async move {
-                    while let Some((payload, reply)) = stream_rx.recv().await {
+                let stream_token = connection_lifecycle.token.clone();
+                let stream_actor = connection_lifecycle.tasks.track_future(async move {
+                    loop {
+                        let request = tokio::select! {
+                            biased;
+                            () = stream_token.cancelled() => break,
+                            request = stream_rx.recv() => request,
+                        };
+                        let Some((payload, reply)) = request else {
+                            break;
+                        };
                         let result = send_stream_request(&mut send, payload)
                             .await
                             .map_err(Into::into);
                         let _ = reply.send(result);
                     }
                 });
+                coordinator.tracker().spawn(stream_actor);
 
                 // One dispatcher task per publish connection owns
                 // `accept_uni()`. It reads each incoming stream's id
@@ -490,14 +541,18 @@ async fn publish_connection_control(
                 // removes the previous race where one of many
                 // policy-scoped receivers could be bound to the wrong
                 // inbound stream.
-                let dispatcher_handle = coordinator.tracker().spawn(run_inbound_dispatcher(
-                    conn.clone(),
-                    series_send.clone(),
-                    connection_notify.clone(),
-                    policy_handle.clone(),
-                    time_sender.clone(),
-                    coordinator.clone(),
-                ));
+                let dispatcher = connection_lifecycle
+                    .tasks
+                    .track_future(run_inbound_dispatcher(
+                        conn.clone(),
+                        series_send.clone(),
+                        connection_notify.clone(),
+                        policy_handle.clone(),
+                        time_sender.clone(),
+                        connection_lifecycle.clone(),
+                        coordinator.clone(),
+                    ));
+                let mut dispatcher_handle = coordinator.tracker().spawn(dispatcher);
 
                 // Startup-only dedup: on (re)connect we replay the
                 // full active-policy snapshot from the policy actor,
@@ -519,11 +574,26 @@ async fn publish_connection_control(
                         if let Err(e) =
                             process_network_stream(policy, stream_tx.clone(), &coordinator).await
                         {
-                            dispatcher_handle.abort();
                             if let Some(action) = classify_stream_error(&e) {
                                 match action {
-                                    StreamRecoveryAction::Reconnect => continue 'connection,
-                                    StreamRecoveryAction::Exit => return Ok(()),
+                                    StreamRecoveryAction::Reconnect => {
+                                        drain_connection_generation(
+                                            &conn,
+                                            &connection_lifecycle,
+                                            "publish",
+                                        )
+                                        .await?;
+                                        continue 'connection;
+                                    }
+                                    StreamRecoveryAction::Exit => {
+                                        drain_connection_generation(
+                                            &conn,
+                                            &connection_lifecycle,
+                                            "publish",
+                                        )
+                                        .await?;
+                                        return Ok(());
+                                    }
                                 }
                             }
                             bail!("Cannot recover from open stream error: {e}");
@@ -544,11 +614,26 @@ async fn publish_connection_control(
                         if let Err(e) =
                             process_network_stream(policy, stream_tx.clone(), &coordinator).await
                         {
-                            dispatcher_handle.abort();
                             if let Some(action) = classify_stream_error(&e) {
                                 match action {
-                                    StreamRecoveryAction::Reconnect => continue 'connection,
-                                    StreamRecoveryAction::Exit => return Ok(()),
+                                    StreamRecoveryAction::Reconnect => {
+                                        drain_connection_generation(
+                                            &conn,
+                                            &connection_lifecycle,
+                                            "publish",
+                                        )
+                                        .await?;
+                                        continue 'connection;
+                                    }
+                                    StreamRecoveryAction::Exit => {
+                                        drain_connection_generation(
+                                            &conn,
+                                            &connection_lifecycle,
+                                            "publish",
+                                        )
+                                        .await?;
+                                        return Ok(());
+                                    }
                                 }
                             }
                             bail!("Cannot recover from open stream error: {e}");
@@ -561,11 +646,40 @@ async fn publish_connection_control(
                     tokio::select! {
                         biased;
                         () = coordinator.cancelled() => {
+                            drain_connection_generation(
+                                &conn,
+                                &connection_lifecycle,
+                                "publish",
+                            )
+                            .await?;
                             return Ok(());
+                        }
+                        dispatcher_result = &mut dispatcher_handle => {
+                            warn!(
+                                "Inbound dispatcher exited ({:?}). Retry connection to {} after {} seconds.",
+                                dispatcher_result.err(), server_addr, SERVER_RETRY_INTERVAL,
+                            );
+                            drain_connection_generation(
+                                &conn,
+                                &connection_lifecycle,
+                                "publish",
+                            )
+                            .await?;
+                            tokio::select! {
+                                biased;
+                                () = coordinator.cancelled() => return Ok(()),
+                                () = sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)) => {}
+                            }
+                            continue 'connection;
                         }
                         () = connection_notify.notified() => {
                             drop(connection_notify);
-                            dispatcher_handle.abort();
+                            drain_connection_generation(
+                                &conn,
+                                &connection_lifecycle,
+                                "publish",
+                            )
+                            .await?;
                             warn!(
                                 "Stream channel closed. Retry connection to {} after {} seconds.",
                                 server_addr, SERVER_RETRY_INTERVAL,
@@ -578,7 +692,12 @@ async fn publish_connection_control(
                             continue 'connection;
                         }
                         err = conn.closed() => {
-                            dispatcher_handle.abort();
+                            drain_connection_generation(
+                                &conn,
+                                &connection_lifecycle,
+                                "publish",
+                            )
+                            .await?;
                             warn!(
                                 "Stream channel closed: {:?}. Retry connection to {} after {} seconds.",
                                 err, server_addr, SERVER_RETRY_INTERVAL,
@@ -600,11 +719,26 @@ async fn publish_connection_control(
                             )
                             .await
                             {
-                                dispatcher_handle.abort();
                                 if let Some(action) = classify_stream_error(&e) {
                                     match action {
-                                        StreamRecoveryAction::Reconnect => continue 'connection,
-                                        StreamRecoveryAction::Exit => return Ok(()),
+                                        StreamRecoveryAction::Reconnect => {
+                                            drain_connection_generation(
+                                                &conn,
+                                                &connection_lifecycle,
+                                                "publish",
+                                            )
+                                            .await?;
+                                            continue 'connection;
+                                        }
+                                        StreamRecoveryAction::Exit => {
+                                            drain_connection_generation(
+                                                &conn,
+                                                &connection_lifecycle,
+                                                "publish",
+                                            )
+                                            .await?;
+                                            return Ok(());
+                                        }
                                     }
                                 }
                                 bail!("Cannot recover from open stream error: {e}");
@@ -727,12 +861,14 @@ async fn run_inbound_dispatcher(
     connection_notify: Arc<Notify>,
     policy_handle: PolicyHandle,
     time_sender: Sender<TimestampCommand>,
+    connection_lifecycle: ConnectionLifecycle,
     coordinator: CancellationCoordinator,
 ) {
     loop {
         let recv_result = tokio::select! {
             biased;
             () = coordinator.cancelled() => return,
+            () = connection_lifecycle.token.cancelled() => return,
             result = conn.accept_uni() => result,
         };
         let mut recv = match recv_result {
@@ -746,6 +882,7 @@ async fn run_inbound_dispatcher(
         let id = tokio::select! {
             biased;
             () = coordinator.cancelled() => return,
+            () = connection_lifecycle.token.cancelled() => return,
             result = receive_time_series_generator_stream_start_message(&mut recv) => match result {
                 Ok(id) => id,
                 Err(e) => {
@@ -768,14 +905,24 @@ async fn run_inbound_dispatcher(
         let sender = sender.clone();
         let time_sender = time_sender.clone();
         let coord = coordinator.clone();
+        let worker_lifecycle = connection_lifecycle.clone();
         let policy_id = policy.id;
-        coordinator.tracker().spawn(async move {
-            if let Err(e) =
-                run_stream_worker(recv, sender, policy, policy_token, time_sender, coord).await
+        let worker = connection_lifecycle.tasks.track_future(async move {
+            if let Err(e) = run_stream_worker(
+                recv,
+                sender,
+                policy,
+                policy_token,
+                worker_lifecycle.token,
+                time_sender,
+                coord,
+            )
+            .await
             {
                 warn!(policy_id, "Stream worker failed: {e:#}");
             }
         });
+        coordinator.tracker().spawn(worker);
     }
 }
 
@@ -796,6 +943,7 @@ async fn run_stream_worker(
     sender: Sender<TimeSeries>,
     policy: SamplingPolicy,
     policy_token: tokio_util::sync::CancellationToken,
+    connection_token: tokio_util::sync::CancellationToken,
     time_sender: Sender<TimestampCommand>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
@@ -830,6 +978,10 @@ async fn run_stream_worker(
                     .send(TimestampCommand::Delete { id })
                     .await
                     .context("timestamp writer closed while deleting a policy")?;
+                break;
+            }
+            () = connection_token.cancelled() => {
+                info!("Stream worker for policy {id} stopping; publish connection replaced");
                 break;
             }
             result = receive_time_series_generator_data(&mut recv) => {
@@ -891,17 +1043,20 @@ fn spawn_time_series_sender(
     connection: Arc<Connection>,
     series: TimeSeries,
     policy_token: CancellationToken,
+    connection_lifecycle: ConnectionLifecycle,
     time_sender: Sender<TimestampCommand>,
     connection_notify: Arc<Notify>,
 ) {
     let sampling_policy_id = series.sampling_policy_id.clone();
     let error_notify = connection_notify.clone();
     let task_coordinator = coordinator.clone();
-    coordinator.tracker().spawn(async move {
+    let connection_tasks = connection_lifecycle.tasks.clone();
+    let tracked = connection_tasks.track_future(async move {
         if let Err(e) = send_time_series(
             connection,
             series,
             policy_token,
+            connection_lifecycle,
             time_sender,
             connection_notify,
             task_coordinator,
@@ -912,12 +1067,14 @@ fn spawn_time_series_sender(
             error_notify.notify_waiters();
         }
     });
+    coordinator.tracker().spawn(tracked);
 }
 
 async fn send_time_series(
     connection: Arc<Connection>,
     series: TimeSeries,
     policy_token: CancellationToken,
+    connection_lifecycle: ConnectionLifecycle,
     time_sender: Sender<TimestampCommand>,
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
@@ -944,13 +1101,17 @@ async fn send_time_series(
         send_time_series_record(&mut series_sender, &series).await?;
 
         // Receive start time of giganto last saved time series.
-        coordinator.tracker().spawn(receive_time_series_timestamp(
-            series_receiver,
-            sampling_policy_id.clone(),
-            policy_token.clone(),
-            time_sender,
-            connection_notify,
-        ));
+        let receiver = connection_lifecycle
+            .tasks
+            .track_future(receive_time_series_timestamp(
+                series_receiver,
+                sampling_policy_id.clone(),
+                policy_token.clone(),
+                connection_lifecycle.token.clone(),
+                time_sender,
+                connection_notify,
+            ));
+        coordinator.tracker().spawn(receiver);
 
         // Data transmission after the first time (only series data).
         // `policy_token` fires on delete so this old-generation sender
@@ -974,6 +1135,13 @@ async fn send_time_series(
                     info!(
                         %sampling_policy_id,
                         "send_time_series stopping; policy deleted"
+                    );
+                    break;
+                }
+                () = connection_lifecycle.token.cancelled() => {
+                    info!(
+                        %sampling_policy_id,
+                        "send_time_series stopping; ingest connection replaced"
                     );
                     break;
                 }
@@ -1032,6 +1200,7 @@ async fn receive_time_series_timestamp(
     mut series_receiver: RecvStream,
     sampling_policy_id: String,
     policy_token: CancellationToken,
+    connection_token: CancellationToken,
     time_sender: Sender<TimestampCommand>,
     connection_notify: Arc<Notify>,
 ) {
@@ -1048,6 +1217,13 @@ async fn receive_time_series_timestamp(
                 info!(
                     %sampling_policy_id,
                     "receive_time_series_timestamp stopping; policy deleted"
+                );
+                return;
+            }
+            () = connection_token.cancelled() => {
+                info!(
+                    %sampling_policy_id,
+                    "receive_time_series_timestamp stopping; ingest connection replaced"
                 );
                 return;
             }

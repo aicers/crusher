@@ -19,7 +19,6 @@ use clap::Parser;
 use client::{Certs, SharedTlsBytes, TlsBytes};
 use logging::init_tracing;
 use request::IdleExitReason;
-use review_protocol::types::SamplingPolicy;
 use settings::Settings;
 use subscribe::{clear_ingest_channel, ensure_time_data_exists, read_last_timestamp};
 use tokio::sync::Notify;
@@ -331,8 +330,6 @@ async fn main() -> Result<()> {
     let args = CmdLineArgs::parse();
     let (mut certs, tls_bytes) = load_tls_material_with_bytes(&args)?;
     let manager_tls = SharedTlsBytes::new(tls_bytes);
-    let (request_send, request_recv) =
-        async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
     let config_reload = Arc::new(Notify::new());
     let tls_reload = Arc::new(Notify::new());
     let shutdown = Arc::new(Notify::new());
@@ -351,8 +348,6 @@ async fn main() -> Result<()> {
             &args,
             &certs,
             request_client.clone(),
-            request_send.clone(),
-            request_recv.clone(),
             config_reload.clone(),
             tls_reload.clone(),
             shutdown.clone(),
@@ -413,13 +408,11 @@ async fn main() -> Result<()> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn run(
     args: &CmdLineArgs,
     certs: &Certs,
     mut request_client: request::Client,
-    request_send: async_channel::Sender<SamplingPolicy>,
-    request_recv: async_channel::Receiver<SamplingPolicy>,
     config_reload: Arc<Notify>,
     tls_reload: Arc<Notify>,
     shutdown: Arc<Notify>,
@@ -445,6 +438,9 @@ async fn run(
         .context("Failed to initialize last timestamp data file")?;
     read_last_timestamp(&settings.last_timestamp_data).await?;
 
+    // Policy requests are scoped to this run so a request queued by an
+    // earlier configuration generation cannot be opened after reload.
+    let (request_send, request_recv) = async_channel::bounded(REQUESTED_POLICY_CHANNEL_SIZE);
     let subscribe_client = subscribe::Client::new(
         settings.giganto_ingest_srv_addr,
         settings.giganto_publish_srv_addr,
@@ -615,8 +611,6 @@ last_timestamp_data = "{}"
         args: CmdLineArgs,
         certs: Certs,
         request_client: request::Client,
-        request_send: async_channel::Sender<SamplingPolicy>,
-        request_recv: async_channel::Receiver<SamplingPolicy>,
         config_reload: Arc<Notify>,
         tls_reload: Arc<Notify>,
         shutdown: Arc<Notify>,
@@ -652,15 +646,11 @@ last_timestamp_data = "{}"
                 manager_tls,
                 Arc::new(Notify::new()),
             );
-            let (request_send, request_recv) =
-                async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
             Some(Self {
                 _temp_dir: temp_dir,
                 args,
                 certs,
                 request_client,
-                request_send,
-                request_recv,
                 config_reload: Arc::new(Notify::new()),
                 tls_reload: Arc::new(Notify::new()),
                 shutdown: Arc::new(Notify::new()),
@@ -672,8 +662,6 @@ last_timestamp_data = "{}"
                 &self.args,
                 &self.certs,
                 self.request_client.clone(),
-                self.request_send.clone(),
-                self.request_recv.clone(),
                 self.config_reload.clone(),
                 self.tls_reload.clone(),
                 self.shutdown.clone(),
@@ -917,8 +905,6 @@ last_timestamp_data = "{}"
         .expect("load certs");
 
         let manager_tls = SharedTlsBytes::new(tls_bytes);
-        let (request_send, request_recv) =
-            async_channel::bounded::<SamplingPolicy>(REQUESTED_POLICY_CHANNEL_SIZE);
         let config_reload = Arc::new(Notify::new());
         let tls_reload = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
@@ -950,8 +936,6 @@ last_timestamp_data = "{}"
             &args,
             &certs,
             request_client,
-            request_send,
-            request_recv,
             config_reload,
             tls_reload,
             shutdown,
