@@ -32,7 +32,6 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, timeout};
 
-use super::time_series::clear_last_transfer_time;
 use super::*;
 use crate::cancellation::{CancellationCoordinator, CancellationPhase};
 use crate::client::{Certs, SharedTlsBytes, TlsBytes};
@@ -46,6 +45,20 @@ const SECS_PER_MINUTE: u64 = 60;
 const SECS_PER_DAY: u64 = 86_400;
 const DEFAULT_POLICY_ID: u32 = 1;
 const BASE_TS_NANOS: i64 = 1_700_000_000_000_000_000;
+// Functional waits allow for CI scheduling and disk latency. Tests of the
+// production shutdown deadline keep their own explicit timing assertions.
+const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+const RECONNECT_TEST_TIMEOUT: Duration =
+    Duration::from_secs(SERVER_RETRY_INTERVAL + TEST_TIMEOUT.as_secs());
+
+async fn join_test_task<T>(name: &str, mut task: tokio::task::JoinHandle<T>) -> T {
+    if let Ok(result) = timeout(TEST_TIMEOUT, &mut task).await {
+        result.unwrap_or_else(|error| panic!("{name} failed: {error}"))
+    } else {
+        task.abort();
+        panic!("{name} did not finish within {TEST_TIMEOUT:?}");
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionPath {
@@ -83,7 +96,7 @@ enum PublishBehavior {
     },
     /// Records stream-open requests without opening response streams.
     RecordRequests {
-        sender: async_channel::Sender<String>,
+        sender: async_channel::Sender<(Connection, RequestTimeSeriesGeneratorStream)>,
     },
 }
 
@@ -348,7 +361,7 @@ async fn handle_publish_connection(
         PublishBehavior::RecordRequests { sender } => {
             while let Ok(payload) = receive_stream_request(&mut recv).await {
                 if let StreamRequestPayload::TimeSeriesGenerator { request, .. } = payload
-                    && sender.send(request.id).await.is_err()
+                    && sender.send((connection.clone(), request)).await.is_err()
                 {
                     return;
                 }
@@ -645,20 +658,18 @@ struct TestHarness {
 
 impl TestHarness {
     async fn new(policies: &[SamplingPolicy]) -> Self {
-        reset_last_transfer_time().await;
         let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
         let certs = cert_key();
         let coordinator = CancellationCoordinator::new();
-        let (request_client, request_recv, last_time_series_path, temp_dir, policy_handle) =
-            setup_request_client(policies.len().max(1), &coordinator);
+        let (request_client, actor_task, last_time_series_path, temp_dir, policy_handle) =
+            setup_request_client(None, &coordinator).await;
 
         let mut rc = request_client;
         rc.sampling_policy_list(policies).await.unwrap();
 
         let client_handle = spawn_subscribe_client(
             &certs,
-            request_recv,
-            &last_time_series_path,
+            actor_task,
             ingest_addr,
             publish_addr,
             policy_handle.clone(),
@@ -678,15 +689,15 @@ impl TestHarness {
     }
 
     async fn wait_for_ack(&self) -> u32 {
-        timeout(Duration::from_secs(5), self.ingest_ack_recv.recv())
+        timeout(TEST_TIMEOUT, self.ingest_ack_recv.recv())
             .await
-            .expect("Ingest ACK should arrive within 5s")
+            .expect("Ingest ACK should arrive before the test deadline")
             .expect("Ingest ACK channel should remain open")
     }
 
     async fn wait_for_timestamp(&self, ids: &[u32]) -> HashMap<String, i64> {
         timeout(
-            Duration::from_secs(5),
+            TEST_TIMEOUT,
             wait_for_policy_ids(&self.last_time_series_path, ids, true),
         )
         .await
@@ -695,7 +706,7 @@ impl TestHarness {
 
     async fn wait_for_timestamp_removed(&self, ids: &[u32]) -> HashMap<String, i64> {
         timeout(
-            Duration::from_secs(5),
+            TEST_TIMEOUT,
             wait_for_policy_ids(&self.last_time_series_path, ids, false),
         )
         .await
@@ -703,29 +714,34 @@ impl TestHarness {
     }
 
     async fn cleanup(self) {
+        drop(self.request_client);
+        drop(self.policy_handle);
         cleanup_test_resources(self.coordinator, self.client_handle, self.server_handles).await;
     }
 }
 
-fn setup_request_client(
-    buffer: usize,
+async fn setup_request_client(
+    existing_path: Option<&Path>,
     coordinator: &CancellationCoordinator,
 ) -> (
     crate::request::Client,
-    async_channel::Receiver<SamplingPolicy>,
+    tokio::task::JoinHandle<Result<()>>,
     PathBuf,
     TempDir,
     PolicyHandle,
 ) {
-    let (request_send, request_recv) = async_channel::bounded::<SamplingPolicy>(buffer);
     let temp_dir = tempfile::tempdir().expect("tempdir");
-    let last_time_series_path = temp_dir.path().join("time_data.json");
+    let last_time_series_path =
+        existing_path.map_or_else(|| temp_dir.path().join("time_data.json"), Path::to_path_buf);
     let tls_bytes = crate::client::SharedTlsBytes::new(crate::client::TlsBytes::new(
         fs::read(CERT_PATH).unwrap(),
         fs::read(KEY_PATH).unwrap(),
         vec![fs::read(CA_CERT_PATH).unwrap()],
     ));
-    let policy_handle = spawn_policy_actor(request_send, coordinator);
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(last_time_series_path.clone(), coordinator)
+            .await
+            .unwrap();
     let mut request_client = crate::request::Client::new(
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
         HOST.to_string(),
@@ -735,7 +751,7 @@ fn setup_request_client(
     request_client.set_policy_handle(policy_handle.clone());
     (
         request_client,
-        request_recv,
+        actor_task,
         last_time_series_path,
         temp_dir,
         policy_handle,
@@ -758,30 +774,21 @@ fn new_policy(id: u32) -> SamplingPolicy {
 
 fn spawn_subscribe_client(
     certs: &Certs,
-    request_recv: async_channel::Receiver<SamplingPolicy>,
-    last_time_series_path: &Path,
+    actor_task: tokio::task::JoinHandle<Result<()>>,
     ingest_addr: SocketAddr,
     publish_addr: SocketAddr,
     policy_handle: PolicyHandle,
     coordinator: CancellationCoordinator,
 ) -> tokio::task::JoinHandle<()> {
-    let client = Client::new(
-        ingest_addr,
-        publish_addr,
-        HOST.to_string(),
-        last_time_series_path.to_path_buf(),
-        certs,
-        request_recv,
-    )
-    .expect("test client should build an endpoint");
+    let client = Client::new(ingest_addr, publish_addr, HOST.to_string(), certs)
+        .expect("test client should build an endpoint");
 
     tokio::spawn(async move {
-        let _ = client.run(policy_handle, coordinator).await;
+        client
+            .run(policy_handle, actor_task, coordinator)
+            .await
+            .expect("subscribe client completes successfully");
     })
-}
-
-async fn reset_last_transfer_time() {
-    clear_last_transfer_time().await;
 }
 
 async fn wait_for_policy_ids(
@@ -812,10 +819,10 @@ async fn cleanup_test_resources(
     server_handles.ingest_shutdown.notify_one();
     server_handles.publish_shutdown.notify_one();
 
-    let _ = tokio::join!(
-        client_handle,
-        server_handles.ingest_handle,
-        server_handles.publish_handle
+    tokio::join!(
+        join_test_task("subscribe client", client_handle),
+        join_test_task("Giganto Ingest server", server_handles.ingest_handle),
+        join_test_task("Giganto Publish server", server_handles.publish_handle)
     );
     INGEST_CHANNEL.write().await.clear();
 }
@@ -824,7 +831,10 @@ async fn cleanup_server_resources(server_handles: TestServerHandlers) {
     server_handles.ingest_shutdown.notify_one();
     server_handles.publish_shutdown.notify_one();
 
-    let _ = tokio::join!(server_handles.ingest_handle, server_handles.publish_handle);
+    tokio::join!(
+        join_test_task("Giganto Ingest server", server_handles.ingest_handle),
+        join_test_task("Giganto Publish server", server_handles.publish_handle)
+    );
 }
 
 fn read_time_data_map(last_time_series_path: &Path) -> HashMap<String, i64> {
@@ -1304,6 +1314,8 @@ async fn cancellation_drains_all_tasks() {
     harness.server_handles.ingest_shutdown.notify_one();
     harness.server_handles.publish_shutdown.notify_one();
 
+    drop(harness.request_client);
+    drop(harness.policy_handle);
     let drained = harness
         .coordinator
         .wait_for_drain(Duration::from_secs(10))
@@ -1334,6 +1346,8 @@ async fn cancellation_flushes_timestamps() {
     harness.server_handles.ingest_shutdown.notify_one();
     harness.server_handles.publish_shutdown.notify_one();
 
+    drop(harness.request_client);
+    drop(harness.policy_handle);
     let drained = harness
         .coordinator
         .wait_for_drain(Duration::from_secs(10))
@@ -1387,6 +1401,8 @@ async fn cancellation_drain_captures_inflight_acks() {
     harness.server_handles.ingest_shutdown.notify_one();
     harness.server_handles.publish_shutdown.notify_one();
 
+    drop(harness.request_client);
+    drop(harness.policy_handle);
     let drained = harness
         .coordinator
         .wait_for_drain(Duration::from_secs(10))
@@ -1411,37 +1427,13 @@ async fn cancellation_drain_captures_inflight_acks() {
     );
 }
 
-#[tokio::test]
-async fn cancellation_interrupts_stream_open_waiting_for_reply() {
-    let coordinator = CancellationCoordinator::new();
-    let task_coordinator = coordinator.clone();
-    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<StreamSendRequest>(1);
-    let task = tokio::spawn(async move {
-        process_network_stream(new_policy(DEFAULT_POLICY_ID), stream_tx, &task_coordinator).await
-    });
-
-    let (_payload, reply) = timeout(Duration::from_secs(1), stream_rx.recv())
-        .await
-        .expect("stream request is sent")
-        .expect("stream actor channel remains open");
-
-    coordinator.request_cancellation("stream-open reply test");
-    timeout(Duration::from_secs(1), task)
-        .await
-        .expect("stream-open wait observes cancellation")
-        .expect("stream-open task joins")
-        .expect("cancellation is a clean exit");
-    drop(reply);
-}
-
 /// A peer that keeps its ACK direction open after the client finishes its
 /// send direction must not make shutdown unbounded. Closing the endpoint at
-/// the deadline must release the ACK receiver so the timestamp writer can
+/// the deadline must release the ACK receiver so the policy actor can
 /// still perform its final flush.
 #[serial]
 #[tokio::test]
-async fn stalled_ack_stream_recovers_and_writer_flushes_before_return() {
-    reset_last_transfer_time().await;
+async fn stalled_ack_stream_recovers_and_actor_flushes_before_return() {
     let client_finished = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let (ingest_ack_send, ingest_ack_recv) = async_channel::bounded::<u32>(4);
@@ -1458,23 +1450,16 @@ async fn stalled_ack_stream_recovers_and_writer_flushes_before_return() {
     let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
 
     let coordinator = CancellationCoordinator::new();
-    let (mut request_client, request_recv, timestamp_path, _temp_dir, policy_handle) =
-        setup_request_client(1, &coordinator);
+    let (mut request_client, actor_task, timestamp_path, _temp_dir, policy_handle) =
+        setup_request_client(None, &coordinator).await;
     let policy = new_policy(DEFAULT_POLICY_ID);
     request_client
         .sampling_policy_list(std::slice::from_ref(&policy))
         .await
         .expect("policy setup succeeds");
-    let client = Client::new(
-        ingest_addr,
-        publish_addr,
-        HOST.to_string(),
-        timestamp_path.clone(),
-        &cert_key(),
-        request_recv,
-    )
-    .expect("subscribe client");
-    let client_handle = tokio::spawn(client.run(policy_handle, coordinator.clone()));
+    let client = Client::new(ingest_addr, publish_addr, HOST.to_string(), &cert_key())
+        .expect("subscribe client");
+    let client_handle = tokio::spawn(client.run(policy_handle, actor_task, coordinator.clone()));
 
     timeout(Duration::from_secs(5), ingest_ack_recv.recv())
         .await
@@ -1488,6 +1473,7 @@ async fn stalled_ack_stream_recovers_and_writer_flushes_before_return() {
     .expect("initial timestamp is persisted");
 
     let shutdown_started = Instant::now();
+    drop(request_client);
     coordinator.request_cancellation("stalled ACK test");
     timeout(Duration::from_secs(5), client_finished.notified())
         .await
@@ -1509,10 +1495,10 @@ async fn stalled_ack_stream_recovers_and_writer_flushes_before_return() {
     assert_eq!(
         coordinator.phase(),
         CancellationPhase::Completed,
-        "forced endpoint close must release ACK receivers and flush the writer before returning"
+        "forced endpoint close must release ACK receivers and flush the actor before returning"
     );
     assert_eq!(coordinator.tracker().active_count(), 0);
-    assert!(timestamp_path.exists(), "writer output must remain durable");
+    assert!(timestamp_path.exists(), "actor output must remain durable");
 
     release.notify_waiters();
     ingest_shutdown.notify_one();
@@ -1538,7 +1524,15 @@ async fn cancellation_drains_queued_time_series() {
         .await
         .expect("ingest connection");
     let coordinator = CancellationCoordinator::new();
-    let (time_sender, _time_receiver) = async_channel::bounded(4);
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+    policy_handle
+        .add_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .await
+        .unwrap();
     let policy_id = DEFAULT_POLICY_ID.to_string();
     let first = TimeSeries {
         sampling_policy_id: policy_id.clone(),
@@ -1556,7 +1550,7 @@ async fn cancellation_drains_queued_time_series() {
         first,
         CancellationToken::new(),
         ConnectionLifecycle::new(),
-        time_sender,
+        policy_handle,
         Arc::new(Notify::new()),
         coordinator.clone(),
     ));
@@ -1595,6 +1589,7 @@ async fn cancellation_drains_queued_time_series() {
         "ACK receiver drains"
     );
 
+    actor_task.await.unwrap().unwrap();
     endpoint.close(0u32.into(), &[]);
     shutdown.notify_one();
     ingest_handle.await.expect("ingest server joins");
@@ -1655,37 +1650,33 @@ async fn connection_generation_drain_waits_for_tracked_children() {
     publish_handle.await.expect("publish server joins");
 }
 
-/// The subscribe supervisor must return the timestamp writer's I/O error
+/// The subscribe supervisor must return the policy actor's I/O error
 /// instead of reporting a successful drain.
 #[serial]
 #[tokio::test]
-async fn timestamp_writer_failure_is_propagated() {
+async fn policy_actor_failure_is_propagated() {
     let (_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
     let temp_dir = tempfile::tempdir().expect("tempdir");
-    let invalid_path = temp_dir.path().join("missing-parent/time_data.json");
+    let invalid_path = temp_dir.path().join("time_data.json");
     let coordinator = CancellationCoordinator::new();
-    let (request_send, request_recv) = async_channel::bounded(1);
-    let policy_handle = spawn_policy_actor(request_send, &coordinator);
-    let client = Client::new(
-        ingest_addr,
-        publish_addr,
-        HOST.to_string(),
-        invalid_path,
-        &cert_key(),
-        request_recv,
-    )
-    .expect("subscribe client");
+    let (policy_handle, actor_task) = spawn_policy_actor(invalid_path.clone(), &coordinator)
+        .await
+        .unwrap();
+    fs::remove_file(&invalid_path).unwrap();
+    fs::create_dir(&invalid_path).unwrap();
+    let client = Client::new(ingest_addr, publish_addr, HOST.to_string(), &cert_key())
+        .expect("subscribe client");
 
-    coordinator.request_cancellation("writer failure test");
+    coordinator.request_cancellation("actor failure test");
     let error = timeout(
         Duration::from_secs(5),
-        client.run(policy_handle, coordinator.clone()),
+        client.run(policy_handle, actor_task, coordinator.clone()),
     )
     .await
     .expect("client exits after cancellation")
-    .expect_err("timestamp writer error must reach the supervisor");
+    .expect_err("policy actor error must reach the supervisor");
     assert!(
-        error.to_string().contains("timestamp writer failed"),
+        error.to_string().contains("policy actor failed"),
         "unexpected error: {error:#}"
     );
 
@@ -1711,6 +1702,8 @@ async fn restart_state_consistency() {
         .expect("policy timestamp must exist after first run");
     let last_time_series_path = harness.last_time_series_path.clone();
     let _keep_temp = harness.temp_dir;
+    drop(harness.request_client);
+    drop(harness.policy_handle);
     cleanup_test_resources(
         harness.coordinator,
         harness.client_handle,
@@ -1718,20 +1711,13 @@ async fn restart_state_consistency() {
     )
     .await;
 
-    let read_result = crate::subscribe::read_last_timestamp(&last_time_series_path).await;
-    assert!(
-        read_result.is_ok(),
-        "Timestamp file must be readable after cancellation: {read_result:?}"
-    );
-
     // --- Second run: re-use persisted timestamp file ---
-    reset_last_transfer_time().await;
 
     let (ingest_ack_recv2, server_handles2, ingest_addr2, publish_addr2) = start_servers();
     let certs = cert_key();
     let coordinator2 = CancellationCoordinator::new();
-    let (mut request_client2, request_recv2, _, _keep_dir, policy_handle2) =
-        setup_request_client(1, &coordinator2);
+    let (mut request_client2, actor_task2, _, _keep_dir, policy_handle2) =
+        setup_request_client(Some(&last_time_series_path), &coordinator2).await;
 
     request_client2
         .sampling_policy_list(std::slice::from_ref(&policy))
@@ -1740,8 +1726,7 @@ async fn restart_state_consistency() {
 
     let client_handle2 = spawn_subscribe_client(
         &certs,
-        request_recv2,
-        &last_time_series_path,
+        actor_task2,
         ingest_addr2,
         publish_addr2,
         policy_handle2,
@@ -1769,6 +1754,7 @@ async fn restart_state_consistency() {
          restart must not lose persisted state"
     );
 
+    drop(request_client2);
     cleanup_test_resources(coordinator2, client_handle2, server_handles2).await;
 }
 
@@ -1777,7 +1763,6 @@ async fn restart_state_consistency() {
 #[serial]
 #[tokio::test(flavor = "current_thread")]
 async fn reload_does_not_open_policy_queued_by_previous_run() {
-    reset_last_transfer_time().await;
     let policy = new_policy(DEFAULT_POLICY_ID);
     let (manager_addr, sync_events, manager_shutdown, manager_handle) =
         start_reload_policy_manager(policy);
@@ -1825,7 +1810,7 @@ async fn reload_does_not_open_policy_queued_by_previous_run() {
         let driver = async {
             assert_eq!(sync_events.recv().await.expect("first policy sync"), 1);
             // The manager event is emitted just before its response is returned.
-            // Give the request actor time to enqueue the restored policy while
+            // Give the policy actor time to register the restored policy while
             // the stalled publish handshake prevents it from being consumed.
             sleep(Duration::from_millis(200)).await;
             first_tls_reload_for_driver.notify_one();
@@ -1926,8 +1911,6 @@ async fn run_with_publish_behavior(
     PathBuf,
     TempDir,
 ) {
-    reset_last_transfer_time().await;
-
     let (ingest_ack_send, ingest_ack_recv) = async_channel::bounded::<u32>(10);
     let ingest_server = FakeGigantoServer::new_ingest().with_notify(ingest_ack_send);
     let publish_server = FakeGigantoServer::new_publish().with_publish_behavior(behavior);
@@ -1938,14 +1921,13 @@ async fn run_with_publish_behavior(
 
     let certs = cert_key();
     let coordinator = CancellationCoordinator::new();
-    let (mut request_client, request_recv, last_time_series_path, temp_dir, policy_handle) =
-        setup_request_client(policies.len().max(1), &coordinator);
+    let (mut request_client, actor_task, last_time_series_path, temp_dir, policy_handle) =
+        setup_request_client(None, &coordinator).await;
     request_client.sampling_policy_list(policies).await.unwrap();
 
     let client_handle = spawn_subscribe_client(
         &certs,
-        request_recv,
-        &last_time_series_path,
+        actor_task,
         ingest_addr,
         publish_addr,
         policy_handle.clone(),
@@ -1969,13 +1951,9 @@ async fn run_with_publish_behavior(
     )
 }
 
-/// Test: After a policy is deleted on a live publish connection, a
-/// re-add with the same id MUST open a fresh stream on that same
-/// connection. This is the regression test for the startup-only-dedup
-/// contract: no connection-lifetime dedupe set may survive into the
-/// steady-state `request_recv.recv()` loop — otherwise a re-add would
-/// be silently dropped as "already opened," breaking live
-/// reconfiguration.
+/// Deleting and then re-adding a policy on a live connection must create a
+/// fresh stream. The existing cancellation token lets the request loop remove
+/// the deleted policy from its set of already requested IDs.
 #[serial]
 #[tokio::test]
 async fn delete_then_readd_same_id_starts_fresh_stream() {
@@ -1987,8 +1965,7 @@ async fn delete_then_readd_same_id_starts_fresh_stream() {
     assert_eq!(id, policy.id);
     let _ = harness.wait_for_timestamp(&[policy.id]).await;
 
-    // Delete and confirm timestamp is removed (writer actor's Delete
-    // command both removes the in-memory entry and rewrites the file).
+    // Successful deletion removes the checkpoint directly in the policy actor.
     harness
         .request_client
         .delete_sampling_policy(&[policy.id])
@@ -1998,7 +1975,7 @@ async fn delete_then_readd_same_id_starts_fresh_stream() {
     assert_eq!(map_after_delete.get(&policy.id.to_string()), None);
 
     // Re-add the same policy id on the same live publish connection.
-    // The subscribe client must enqueue a fresh stream request and
+    // The subscribe client must send a fresh stream request and
     // the fake server must respond with a new inbound stream — which
     // drives a fresh ACK back through the ingest path.
     harness
@@ -2015,9 +1992,7 @@ async fn delete_then_readd_same_id_starts_fresh_stream() {
     let map_after_readd = harness.wait_for_timestamp(&[policy.id]).await;
     assert!(
         map_after_readd.contains_key(&policy.id.to_string()),
-        "timestamp for re-added policy must reappear; the writer \
-         actor's tombstone must have been cleared by the new stream \
-         worker's Reset command"
+        "the active policy must accept new ACKs after re-registration"
     );
 
     harness.cleanup().await;
@@ -2083,12 +2058,20 @@ async fn wait_for_ingest_channel(key: &str, should_exist: bool) -> Result<(), ()
 async fn inbound_stream_dispatch_is_id_keyed() {
     let policy_a = new_policy(1);
     let policy_b = new_policy(2);
-    let (coordinator, _rc, _ph, client_handle, server_handles, ingest_ack_recv, _, _temp) =
-        run_with_publish_behavior(
-            &[policy_a.clone(), policy_b.clone()],
-            PublishBehavior::ReverseOrder { expected: 2 },
-        )
-        .await;
+    let (
+        coordinator,
+        request_client,
+        policy_handle,
+        client_handle,
+        server_handles,
+        ingest_ack_recv,
+        _,
+        _temp,
+    ) = run_with_publish_behavior(
+        &[policy_a.clone(), policy_b.clone()],
+        PublishBehavior::ReverseOrder { expected: 2 },
+    )
+    .await;
 
     let mut expected_ids = vec![policy_a.id, policy_b.id];
     for _ in 0..2 {
@@ -2103,6 +2086,8 @@ async fn inbound_stream_dispatch_is_id_keyed() {
         "Both policies should receive correct ACKs even with reversed stream arrival: {expected_ids:?}"
     );
 
+    drop(request_client);
+    drop(policy_handle);
     cleanup_test_resources(coordinator, client_handle, server_handles).await;
 }
 
@@ -2114,12 +2099,20 @@ async fn inbound_stream_dispatch_is_id_keyed() {
 #[tokio::test]
 async fn inbound_stream_for_unknown_policy_is_dropped() {
     let policy = new_policy(DEFAULT_POLICY_ID);
-    let (coordinator, _rc, _ph, client_handle, server_handles, ingest_ack_recv, _, _temp) =
-        run_with_publish_behavior(
-            std::slice::from_ref(&policy),
-            PublishBehavior::StaleIdFirst { stale_id: 9999 },
-        )
-        .await;
+    let (
+        coordinator,
+        request_client,
+        policy_handle,
+        client_handle,
+        server_handles,
+        ingest_ack_recv,
+        _,
+        _temp,
+    ) = run_with_publish_behavior(
+        std::slice::from_ref(&policy),
+        PublishBehavior::StaleIdFirst { stale_id: 9999 },
+    )
+    .await;
 
     // The real policy's ACK must still arrive even though the
     // dispatcher saw an unknown-id stream first.
@@ -2129,6 +2122,8 @@ async fn inbound_stream_for_unknown_policy_is_dropped() {
         .expect("ACK channel should remain open");
     assert_eq!(id, policy.id);
 
+    drop(request_client);
+    drop(policy_handle);
     cleanup_test_resources(coordinator, client_handle, server_handles).await;
 }
 
@@ -2146,7 +2141,7 @@ async fn inbound_stream_arrival_after_delete_is_dropped() {
     let (
         coordinator,
         mut request_client,
-        _ph,
+        policy_handle,
         client_handle,
         server_handles,
         ingest_ack_recv,
@@ -2193,6 +2188,8 @@ async fn inbound_stream_arrival_after_delete_is_dropped() {
         policy_b.id,
     );
 
+    drop(request_client);
+    drop(policy_handle);
     cleanup_test_resources(coordinator, client_handle, server_handles).await;
 }
 
@@ -2206,8 +2203,6 @@ async fn inbound_stream_arrival_after_delete_is_dropped() {
 #[serial]
 #[tokio::test(flavor = "current_thread")]
 async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
-    reset_last_transfer_time().await;
-
     let (peer_cert_send, peer_cert_recv) = async_channel::bounded::<PeerCertEvent>(8);
     let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) =
         start_servers_with_config(config_server(), config_server(), peer_cert_send.clone());
@@ -2244,14 +2239,15 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Iteration 1: register a policy, build the shared endpoint, and drive
-    // both ingest and publish to a first ACK. The policy actor uses a
-    // dedicated coordinator that outlives the per-iteration subscribe
-    // coordinators so the same active_policies survive the rerun boundary.
-    let policy_coordinator = CancellationCoordinator::new();
-    let (request_send, request_recv) = async_channel::bounded::<SamplingPolicy>(1);
+    // both ingest and publish to a first ACK. Each iteration creates its own
+    // policy actor and restores checkpoints from the same file, like main::run.
+    let coordinator_1 = CancellationCoordinator::new();
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let last_time_series_path = temp_dir.path().join("time_data.json");
-    let policy_handle = spawn_policy_actor(request_send, &policy_coordinator);
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(last_time_series_path.clone(), &coordinator_1)
+            .await
+            .unwrap();
     let tls_bytes = crate::client::SharedTlsBytes::new(crate::client::TlsBytes::new(
         fs::read(CERT_PATH).unwrap(),
         fs::read(KEY_PATH).unwrap(),
@@ -2277,11 +2273,9 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
         .expect("initial client leaf")
         .as_ref()
         .to_vec();
-    let coordinator_1 = CancellationCoordinator::new();
     let client_handle_1 = spawn_subscribe_client(
         &certs,
-        request_recv.clone(),
-        &last_time_series_path,
+        actor_task,
         ingest_addr,
         publish_addr,
         policy_handle.clone(),
@@ -2317,6 +2311,8 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
     // endpoint, reload TLS material from disk, and rebuild the shared
     // subscribe::Client. This mirrors the `RunExitReason::TlsReload` branch
     // in `main::main`.
+    drop(policy_handle);
+    drop(request_client);
     coordinator_1.request_cancellation("TLS reload rerun");
     let _ = client_handle_1.await;
     INGEST_CHANNEL.write().await.clear();
@@ -2335,10 +2331,28 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
         "rerun should reload the rotated client certificate",
     );
     let coordinator_2 = CancellationCoordinator::new();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(last_time_series_path.clone(), &coordinator_2)
+            .await
+            .unwrap();
+    let mut request_client = crate::request::Client::new(
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        HOST.to_string(),
+        crate::client::SharedTlsBytes::new(crate::client::TlsBytes::new(
+            fs::read(CERT_PATH).unwrap(),
+            fs::read(KEY_PATH).unwrap(),
+            vec![fs::read(CA_CERT_PATH).unwrap()],
+        )),
+        Arc::new(Notify::new()),
+    );
+    request_client.set_policy_handle(policy_handle.clone());
+    request_client
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
     let client_handle_2 = spawn_subscribe_client(
         &certs,
-        request_recv.clone(),
-        &last_time_series_path,
+        actor_task,
         ingest_addr,
         publish_addr,
         policy_handle.clone(),
@@ -2402,7 +2416,417 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
         .expect("ingest ACK channel open");
     assert_eq!(id, extra_policy.id);
 
+    drop(request_client);
+    drop(policy_handle);
     cleanup_test_resources(coordinator_2, client_handle_2, server_handles).await;
-    policy_coordinator.request_cancellation("test cleanup");
     drop(temp_dir);
+}
+
+mod policy_lifecycle {
+    use super::*;
+
+    // This scope starts after the serial lock is acquired. It bounds actor replies
+    // and setup too, not just the individual network waits and teardown joins.
+    async fn run_test(future: impl std::future::Future<Output = ()>) {
+        timeout(Duration::from_secs(60), future)
+            .await
+            .expect("policy lifecycle test completes within its deadline");
+    }
+
+    /// Runs the real Publish control loop against a QUIC peer which records requests
+    /// without replying with data streams, to exercise pending-request deduplication
+    /// and reconnection through the production watch loop.
+    struct PublishProbe {
+        requests: async_channel::Receiver<(Connection, RequestTimeSeriesGeneratorStream)>,
+        control: tokio::task::JoinHandle<Result<()>>,
+        server: tokio::task::JoinHandle<()>,
+        shutdown: Arc<Notify>,
+        endpoint: Endpoint,
+    }
+
+    impl PublishProbe {
+        fn start(handle: PolicyHandle, coordinator: CancellationCoordinator) -> Self {
+            let (sender, requests) = async_channel::unbounded();
+            let shutdown = Arc::new(Notify::new());
+            let (addr, server) = FakeGigantoServer::new_publish()
+                .with_publish_behavior(PublishBehavior::RecordRequests { sender })
+                .start_publish(shutdown.clone());
+            let endpoint = client::config(&cert_key()).unwrap();
+            let client_endpoint = endpoint.clone();
+            let (series, _unused) = async_channel::bounded(1);
+            let control = tokio::spawn(async move {
+                publish_connection_control(
+                    series,
+                    addr,
+                    HOST,
+                    &client_endpoint,
+                    REQUIRED_GIGANTO_VERSION,
+                    handle,
+                    Arc::new(Notify::new()),
+                    coordinator,
+                )
+                .await
+            });
+            Self {
+                requests,
+                control,
+                server,
+                shutdown,
+                endpoint,
+            }
+        }
+
+        async fn next(&self) -> (Connection, RequestTimeSeriesGeneratorStream) {
+            timeout(RECONNECT_TEST_TIMEOUT, self.requests.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn assert_no_additional_requests(&self) {
+            // Call only after the expected request arrives. The production loop
+            // keeps the stream open, so this is a bounded observation window,
+            // not an assertion that snapshot processing has finished.
+            match timeout(Duration::from_secs(1), self.requests.recv()).await {
+                Err(_) => {}
+                Ok(Ok((_, request))) => panic!("unexpected additional request: {}", request.id),
+                Ok(Err(error)) => panic!("Publish request channel closed unexpectedly: {error}"),
+            }
+        }
+
+        async fn finish(self, coordinator: &CancellationCoordinator) {
+            coordinator.request_cancellation("Publish probe complete");
+            join_test_task("Publish control", self.control)
+                .await
+                .unwrap();
+            self.endpoint.close(0u32.into(), &[]);
+            self.shutdown.notify_one();
+            join_test_task("Giganto Publish server", self.server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn add_then_delete_before_publish_connection_never_opens_deleted_policy() {
+        run_test(async {
+            let coordinator = CancellationCoordinator::new();
+            let (mut review, actor, path, _dir, handle) =
+                setup_request_client(None, &coordinator).await;
+            review
+                .sampling_policy_list(&[new_policy(42)])
+                .await
+                .unwrap();
+            handle.record_ack(42, 123).await.unwrap();
+            review.delete_sampling_policy(&[42]).await.unwrap();
+            review.sampling_policy_list(&[new_policy(7)]).await.unwrap();
+
+            let probe = PublishProbe::start(handle.clone(), coordinator.clone());
+            assert_eq!(probe.next().await.1.id, "7");
+            probe.assert_no_additional_requests().await;
+            assert!(!read_time_data_map(&path).contains_key("42"));
+            probe.finish(&coordinator).await;
+            drop(review);
+            drop(handle);
+            join_test_task("policy actor", actor).await.unwrap();
+            assert!(coordinator.wait_for_drain(TEST_TIMEOUT).await);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn latest_snapshot_does_not_duplicate_pending_stream_requests() {
+        run_test(async {
+            let coordinator = CancellationCoordinator::new();
+            let (mut review, actor, _, _dir, handle) =
+                setup_request_client(None, &coordinator).await;
+            let probe = PublishProbe::start(handle.clone(), coordinator.clone());
+            review
+                .sampling_policy_list(&[new_policy(42)])
+                .await
+                .unwrap();
+            assert_eq!(probe.next().await.1.id, "42");
+            // The peer still has not opened the inbound stream for 42. Updating the
+            // full snapshot with another policy must not send a second request for 42.
+            review
+                .sampling_policy_list(&[new_policy(42), new_policy(7)])
+                .await
+                .unwrap();
+            assert_eq!(probe.next().await.1.id, "7");
+            probe.assert_no_additional_requests().await;
+            probe.finish(&coordinator).await;
+            drop(review);
+            drop(handle);
+            join_test_task("policy actor", actor).await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_active_policy_with_saved_resume_timestamp() {
+        run_test(async {
+            let coordinator = CancellationCoordinator::new();
+            let (mut review, actor, _, _dir, handle) =
+                setup_request_client(None, &coordinator).await;
+            let mut policy = new_policy(42);
+            policy.src_ip = Some("192.0.2.1".parse().unwrap());
+            policy.dst_ip = Some("192.0.2.2".parse().unwrap());
+            review
+                .sampling_policy_list(std::slice::from_ref(&policy))
+                .await
+                .unwrap();
+            let probe = PublishProbe::start(handle.clone(), coordinator.clone());
+            let (connection, first) = probe.next().await;
+            assert_eq!(first.start, 0);
+            assert_eq!(first.src_ip, policy.src_ip);
+            assert_eq!(first.dst_ip, policy.dst_ip);
+            assert_eq!(first.sensor, policy.node);
+            handle.record_ack(42, 123).await.unwrap();
+            let _ = handle.stream_policy(42).await.unwrap();
+            connection.close(0u32.into(), b"simulate Giganto connection loss");
+            // No policy-change notification is emitted after disconnect.
+            let (_, resumed) = probe.next().await;
+            assert_eq!(resumed.id, "42");
+            assert_eq!(resumed.start, 86_400_000_000_123);
+            assert_eq!(resumed.src_ip, policy.src_ip);
+            assert_eq!(resumed.dst_ip, policy.dst_ip);
+            assert_eq!(resumed.sensor, policy.node);
+            probe.finish(&coordinator).await;
+            drop(review);
+            drop(handle);
+            join_test_task("policy actor", actor).await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deletion_during_giganto_disconnect_persists_and_is_not_replayed() {
+        run_test(async {
+            let coordinator = CancellationCoordinator::new();
+            let (mut review, actor, path, _dir, handle) =
+                setup_request_client(None, &coordinator).await;
+            review
+                .sampling_policy_list(&[new_policy(42)])
+                .await
+                .unwrap();
+            let probe = PublishProbe::start(handle.clone(), coordinator.clone());
+            let (connection, _) = probe.next().await;
+            handle.record_ack(42, 123).await.unwrap();
+            let _ = handle.stream_policy(42).await.unwrap();
+            connection.close(0u32.into(), b"simulate Giganto connection loss");
+
+            // Execute the same Review request handler while Publish is disconnected.
+            timeout(TEST_TIMEOUT, review.delete_sampling_policy(&[42]))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!read_time_data_map(&path).contains_key("42"));
+            review.sampling_policy_list(&[new_policy(7)]).await.unwrap();
+            assert_eq!(probe.next().await.1.id, "7");
+            probe.finish(&coordinator).await;
+            drop(review);
+            drop(handle);
+            join_test_task("policy actor", actor).await.unwrap();
+            // Restart loads the actual file saved by the preceding run.
+            let next_coordinator = CancellationCoordinator::new();
+            let (next, next_actor) = spawn_policy_actor(path, &next_coordinator).await.unwrap();
+            next.add_policies(vec![new_policy(42)]).await.unwrap();
+            assert_eq!(next.stream_policy(42).await.unwrap().unwrap().start, 0);
+            drop(next);
+            join_test_task("restarted policy actor", next_actor)
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn delete_after_publish_worker_finishes_still_removes_timestamp() {
+        run_test(async {
+            let coordinator = CancellationCoordinator::new();
+            let (mut review, actor, path, _dir, handle) =
+                setup_request_client(None, &coordinator).await;
+            review
+                .sampling_policy_list(&[new_policy(42)])
+                .await
+                .unwrap();
+            let state = handle.stream_policy(42).await.unwrap().unwrap();
+            let shutdown = Arc::new(Notify::new());
+            let mut fake = FakeGigantoServer::new_publish();
+            fake.publish_repeat_delay = Duration::ZERO;
+            let (addr, server) = fake.start_publish(shutdown.clone());
+            let endpoint = client::config(&cert_key()).unwrap();
+            let (connection, mut send) =
+                publish_connect(&endpoint, addr, HOST, REQUIRED_GIGANTO_VERSION)
+                    .await
+                    .unwrap();
+            process_network_stream(&mut send, &state).await.unwrap();
+            let mut recv = connection.accept_uni().await.unwrap();
+            assert_eq!(
+                receive_time_series_generator_stream_start_message(&mut recv)
+                    .await
+                    .unwrap(),
+                42
+            );
+            let policy_token = state.token.clone();
+            let connection_token = CancellationToken::new();
+            let (sender, receiver) = async_channel::unbounded();
+            let worker = coordinator.tracker().spawn(run_stream_worker(
+                recv,
+                sender,
+                state,
+                connection_token.clone(),
+                coordinator.clone(),
+            ));
+            // Join this worker itself, not an assumed total number of unrelated tasks.
+            // Neither policy nor connection cancellation can account for its exit.
+            join_test_task("Publish worker consumes EOF", worker)
+                .await
+                .unwrap();
+            assert!(!policy_token.is_cancelled());
+            assert!(!connection_token.is_cancelled());
+            assert!(!coordinator.is_cancelled());
+            assert!(connection.close_reason().is_none());
+            assert_eq!(receiver.recv().await.unwrap().sampling_policy_id, "42");
+            // Seed an acknowledged checkpoint after natural worker completion.
+            handle.record_ack(42, 123).await.unwrap();
+            let _ = handle.stream_policy(42).await.unwrap();
+            assert_eq!(read_time_data_map(&path)["42"], 123);
+            review.delete_sampling_policy(&[42]).await.unwrap();
+            assert!(!read_time_data_map(&path).contains_key("42"));
+            assert!(handle.get_policy(42).await.is_none());
+            coordinator.request_cancellation("EOF deletion test complete");
+            endpoint.close(0u32.into(), &[]);
+            shutdown.notify_one();
+            join_test_task("Giganto Publish server", server).await;
+            drop(review);
+            drop(handle);
+            join_test_task("policy actor", actor).await.unwrap();
+            assert!(coordinator.wait_for_drain(TEST_TIMEOUT).await);
+        })
+        .await;
+    }
+
+    /// The peer reads only the frame length, then withholds flow-control credit.
+    /// Cancelling an in-progress frame must close the connection rather than append
+    /// a different request to a partially written frame.
+    async fn interrupt_blocked_request(delete_policy: bool) {
+        let mut config = config_server();
+        let transport = Arc::get_mut(&mut config.transport).unwrap();
+        transport.stream_receive_window(1024u32.into());
+        transport.receive_window(2048u32.into());
+        let server_endpoint =
+            Endpoint::server(config, SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
+        let addr = server_endpoint.local_addr().unwrap();
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (_send, mut recv) =
+                server_handshake(&connection, &format!("={REQUIRED_GIGANTO_VERSION}"))
+                    .await
+                    .unwrap();
+            let mut length = [0; 4];
+            recv.read_exact(&mut length).await.unwrap();
+            assert!(u32::from_be_bytes(length) > 2048);
+            started.send(()).unwrap();
+            connection.closed().await;
+            drop(recv);
+        });
+        let coordinator = CancellationCoordinator::new();
+        let (mut review, actor, _, _dir, handle) = setup_request_client(None, &coordinator).await;
+        let mut policy = new_policy(42);
+        policy.node = Some("x".repeat(4 * 1024 * 1024));
+        review.sampling_policy_list(&[policy]).await.unwrap();
+        let endpoint = client::config(&cert_key()).unwrap();
+        let control_endpoint = endpoint.clone();
+        let control_handle = handle.clone();
+        let control_coordinator = coordinator.clone();
+        let (sender, _receiver) = async_channel::bounded(1);
+        let control = tokio::spawn(async move {
+            publish_connection_control(
+                sender,
+                addr,
+                HOST,
+                &control_endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                control_handle,
+                Arc::new(Notify::new()),
+                control_coordinator,
+            )
+            .await
+        });
+        timeout(TEST_TIMEOUT, observed).await.unwrap().unwrap();
+        assert!(!control.is_finished());
+        if delete_policy {
+            timeout(TEST_TIMEOUT, review.delete_sampling_policy(&[42]))
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            coordinator.request_cancellation("cancel blocked Publish request");
+        }
+        join_test_task("interrupted write closes connection", server).await;
+        coordinator.request_cancellation("blocked write test complete");
+        drop(review);
+        drop(handle);
+        join_test_task("Publish control", control).await.unwrap();
+        join_test_task("policy actor", actor).await.unwrap();
+        endpoint.close(0u32.into(), &[]);
+        assert!(coordinator.wait_for_drain(TEST_TIMEOUT).await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_publish_request_blocked_by_flow_control() {
+        run_test(async {
+            interrupt_blocked_request(false).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn policy_delete_interrupts_publish_request_blocked_by_flow_control() {
+        run_test(async {
+            interrupt_blocked_request(true).await;
+        })
+        .await;
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn giganto_shutdown_does_not_prevent_review_handler_deletion() {
+        run_test(async {
+            let policy = new_policy(42);
+            let mut harness = TestHarness::new(std::slice::from_ref(&policy)).await;
+            harness.wait_for_ack().await;
+            harness.wait_for_timestamp(&[42]).await;
+            harness.server_handles.ingest_shutdown.notify_one();
+            harness.server_handles.publish_shutdown.notify_one();
+            join_test_task(
+                "Giganto Ingest server",
+                harness.server_handles.ingest_handle,
+            )
+            .await;
+            join_test_task(
+                "Giganto Publish server",
+                harness.server_handles.publish_handle,
+            )
+            .await;
+            timeout(
+                TEST_TIMEOUT,
+                harness.request_client.delete_sampling_policy(&[42]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(!read_time_data_map(&harness.last_time_series_path).contains_key("42"));
+            harness
+                .coordinator
+                .request_cancellation("Giganto offline test finished");
+            drop(harness.request_client);
+            drop(harness.policy_handle);
+            join_test_task("subscribe client", harness.client_handle).await;
+            assert_eq!(harness.coordinator.tracker().active_count(), 0);
+            INGEST_CHANNEL.write().await.clear();
+        })
+        .await;
+    }
 }

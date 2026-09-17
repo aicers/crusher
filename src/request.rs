@@ -448,7 +448,6 @@ mod tests {
     };
     use std::time::Duration;
 
-    use async_channel::TryRecvError;
     use quinn::{Endpoint, ServerConfig, crypto::rustls::QuicServerConfig};
     use review_protocol::request::Handler;
     use review_protocol::types::{SamplingKind, SamplingPolicy};
@@ -464,16 +463,15 @@ mod tests {
     const CA_CERT_PATH: &str = "tests/ca_cert.pem";
 
     /// Creates a test client with a policy actor and default configuration.
-    /// Returns the client, a receiver for sampling policies, and the policy handle.
-    fn create_test_client() -> (
-        Client,
-        async_channel::Receiver<SamplingPolicy>,
-        PolicyHandle,
-    ) {
-        let (tx, rx) = async_channel::unbounded();
+    /// Returns the client, checkpoint directory, and the policy handle.
+    async fn create_test_client() -> (Client, tempfile::TempDir, PolicyHandle) {
+        let dir = tempfile::tempdir().unwrap();
         let config_reload = Arc::new(Notify::new());
         let coordinator = CancellationCoordinator::new();
-        let policy_handle = crate::policy::spawn_policy_actor(tx, &coordinator);
+        let (policy_handle, _actor) =
+            crate::policy::spawn_policy_actor(dir.path().join("time_data.json"), &coordinator)
+                .await
+                .unwrap();
 
         let client = Client {
             server_address: "127.0.0.1:8080".parse().unwrap(),
@@ -485,7 +483,7 @@ mod tests {
             policy_handle: Some(policy_handle.clone()),
         };
 
-        (client, rx, policy_handle)
+        (client, dir, policy_handle)
     }
 
     /// Creates a test sampling policy with the given ID.
@@ -534,7 +532,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn add_policy_duplicate_entries() {
         // Test: Adding the same policy ID twice should only process it once
-        let (mut client, rx, policy_handle) = create_test_client();
+        let (mut client, _dir, policy_handle) = create_test_client().await;
         let policy = create_test_policy(1);
 
         // Add the policy first time
@@ -544,28 +542,21 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify policy was added to active list
-        assert_eq!(policy_handle.get_all_policies().await.len(), 1);
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 1);
         assert!(policy_handle.get_policy(1).await.is_some());
-
-        // Verify policy was sent through channel
-        let received = rx.try_recv().expect("Success to receive policy");
-        assert_eq!(received.id, 1);
 
         // Add the same policy again (duplicate)
         let result = client.sampling_policy_list(&[policy]).await;
         assert!(result.is_ok());
 
         // Verify still only one policy in active list
-        assert_eq!(policy_handle.get_all_policies().await.len(), 1);
-
-        // Verify no additional policy was sent (channel should be empty)
-        assert_eq!(rx.try_recv().expect_err("Empty"), TryRecvError::Empty);
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_policy_multiple_entries() {
         // Test: Adding multiple policies, some duplicates
-        let (mut client, rx, policy_handle) = create_test_client();
+        let (mut client, _dir, policy_handle) = create_test_client().await;
         let policy1 = create_test_policy(1);
         let policy2 = create_test_policy(2);
 
@@ -574,13 +565,7 @@ mod tests {
             .sampling_policy_list(&[policy1.clone(), policy2.clone()])
             .await;
         assert!(result.is_ok());
-        assert_eq!(policy_handle.get_all_policies().await.len(), 2);
-
-        // Drain the channel
-        let received1 = rx.try_recv().expect("Success to receive the first policy");
-        assert_eq!(received1.id, 1);
-        let received2 = rx.try_recv().expect("Success to receive the second policy");
-        assert_eq!(received2.id, 2);
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 2);
 
         // Try to add policy1 again as duplicate, and policy3 as new
         let policy3 = create_test_policy(3);
@@ -588,36 +573,28 @@ mod tests {
         assert!(result.is_ok());
 
         // Should have 3 policies now (policy1 was duplicate, policy3 is new)
-        assert_eq!(policy_handle.get_all_policies().await.len(), 3);
-
-        // Only policy3 should be in the channel
-        let received3 = rx.try_recv().expect("Success to receive the third policy");
-        assert_eq!(received3.id, 3);
-
-        // Channel should be empty
-        assert_eq!(rx.try_recv().expect_err("Empty"), TryRecvError::Empty);
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 3);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn add_policy_when_queue_empty() {
-        // Test: Adding a policy when queue is empty
-        let (mut client, rx, policy_handle) = create_test_client();
+    async fn add_policy_when_active_set_empty() {
+        // Test: Adding the first policy updates the active set.
+        let (mut client, _dir, policy_handle) = create_test_client().await;
 
         // Verify empty initial state
-        assert!(policy_handle.get_all_policies().await.is_empty());
+        assert!(policy_handle.get_all_policy_ids().is_empty());
 
         let policy = create_test_policy(1);
         let result = client.sampling_policy_list(&[policy]).await;
         assert!(result.is_ok());
 
-        assert_eq!(policy_handle.get_all_policies().await.len(), 1);
-        assert!(rx.try_recv().is_ok());
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_policy_rapid_add_remove_add_cycle() {
         // Test: Rapid add/remove/add cycle should work correctly
-        let (mut client, rx, policy_handle) = create_test_client();
+        let (mut client, _dir, policy_handle) = create_test_client().await;
         let policy = create_test_policy(1);
 
         // Add policy
@@ -625,60 +602,45 @@ mod tests {
             .sampling_policy_list(std::slice::from_ref(&policy))
             .await
             .expect("Success to add policy");
-        assert_eq!(policy_handle.get_all_policies().await.len(), 1);
-        let _ = rx.try_recv(); // Drain channel
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 1);
 
         // Remove policy
         client
             .delete_sampling_policy(&[1])
             .await
             .expect("Success to remove policy");
-        assert!(policy_handle.get_all_policies().await.is_empty());
+        assert!(policy_handle.get_all_policy_ids().is_empty());
 
         // Add policy again (should succeed since it was deleted)
         client
             .sampling_policy_list(&[policy])
             .await
             .expect("Success to add policy");
-        assert_eq!(policy_handle.get_all_policies().await.len(), 1);
-
-        // Verify policy was sent again
-        let received = rx.try_recv().expect("Success to receive policy");
-        assert_eq!(received.id, 1);
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_policy_empty_list() {
         // Test: Empty policy list should be handled correctly
-        let (mut client, rx, policy_handle) = create_test_client();
+        let (mut client, _dir, policy_handle) = create_test_client().await;
 
         let result = client.sampling_policy_list(&[]).await;
         assert!(result.is_ok());
-        assert!(policy_handle.get_all_policies().await.is_empty());
-        assert_eq!(rx.try_recv().expect_err("Empty"), TryRecvError::Empty);
+        assert!(policy_handle.get_all_policy_ids().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_policy_ignores_update_on_conflict() {
         // Test: Duplicate ID should not update existing policy data
-        let (mut client, rx, policy_handle) = create_test_client();
+        let (mut client, _dir, policy_handle) = create_test_client().await;
         let original_policy = create_test_policy(1);
 
         client
             .sampling_policy_list(std::slice::from_ref(&original_policy))
             .await
             .expect("Success to add policy");
-        let received = rx.try_recv().expect("Success to receive policy");
-        assert_eq!(received.id, 1);
 
-        // NOTE:
-        // When a policy with an existing ID is submitted, it is treated as a conflict.
-        //
-        // In this case:
-        // - the existing policy remains unchanged, and
-        // - no message is observed on the corresponding receiver.
-        //
-        // Only newly added (non-conflicting) policies produce a message.
+        // Duplicate IDs leave the existing policy unchanged.
         let mut conflicting_policy = create_test_policy(1);
         conflicting_policy.interval = Duration::from_secs(30);
         conflicting_policy.node = Some("updated_node".to_string());
@@ -687,9 +649,6 @@ mod tests {
             .sampling_policy_list(&[conflicting_policy])
             .await
             .expect("No error or failure");
-
-        // No message for the conflicting policy
-        assert_eq!(rx.try_recv().expect_err("Empty"), TryRecvError::Empty);
 
         let stored = policy_handle.get_policy(1).await.unwrap();
         assert_eq!(stored.interval, original_policy.interval);
@@ -701,8 +660,8 @@ mod tests {
     // =========================================================================
     #[tokio::test(flavor = "current_thread")]
     async fn delete_policy_multiple_times() {
-        // Test: Multiple delete requests should accumulate in pending deletes
-        let (mut client, rx, policy_handle) = create_test_client();
+        // Test: Multiple delete requests remove all requested policies.
+        let (mut client, _dir, policy_handle) = create_test_client().await;
 
         // Add multiple policies first
         let policies: Vec<SamplingPolicy> = (1..=5).map(create_test_policy).collect();
@@ -710,12 +669,6 @@ mod tests {
             .sampling_policy_list(&policies)
             .await
             .expect("Success to add policies");
-
-        // Drain channel
-        (1..=5).for_each(|id| {
-            let received = rx.try_recv().expect("Success to receive policy");
-            assert_eq!(received.id, id);
-        });
 
         // Delete policies one by one
         client
@@ -737,15 +690,15 @@ mod tests {
         assert!(policy_handle.get_policy(3).await.is_none());
 
         // Verify active list only has remaining policies
-        assert_eq!(policy_handle.get_all_policies().await.len(), 2);
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 2);
         assert!(policy_handle.get_policy(4).await.is_some());
         assert!(policy_handle.get_policy(5).await.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn delete_policy_batch() {
-        // Test: Batch delete request should mark all IDs as pending
-        let (mut client, rx, policy_handle) = create_test_client();
+        // Test: Batch delete removes every requested ID.
+        let (mut client, _dir, policy_handle) = create_test_client().await;
 
         // Add policies
         let policies: Vec<SamplingPolicy> = (1..=5).map(create_test_policy).collect();
@@ -753,12 +706,6 @@ mod tests {
             .sampling_policy_list(&policies)
             .await
             .expect("Success to add policies");
-
-        // Drain channel
-        (1..=5).for_each(|id| {
-            let received = rx.try_recv().expect("Success to receive policy");
-            assert_eq!(received.id, id);
-        });
 
         // Delete multiple in one call
         client
@@ -777,7 +724,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn delete_policy_ignores_non_existent_id() {
         // Test: Deleting a non-existent policy should be silently ignored
-        let (mut client, rx, policy_handle) = create_test_client();
+        let (mut client, _dir, policy_handle) = create_test_client().await;
 
         // Add a policy
         let policy = create_test_policy(1);
@@ -785,8 +732,6 @@ mod tests {
             .sampling_policy_list(&[policy])
             .await
             .expect("Success to add policy");
-        let received = rx.try_recv().expect("Success to receive policy");
-        assert_eq!(received.id, 1);
 
         // Try to delete a non-existent policy
         let result = client.delete_sampling_policy(&[999]).await;
@@ -796,25 +741,19 @@ mod tests {
         assert!(policy_handle.get_policy(999).await.is_none());
 
         // Active list should still have the original policy
-        assert_eq!(policy_handle.get_all_policies().await.len(), 1);
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn delete_policy_ignores_non_existent_id_in_batch() {
         // Test: Deleting a non-existent policy should be silently ignored
-        let (mut client, rx, policy_handle) = create_test_client();
+        let (mut client, _dir, policy_handle) = create_test_client().await;
 
         let policies: Vec<SamplingPolicy> = (1..=7).map(create_test_policy).collect();
         client
             .sampling_policy_list(&policies)
             .await
             .expect("Success to add policies");
-
-        // Drain channel
-        (1..=7).for_each(|id| {
-            let received = rx.try_recv().expect("Success to receive policy");
-            assert_eq!(received.id, id);
-        });
 
         // Try to delete a batch including non-existent policy and some existent policies
         let result = client.delete_sampling_policy(&[1, 2, 3, 999, 4, 5]).await;
@@ -825,7 +764,7 @@ mod tests {
         }
         assert!(policy_handle.get_policy(999).await.is_none());
 
-        assert_eq!(policy_handle.get_all_policies().await.len(), 2);
+        assert_eq!(policy_handle.get_all_policy_ids().len(), 2);
         assert!(policy_handle.get_policy(6).await.is_some());
         assert!(policy_handle.get_policy(7).await.is_some());
     }
@@ -833,7 +772,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn delete_policy_empty_list() {
         // Test: Delete on empty active list should be no-op
-        let (mut client, _, _policy_handle) = create_test_client();
+        let (mut client, _dir, _policy_handle) = create_test_client().await;
 
         let result = client.delete_sampling_policy(&[1, 2, 3]).await;
         assert!(result.is_ok());
@@ -841,8 +780,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn delete_policy_no_double_delete() {
-        // Test: Deleting the same ID twice should only add it once to pending
-        let (mut client, rx, policy_handle) = create_test_client();
+        // Test: Deleting the same ID twice is idempotent.
+        let (mut client, _dir, policy_handle) = create_test_client().await;
 
         // Add a policy
         let policy = create_test_policy(1);
@@ -850,8 +789,6 @@ mod tests {
             .sampling_policy_list(&[policy])
             .await
             .expect("Success to add policy");
-        let received = rx.try_recv().expect("Success to receive policy");
-        assert_eq!(received.id, 1);
 
         // Delete it once
         client
@@ -874,7 +811,7 @@ mod tests {
         // Test: Rapid add/remove cycles of the same ID.
         // With per-policy CancellationTokens, re-add after delete
         // creates a fresh token — no consume step needed.
-        let (mut client, rx, policy_handle) = create_test_client();
+        let (mut client, _dir, policy_handle) = create_test_client().await;
 
         for _ in 0..3 {
             let policy = create_test_policy(1);
@@ -882,8 +819,6 @@ mod tests {
                 .sampling_policy_list(&[policy])
                 .await
                 .expect("Success to add policy");
-            let received = rx.try_recv().expect("Success to receive policy");
-            assert_eq!(received.id, 1);
 
             let token = policy_handle.get_policy_token(1).await.unwrap();
             assert!(!token.is_cancelled());
@@ -898,35 +833,7 @@ mod tests {
         }
 
         // Final state: empty active list
-        assert!(policy_handle.get_all_policies().await.is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn delete_policy_succeeds_after_receiver_dropped() {
-        let (mut client, rx, policy_handle) = create_test_client();
-
-        let policy = create_test_policy(1);
-        client
-            .sampling_policy_list(&[policy])
-            .await
-            .expect("Success to add policy");
-        let received = rx.try_recv().expect("Success to receive policy");
-        assert_eq!(received.id, 1);
-
-        // Drop receiver to simulate the notification channel being unavailable.
-        // Delete path should remain functional regardless.
-        drop(rx);
-
-        assert!(policy_handle.get_policy(1).await.is_some());
-
-        client
-            .delete_sampling_policy(&[1])
-            .await
-            .expect("Success to delete policy");
-
-        // Final state: empty active list, policy deleted
-        assert!(policy_handle.get_policy(1).await.is_none());
-        assert!(policy_handle.get_all_policies().await.is_empty());
+        assert!(policy_handle.get_all_policy_ids().is_empty());
     }
 
     // =========================================================================
@@ -936,7 +843,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn idle_mode_exits_on_reload() {
         // Test: Config reload notification should exit idle mode
-        let (mut client, _, _policy_handle) = create_test_client();
+        let (mut client, _dir, _policy_handle) = create_test_client().await;
         let config_reload = client.config_reload.clone();
         let tls_reload = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
@@ -968,7 +875,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn idle_mode_exits_on_tls_reload() {
-        let (mut client, _, _) = create_test_client();
+        let (mut client, _dir, _) = create_test_client().await;
         let tls_reload = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
 
@@ -994,7 +901,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn idle_mode_exits_on_shutdown() {
-        let (mut client, _, _) = create_test_client();
+        let (mut client, _dir, _) = create_test_client().await;
         let tls_reload = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
 
@@ -1021,7 +928,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn idle_mode_health_check_returns_immediately() {
         // Test: health_check=true returns without waiting for config_reload
-        let (mut client, _rx, _policy_handle) = create_test_client();
+        let (mut client, _dir, _policy_handle) = create_test_client().await;
         let config_reload = client.config_reload.clone();
         let tls_reload = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
@@ -1057,7 +964,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn update_config_triggers_config_reload() {
         // Test: update_config should notify the config_reload
-        let (mut client, _rx, _policy_handle) = create_test_client();
+        let (mut client, _dir, _policy_handle) = create_test_client().await;
         let config_reload = client.config_reload.clone();
 
         // Spawn a task to wait for notification
@@ -1079,7 +986,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn idle_mode_sets_status_to_idle() {
         // Test: Entering idle mode should set status to Idle
-        let (mut client, _rx, _policy_handle) = create_test_client();
+        let (mut client, _dir, _policy_handle) = create_test_client().await;
         let config_reload = client.config_reload.clone();
         let tls_reload = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
@@ -1168,7 +1075,7 @@ mod tests {
         // Test: run() should exit cleanly when cancellation is requested.
         // Policy state is owned by the actor (spawned per-run), so
         // there is nothing to clear on the Client itself.
-        let (mut client, _rx, _policy_handle) = create_test_client();
+        let (mut client, _dir, _policy_handle) = create_test_client().await;
 
         let coordinator = CancellationCoordinator::new();
         coordinator.request_cancellation("test");
@@ -1250,10 +1157,13 @@ mod tests {
             }
         });
 
-        let (request_send, request_recv) = async_channel::unbounded::<SamplingPolicy>();
+        let dir = tempfile::tempdir().unwrap();
         let tls_bytes = SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
         let coordinator = CancellationCoordinator::new();
-        let policy_handle = crate::policy::spawn_policy_actor(request_send, &coordinator);
+        let (policy_handle, actor) =
+            crate::policy::spawn_policy_actor(dir.path().join("time_data.json"), &coordinator)
+                .await
+                .unwrap();
         let mut client = Client::new(
             server_addr,
             "localhost".to_string(),
@@ -1265,20 +1175,17 @@ mod tests {
         client.sync_sampling_policies().await;
 
         // Verify policies were restored into the active list
-        let all = policy_handle.get_all_policies().await;
-        assert_eq!(all.len(), 2);
+        let mut ids = policy_handle.get_all_policy_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, [10, 20]);
         assert!(policy_handle.get_policy(10).await.is_some());
         assert!(policy_handle.get_policy(20).await.is_some());
 
-        // Verify policies were sent through the channel
-        let p1 = request_recv.try_recv().expect("first policy");
-        let p2 = request_recv.try_recv().expect("second policy");
-        assert_eq!(p1.id, 10);
-        assert_eq!(p2.id, 20);
-        assert_eq!(
-            request_recv.try_recv().expect_err("Empty"),
-            TryRecvError::Empty
-        );
+        let snapshot = policy_handle.subscribe();
+        assert_eq!(snapshot.borrow().len(), 2);
+        drop(client);
+        drop(policy_handle);
+        actor.await.unwrap().unwrap();
 
         server_task.abort();
     }

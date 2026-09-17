@@ -20,12 +20,10 @@ use client::{Certs, SharedTlsBytes, TlsBytes};
 use logging::init_tracing;
 use request::IdleExitReason;
 use settings::Settings;
-use subscribe::{clear_ingest_channel, ensure_time_data_exists, read_last_timestamp};
+use subscribe::clear_ingest_channel;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
-
-const REQUESTED_POLICY_CHANNEL_SIZE: usize = 1;
 
 #[derive(Clone, Copy)]
 enum CompletedTopLevelTask {
@@ -434,20 +432,11 @@ async fn run(
         if is_local_config { "local" } else { "remote" }
     );
 
-    ensure_time_data_exists(&settings.last_timestamp_data)
-        .context("Failed to initialize last timestamp data file")?;
-    read_last_timestamp(&settings.last_timestamp_data).await?;
-
-    // Policy requests are scoped to this run so a request queued by an
-    // earlier configuration generation cannot be opened after reload.
-    let (request_send, request_recv) = async_channel::bounded(REQUESTED_POLICY_CHANNEL_SIZE);
     let subscribe_client = subscribe::Client::new(
         settings.giganto_ingest_srv_addr,
         settings.giganto_publish_srv_addr,
         settings.giganto_name,
-        settings.last_timestamp_data,
         certs,
-        request_recv,
     )?;
 
     info!("Time series generate started");
@@ -455,7 +444,8 @@ async fn run(
 
     // Spawn the policy actor. All policy state mutations go through
     // this handle, ensuring atomicity and cancellation safety.
-    let policy_handle = policy::spawn_policy_actor(request_send, &coordinator);
+    let (policy_handle, actor_task) =
+        policy::spawn_policy_actor(settings.last_timestamp_data, &coordinator).await?;
     request_client.set_policy_handle(policy_handle.clone());
 
     // Spawn top-level tasks with tokio::spawn (NOT tracker.spawn).
@@ -463,7 +453,7 @@ async fn run(
     // completion, while TaskTracker is reserved for child/background
     // tasks spawned inside subscribe and request.
     let mut subscribe_handle =
-        tokio::spawn(subscribe_client.run(policy_handle, coordinator.clone()));
+        tokio::spawn(subscribe_client.run(policy_handle, actor_task, coordinator.clone()));
 
     let request_coordinator = coordinator.clone();
     let mut request_handle =
@@ -928,7 +918,9 @@ last_timestamp_data = "{}"
                 .to_string(),
         );
 
-        let mut guard = None;
+        // Reuse the test guard so this settings test neither installs a global
+        // subscriber nor writes application logs outside the test capture.
+        let mut guard = Some(test_tracing_guard());
         // Preload the notification so this local-settings test does not
         // depend on whatever process may use the fixed Manager test port.
         tls_reload.notify_one();
