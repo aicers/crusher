@@ -1,57 +1,12 @@
-use std::{
-    collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{BufReader, BufWriter},
-    path::{Path, PathBuf},
-    sync::LazyLock,
-};
-
 use anyhow::{Context, Result, bail};
-use async_channel::{Receiver, Sender};
-use async_trait::async_trait;
+use async_channel::Sender;
 use review_protocol::types::SamplingPolicy;
 use serde::Serialize;
-use serde_json::Value;
-use tokio::sync::RwLock;
-use tracing::info;
 
 use super::{Event, INGEST_CHANNEL};
 
 pub(super) const SECOND_TO_NANO: i64 = 1_000_000_000;
 const SECONDS_PER_DAY: i64 = 86_400;
-const DEFAULT_START_TIMESTAMP_NANOS: i64 = 0;
-
-// Stores the last transferred time-series timestamp in nanoseconds by sampling policy ID.
-static LAST_TRANSFER_TIME: LazyLock<RwLock<HashMap<String, i64>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-#[async_trait]
-pub(super) trait SamplingPolicyExt {
-    /// Returns the next stream start timestamp in nanoseconds.
-    async fn start_timestamp_nanos(&self) -> Result<i64>;
-}
-
-#[async_trait]
-impl SamplingPolicyExt for SamplingPolicy {
-    async fn start_timestamp_nanos(&self) -> Result<i64> {
-        let id = self.id.to_string();
-        let last_transfer_time = LAST_TRANSFER_TIME.read().await;
-
-        let start: i64 = if let Some(last_time) = last_transfer_time.get(&id) {
-            let period_secs = i64::try_from(self.period.as_secs())?;
-            let period_nanos = period_secs
-                .checked_mul(SECOND_TO_NANO)
-                .context("Failed to convert period to nanoseconds")?;
-            last_time
-                .checked_add(period_nanos)
-                .unwrap_or(DEFAULT_START_TIMESTAMP_NANOS)
-        } else {
-            DEFAULT_START_TIMESTAMP_NANOS
-        };
-
-        Ok(start)
-    }
-}
 
 #[cfg_attr(test, derive(serde::Deserialize))]
 #[derive(Default, Clone, Debug, Serialize)]
@@ -73,9 +28,8 @@ impl TimeSeries {
     /// - The policy's period is not a multiple of the interval (i.e.,
     ///   `period % interval != 0`).
     /// - The policy's period is not a divisor of 1 day (86400 seconds).
-    /// - The start timestamp cannot be computed.
     /// - The series length overflows `usize`.
-    pub(super) async fn try_new(policy: &SamplingPolicy) -> Result<Self> {
+    pub(super) fn try_new(policy: &SamplingPolicy, start_timestamp: i64) -> Result<Self> {
         let interval_secs = policy.interval.as_secs();
         let period_secs = policy.period.as_secs();
         if interval_secs == 0 {
@@ -91,10 +45,7 @@ impl TimeSeries {
             bail!("period must be a multiple of interval");
         }
 
-        let start_secs = policy
-            .start_timestamp_nanos()
-            .await?
-            .div_euclid(SECOND_TO_NANO);
+        let start_secs = start_timestamp.div_euclid(SECOND_TO_NANO);
         let len = usize::try_from(period_secs / interval_secs)?;
         let series = vec![0_f64; len];
         Ok(TimeSeries {
@@ -117,7 +68,14 @@ impl TimeSeries {
             .context("failed to calculate elapsed time")?;
 
         if elapsed > period {
-            if let Some(sender) = INGEST_CHANNEL.read().await.get(&self.sampling_policy_id) {
+            // Clone the sender out of the lock to avoid holding the
+            // RwLock read guard across an await point.
+            let cached_sender = INGEST_CHANNEL
+                .read()
+                .await
+                .get(&self.sampling_policy_id)
+                .cloned();
+            if let Some(sender) = cached_sender {
                 sender.send(self.clone()).await?;
             } else {
                 send_channel.send(self.clone()).await?;
@@ -175,88 +133,6 @@ fn start_time(policy: &SamplingPolicy, time_secs: i64) -> Result<i64> {
     Ok(start_time)
 }
 
-pub(super) async fn write_last_timestamp(
-    last_series_time_path: PathBuf,
-    time_receiver: Receiver<(String, i64)>,
-) -> Result<()> {
-    while let Ok((id, timestamp_nanos)) = time_receiver.recv().await {
-        LAST_TRANSFER_TIME.write().await.insert(id, timestamp_nanos);
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&last_series_time_path)
-            .context("Failed to open last time series timestamp file")?;
-        serde_json::to_writer(&file, &(*LAST_TRANSFER_TIME.read().await))
-            .context("Failed to write last time series timestamp file")?;
-    }
-    Ok(())
-}
-
-/// Ensures the timestamp data file exists at the given path.
-///
-/// If the file already exists, this is a no-op. If it is missing, an
-/// empty JSON object (`{}`) is written so that subsequent reads and
-/// writes succeed.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be created (e.g. the parent
-/// directory does not exist or a permission error occurs).
-pub fn ensure_time_data_exists(path: &Path) -> std::io::Result<()> {
-    match File::open(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            info!(
-                "Timestamp data file not found; creating: {}",
-                path.display()
-            );
-            std::fs::write(path, b"{}")
-        }
-        Err(e) => Err(e),
-    }
-}
-
-pub(super) async fn read_last_timestamp(last_series_time_path: &Path) -> Result<()> {
-    let file = File::open(last_series_time_path)
-        .context("Failed to open last time series timestamp file")?;
-    let json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
-    let Value::Object(map_data) = json else {
-        bail!("Failed to parse json data, invalid json format");
-    };
-    for (key, val) in map_data {
-        let Value::Number(value) = val else {
-            bail!("Failed to parse timestamp data, invalid json format");
-        };
-        let Some(timestamp_nanos) = value.as_i64() else {
-            bail!("Failed to convert timestamp data, invalid time data");
-        };
-        LAST_TRANSFER_TIME
-            .write()
-            .await
-            .insert(key, timestamp_nanos);
-    }
-    Ok(())
-}
-
-pub(super) fn delete_last_timestamp(last_series_time_path: &Path, id: u32) -> Result<()> {
-    let file = File::open(last_series_time_path)?;
-    let id = format!("{id}");
-    let mut json: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
-    if let Value::Object(ref mut map_data) = json {
-        map_data.remove(&id);
-    }
-    let file = File::create(last_series_time_path)?;
-    serde_json::to_writer(BufWriter::new(file), &json)?;
-
-    Ok(())
-}
-
-#[cfg(test)]
-pub(super) async fn clear_last_transfer_time() {
-    LAST_TRANSFER_TIME.write().await.clear();
-}
-
 #[cfg(test)]
 #[allow(
     clippy::cast_precision_loss,
@@ -265,12 +141,10 @@ pub(super) async fn clear_last_transfer_time() {
     clippy::float_cmp
 )]
 mod tests {
-    use std::io::Write;
     use std::time::Duration;
 
     use review_protocol::types::{SamplingKind, SamplingPolicy};
     use serial_test::serial;
-    use tempfile::tempdir;
     use time::{Date, Month};
 
     use super::*;
@@ -558,268 +432,6 @@ mod tests {
     // =========================================================================
     // Tests for JSON timestamp persistence (read/write/delete)
     // =========================================================================
-
-    #[tokio::test]
-    async fn test_write_last_timestamp_creates_file() {
-        let dir = tempdir().expect("Success creating temp dir");
-        let file_path = dir.path().join("timestamps.json");
-
-        // Use unique keys with random component to avoid interference
-        let unique_id = format!(
-            "{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let key1 = format!("write_creates_1_{unique_id}");
-        let key2 = format!("write_creates_2_{unique_id}");
-
-        let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
-
-        // Start the writer task
-        let writer_handle = tokio::spawn(write_last_timestamp(file_path.clone(), receiver));
-
-        // Send some timestamps
-        sender
-            .send((key1.clone(), 1_000_000_000_i64))
-            .await
-            .unwrap();
-        sender
-            .send((key2.clone(), 2_000_000_000_i64))
-            .await
-            .unwrap();
-
-        // Close sender to end the writer task
-        drop(sender);
-        let _ = writer_handle
-            .await
-            .expect("Writer task successfully completed");
-
-        // Verify file was created and contains valid JSON
-        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
-        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-        assert!(json.is_object());
-
-        // Verify the in-memory state contains our keys with correct values
-        let map = LAST_TRANSFER_TIME.read().await;
-        assert_eq!(map.get(&key1), Some(&1_000_000_000_i64));
-        assert_eq!(map.get(&key2), Some(&2_000_000_000_i64));
-        drop(map);
-
-        // Cleanup: remove our keys from the global state
-        LAST_TRANSFER_TIME.write().await.remove(&key1);
-        LAST_TRANSFER_TIME.write().await.remove(&key2);
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_write_last_timestamp_updates_existing() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("timestamps.json");
-
-        // Use unique key with random component to avoid interference
-        let unique_id = format!(
-            "{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let key = format!("write_updates_{unique_id}");
-
-        let (sender, receiver) = async_channel::bounded::<(String, i64)>(10);
-
-        let path_clone = file_path.clone();
-        let writer_handle =
-            tokio::spawn(async move { write_last_timestamp(path_clone, receiver).await });
-
-        // Send initial timestamp
-        sender.send((key.clone(), 1_000_000_000_i64)).await.unwrap();
-
-        // Update with new timestamp
-        sender.send((key.clone(), 3_000_000_000_i64)).await.unwrap();
-
-        drop(sender);
-        let _ = writer_handle.await;
-
-        // Verify file was created and contains valid JSON
-        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
-        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-        assert!(json.is_object());
-
-        // Verify the in-memory state contains the updated value
-        let map = LAST_TRANSFER_TIME.read().await;
-        assert_eq!(map.get(&key), Some(&3_000_000_000_i64));
-        drop(map);
-
-        // Cleanup: remove our key from the global state
-        LAST_TRANSFER_TIME.write().await.remove(&key);
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_read_last_timestamp_from_file() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("timestamps.json");
-
-        // Use unique keys to avoid interference with other tests
-        let key1 = format!("read_test_policy_{}", std::process::id());
-        let key2 = format!("read_test_policy2_{}", std::process::id());
-        let json_content = format!("{{\"{key1}\": 1234567890, \"{key2}\": 9876543210}}");
-
-        // Pre-write a JSON file with known content
-        let mut file = File::create(&file_path).expect("failed to create file");
-        file.write_all(json_content.as_bytes())
-            .expect("failed to write");
-        drop(file);
-
-        // Remove our keys first if they exist from a previous run
-        LAST_TRANSFER_TIME.write().await.remove(&key1);
-        LAST_TRANSFER_TIME.write().await.remove(&key2);
-
-        // Read the file
-        read_last_timestamp(&file_path)
-            .await
-            .expect("failed to read");
-
-        // Verify the in-memory state contains our keys
-        let map = LAST_TRANSFER_TIME.read().await;
-        assert_eq!(map.get(&key1), Some(&1_234_567_890_i64));
-        assert_eq!(map.get(&key2), Some(&9_876_543_210_i64));
-
-        // Cleanup
-        drop(map);
-        LAST_TRANSFER_TIME.write().await.remove(&key1);
-        LAST_TRANSFER_TIME.write().await.remove(&key2);
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_read_last_timestamp_nonexistent_file() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("nonexistent.json");
-
-        // Reading a nonexistent file should fail since read_last_timestamp
-        // no longer creates the file (initialization is done in main)
-        let result = read_last_timestamp(&file_path).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_read_last_timestamp_invalid_json() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("invalid.json");
-
-        // Write invalid JSON
-        let mut file = File::create(&file_path).expect("failed to create file");
-        file.write_all(b"not valid json").expect("failed to write");
-        drop(file);
-
-        // Reading invalid JSON should fail
-        let result = read_last_timestamp(&file_path).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_read_last_timestamp_wrong_format() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("wrong_format.json");
-
-        // Write JSON array instead of object
-        let mut file = File::create(&file_path).expect("failed to create file");
-        file.write_all(b"[1, 2, 3]").expect("failed to write");
-        drop(file);
-
-        // Reading wrong format should fail
-        let result = read_last_timestamp(&file_path).await;
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_delete_last_timestamp_removes_entry() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("timestamps.json");
-
-        // Pre-write a JSON file with multiple entries
-        let mut file = File::create(&file_path).expect("failed to create file");
-        file.write_all(b"{\"1\": 1000, \"2\": 2000, \"3\": 3000}")
-            .expect("failed to write");
-        drop(file);
-
-        // Delete entry with id=2
-        delete_last_timestamp(&file_path, 2).expect("failed to delete");
-
-        // Verify the file contents
-        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
-        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-        let map = json.as_object().unwrap();
-
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key("1"));
-        assert!(!map.contains_key("2"));
-        assert!(map.contains_key("3"));
-    }
-
-    #[test]
-    fn test_delete_last_timestamp_nonexistent_entry() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("timestamps.json");
-
-        // Pre-write a JSON file
-        let mut file = File::create(&file_path).expect("failed to create file");
-        file.write_all(b"{\"1\": 1000, \"2\": 2000}")
-            .expect("failed to write");
-        drop(file);
-
-        // Delete entry with id=99 (doesn't exist)
-        delete_last_timestamp(&file_path, 99).expect("should succeed even if entry doesn't exist");
-
-        // Verify original entries are still there
-        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
-        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-        let map = json.as_object().unwrap();
-
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key("1"));
-        assert!(map.contains_key("2"));
-    }
-
-    #[test]
-    fn test_delete_last_timestamp_nonexistent_file() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("nonexistent.json");
-
-        // Deleting from nonexistent file should fail
-        let result = delete_last_timestamp(&file_path, 1);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_delete_last_timestamp_last_entry() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("timestamps.json");
-
-        // Pre-write a JSON file with single entry
-        let mut file = File::create(&file_path).expect("failed to create file");
-        file.write_all(b"{\"1\": 1000}").expect("failed to write");
-        drop(file);
-
-        // Delete the only entry
-        delete_last_timestamp(&file_path, 1).expect("failed to delete");
-
-        // Verify the file is now empty object
-        let contents = std::fs::read_to_string(&file_path).expect("failed to read file");
-        let json: serde_json::Value = serde_json::from_str(&contents).expect("invalid JSON");
-        let map = json.as_object().unwrap();
-
-        assert!(map.is_empty());
-    }
-
-    // =========================================================================
-    // Tests for event_value function
     // =========================================================================
 
     #[test]
@@ -1383,135 +995,23 @@ mod tests {
     }
 
     // =========================================================================
-    // Tests for SamplingPolicyExt::start_timestamp
+    // Tests for TimeSeries construction
     // =========================================================================
-
-    #[serial]
-    #[tokio::test]
-    async fn test_start_timestamp_no_last_transmission() {
-        // When there is no last transmission timestamp in LAST_TRANSFER_TIME,
-        // start_timestamp_nanos() should return 0
-
-        // Use a unique policy ID that won't conflict with other tests
-        let policy_id = 999_999_u32;
-        let policy = SamplingPolicy {
-            id: policy_id,
-            kind: SamplingKind::Conn,
-            interval: Duration::from_mins(1),
-            period: Duration::from_hours(1),
-            offset: 0,
-            src_ip: None,
-            dst_ip: None,
-            node: Some("test_start_timestamp_no_last".to_string()),
-            column: None,
-        };
-
-        // Ensure the key doesn't exist in the global map
-        LAST_TRANSFER_TIME
-            .write()
-            .await
-            .remove(&policy_id.to_string());
-
-        // start_timestamp_nanos should return 0 when no last timestamp exists
-        let start = policy
-            .start_timestamp_nanos()
-            .await
-            .expect("should succeed");
-        assert_eq!(start, 0);
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_start_timestamp_with_last_transmission() {
-        // When there is a last transmission timestamp, start_timestamp_nanos() should
-        // return last_time + period (in nanoseconds)
-
-        // Use a unique policy ID to avoid interference
-        let policy_id = 888_888_u32;
-        let policy = SamplingPolicy {
-            id: policy_id,
-            kind: SamplingKind::Conn,
-            interval: Duration::from_mins(1),
-            period: Duration::from_hours(1), // 1 hour
-            offset: 0,
-            src_ip: None,
-            dst_ip: None,
-            node: Some("test_start_timestamp_with_last".to_string()),
-            column: None,
-        };
-
-        // Set a known last transmission timestamp (in nanoseconds)
-        let last_timestamp_ns: i64 = 1_705_320_000_000_000_000; // 2024-01-15 12:00:00 UTC in nanos
-        LAST_TRANSFER_TIME
-            .write()
-            .await
-            .insert(policy_id.to_string(), last_timestamp_ns);
-
-        // start_timestamp_nanos should return last_time + period_in_nanos
-        // period = 3600 seconds = 3_600_000_000_000 nanoseconds
-        let expected = last_timestamp_ns + 3600 * SECOND_TO_NANO;
-        let start = policy
-            .start_timestamp_nanos()
-            .await
-            .expect("should succeed");
-        assert_eq!(start, expected);
-
-        // Cleanup
-        LAST_TRANSFER_TIME
-            .write()
-            .await
-            .remove(&policy_id.to_string());
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_start_timestamp_period_conversion_overflow() {
-        // When the period is too large to convert to nanoseconds (overflow),
-        // start_timestamp_nanos() should return an error
-
-        // Use a unique policy ID
-        let policy_id = 777_777_u32;
-        let policy = SamplingPolicy {
-            id: policy_id,
-            kind: SamplingKind::Conn,
-            interval: Duration::from_mins(1),
-            // Use a very large period that will overflow when multiplied by SECOND_TO_NANO
-            // i64::MAX / SECOND_TO_NANO ≈ 9_223_372_036 seconds
-            // So a period larger than this will overflow
-            period: Duration::from_secs(10_000_000_000), // ~317 years, will overflow
-            offset: 0,
-            src_ip: None,
-            dst_ip: None,
-            node: Some("test_start_timestamp_overflow".to_string()),
-            column: None,
-        };
-
-        // Set a last transmission timestamp to trigger the overflow path
-        let last_timestamp_ns: i64 = 1_000_000_000_000_000_000;
-        LAST_TRANSFER_TIME
-            .write()
-            .await
-            .insert(policy_id.to_string(), last_timestamp_ns);
-
-        // start_timestamp_nanos should fail due to overflow in period conversion
-        let result = policy.start_timestamp_nanos().await;
-        assert!(
-            result.is_err(),
-            "Expected error due to period conversion overflow"
-        );
-
-        // Cleanup
-        LAST_TRANSFER_TIME
-            .write()
-            .await
-            .remove(&policy_id.to_string());
+    #[test]
+    fn try_new_uses_explicit_resume_timestamp() {
+        let policy = create_simple_policy(60, 3600);
+        for (nanos, seconds) in [(1_700_003_600_000_000_001, 1_700_003_600), (-1, -1), (0, 0)] {
+            let series = TimeSeries::try_new(&policy, nanos).unwrap();
+            assert_eq!(series.start_secs, seconds);
+            assert_eq!(series.series.len(), 60);
+        }
     }
 
     #[tokio::test]
     async fn try_new_valid_period_interval() {
         // period (3600) is a multiple of interval (60)
         let policy = create_simple_policy(60, 3600);
-        let result = TimeSeries::try_new(&policy).await;
+        let result = TimeSeries::try_new(&policy, 0);
         assert!(result.is_ok());
         let ts = result.unwrap();
         assert_eq!(ts.series.len(), 60); // 3600 / 60 = 60
@@ -1521,7 +1021,7 @@ mod tests {
     async fn try_new_invalid_period_not_divisor_of_1_day() {
         // period (777) is not a divisor of 1 day (86400 seconds)
         let policy = create_simple_policy(7, 777);
-        let result = TimeSeries::try_new(&policy).await;
+        let result = TimeSeries::try_new(&policy, 0);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1534,7 +1034,7 @@ mod tests {
     async fn try_new_invalid_period_not_multiple_of_interval() {
         // period (100) is not a multiple of interval (30)
         let policy = create_simple_policy(30, 100);
-        let result = TimeSeries::try_new(&policy).await;
+        let result = TimeSeries::try_new(&policy, 0);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1547,7 +1047,7 @@ mod tests {
     async fn try_new_interval_zero() {
         // interval is 0, should error before division
         let policy = create_simple_policy(0, 3600);
-        let result = TimeSeries::try_new(&policy).await;
+        let result = TimeSeries::try_new(&policy, 0);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1560,7 +1060,7 @@ mod tests {
     async fn try_new_period_zero() {
         // period is 0, should error
         let policy = create_simple_policy(60, 0);
-        let result = TimeSeries::try_new(&policy).await;
+        let result = TimeSeries::try_new(&policy, 0);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1568,45 +1068,6 @@ mod tests {
             "unexpected error message: {err_msg}"
         );
     }
-
-    #[test]
-    fn ensure_time_data_creates_missing_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("time_data.json");
-        assert!(!path.exists());
-
-        ensure_time_data_exists(&path).unwrap();
-
-        assert!(path.exists());
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents, "{}");
-    }
-
-    #[test]
-    fn ensure_time_data_preserves_existing_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("time_data.json");
-        std::fs::write(&path, r#"{"1":100}"#).unwrap();
-
-        ensure_time_data_exists(&path).unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents, r#"{"1":100}"#);
-    }
-
-    #[test]
-    fn ensure_time_data_missing_parent_propagates_error() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("no_such_dir").join("time_data.json");
-
-        let err = ensure_time_data_exists(&path).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    // =========================================================================
-    // Time-handling contracts
-    //
-    // These tests pin down the externally observable contracts of the
     // time-handling code against a stable baseline. They prefer integer Unix
     // timestamps and literal expected values over runtime-derived ones.
     // =========================================================================
@@ -1847,203 +1308,6 @@ mod tests {
             assert_eq!(decoded.sampling_policy_id, "policy-1");
             assert_eq!(decoded.series, vec![0.0, 1.5, -2.25, 3.125]);
             assert_eq!(decoded.start_secs, i64::default());
-        }
-
-        // Unique-per-test prefix prevents interference with concurrent tests
-        // that share the global LAST_TRANSFER_TIME map.
-        async fn cleanup_keys(keys: &[&str]) {
-            let mut map = LAST_TRANSFER_TIME.write().await;
-            for key in keys {
-                map.remove(*key);
-            }
-        }
-
-        #[serial]
-        #[tokio::test]
-        async fn json_persistence_round_trip_with_boundary_timestamps() {
-            // Round-trip the exact integer values 0, 1, 1_700_000_000, and
-            // 253_402_300_799 through the on-disk JSON file used by
-            // write_last_timestamp/read_last_timestamp.
-            let prefix = format!("regression_round_trip_{}", std::process::id());
-            let k0 = format!("{prefix}_0");
-            let k1 = format!("{prefix}_1");
-            let k2 = format!("{prefix}_2");
-            let k3 = format!("{prefix}_3");
-            cleanup_keys(&[&k0, &k1, &k2, &k3]).await;
-
-            let dir = tempdir().expect("tempdir");
-            let path = dir.path().join("time_data.json");
-
-            let payload = format!(
-                "{{\"{k0}\":{TS_EPOCH},\
-                  \"{k1}\":{TS_EPOCH_PLUS_ONE},\
-                  \"{k2}\":{TS_2023_11_14_221320Z},\
-                  \"{k3}\":{TS_9999_12_31_235959Z}}}"
-            );
-            std::fs::write(&path, payload).expect("write timestamps file");
-
-            read_last_timestamp(&path).await.expect("read timestamps");
-
-            let map = LAST_TRANSFER_TIME.read().await;
-            assert_eq!(map.get(&k0), Some(&TS_EPOCH));
-            assert_eq!(map.get(&k1), Some(&TS_EPOCH_PLUS_ONE));
-            assert_eq!(map.get(&k2), Some(&TS_2023_11_14_221320Z));
-            assert_eq!(map.get(&k3), Some(&TS_9999_12_31_235959Z));
-            drop(map);
-
-            // Now write back through the producer task and verify the
-            // file's parsed contents preserve those exact integers.
-            let (sender, receiver) = async_channel::bounded::<(String, i64)>(8);
-            let writer = tokio::spawn(write_last_timestamp(path.clone(), receiver));
-            for (id, ts) in [
-                (&k0, TS_EPOCH),
-                (&k1, TS_EPOCH_PLUS_ONE),
-                (&k2, TS_2023_11_14_221320Z),
-                (&k3, TS_9999_12_31_235959Z),
-            ] {
-                sender.send((id.clone(), ts)).await.expect("send");
-            }
-            drop(sender);
-            writer
-                .await
-                .expect("writer task joined")
-                .expect("writer ran successfully");
-
-            let raw = std::fs::read_to_string(&path).expect("read file");
-            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse json");
-            let obj = parsed.as_object().expect("object");
-            assert_eq!(obj.get(&k0).and_then(Value::as_i64), Some(TS_EPOCH));
-            assert_eq!(
-                obj.get(&k1).and_then(Value::as_i64),
-                Some(TS_EPOCH_PLUS_ONE),
-            );
-            assert_eq!(
-                obj.get(&k2).and_then(Value::as_i64),
-                Some(TS_2023_11_14_221320Z),
-            );
-            assert_eq!(
-                obj.get(&k3).and_then(Value::as_i64),
-                Some(TS_9999_12_31_235959Z),
-            );
-
-            cleanup_keys(&[&k0, &k1, &k2, &k3]).await;
-        }
-
-        #[tokio::test]
-        async fn json_persistence_rejects_non_integer_timestamp_values() {
-            // The on-disk format must reject non-integer timestamp values.
-            // We assert this against literal JSON strings.
-            let dir = tempdir().expect("tempdir");
-
-            // Floating-point values must be rejected even though they are
-            // valid JSON numbers.
-            let path_float = dir.path().join("float.json");
-            std::fs::write(&path_float, b"{\"1\": 1700000000.5}").expect("write");
-            assert!(read_last_timestamp(&path_float).await.is_err());
-
-            // RFC3339-style strings must be rejected (production code
-            // expects integer seconds, not strings).
-            let path_str = dir.path().join("string.json");
-            std::fs::write(&path_str, b"{\"1\": \"2023-11-14T22:13:20Z\"}").expect("write");
-            assert!(read_last_timestamp(&path_str).await.is_err());
-        }
-
-        #[test]
-        fn json_persistence_delete_preserves_other_integer_timestamps() {
-            // Deleting one entry must not perturb the integer values of the
-            // others. Use literal integers so the expected file contents
-            // are independent of any time library.
-            let dir = tempdir().expect("tempdir");
-            let path = dir.path().join("time_data.json");
-            let payload = format!(
-                "{{\"1\":{TS_EPOCH},\
-                  \"2\":{TS_2023_11_14_221320Z},\
-                  \"3\":{TS_9999_12_31_235959Z}}}"
-            );
-            std::fs::write(&path, payload).expect("write");
-
-            delete_last_timestamp(&path, 2).expect("delete");
-
-            let raw = std::fs::read_to_string(&path).expect("read");
-            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse");
-            let obj = parsed.as_object().expect("object");
-            assert_eq!(obj.len(), 2);
-            assert_eq!(obj.get("1").and_then(Value::as_i64), Some(TS_EPOCH));
-            assert!(obj.get("2").is_none());
-            assert_eq!(
-                obj.get("3").and_then(Value::as_i64),
-                Some(TS_9999_12_31_235959Z),
-            );
-        }
-
-        #[serial]
-        #[tokio::test]
-        async fn start_timestamp_arithmetic_uses_integer_nanoseconds() {
-            // start_timestamp_nanos() is documented to add the policy's period
-            // (in nanoseconds) to the last transmission time. Pin this
-            // arithmetic against literal integers so any future swap of
-            // the time backend keeps producing exact i64 nanoseconds.
-            let policy_id: u32 = 555_555;
-            cleanup_keys(&[&policy_id.to_string()]).await;
-            let policy = SamplingPolicy {
-                id: policy_id,
-                kind: SamplingKind::Conn,
-                interval: Duration::from_secs(SECS_PER_MINUTE),
-                period: Duration::from_secs(SECS_PER_HOUR),
-                offset: NO_OFFSET,
-                src_ip: None,
-                dst_ip: None,
-                node: Some("regression".to_string()),
-                column: None,
-            };
-
-            // Last transmission at 1_700_000_000 seconds = 2023-11-14T22:13:20Z,
-            // expressed in nanoseconds as i64.
-            let last_ns: i64 = 1_700_000_000_000_000_000;
-            LAST_TRANSFER_TIME
-                .write()
-                .await
-                .insert(policy_id.to_string(), last_ns);
-
-            let next = policy
-                .start_timestamp_nanos()
-                .await
-                .expect("start_timestamp_nanos");
-            // period = 3_600s = 3_600_000_000_000ns; expected = literal sum.
-            let expected: i64 = 1_700_000_000_000_000_000 + 3_600_000_000_000;
-            assert_eq!(next, expected);
-            assert_eq!(next, 1_700_003_600_000_000_000);
-
-            LAST_TRANSFER_TIME
-                .write()
-                .await
-                .remove(&policy_id.to_string());
-        }
-
-        #[serial]
-        #[tokio::test]
-        async fn start_timestamp_returns_zero_for_missing_entry() {
-            // The contract for "no last transmission" is to return integer 0.
-            let policy_id: u32 = 444_444;
-            cleanup_keys(&[&policy_id.to_string()]).await;
-            let policy = SamplingPolicy {
-                id: policy_id,
-                kind: SamplingKind::Conn,
-                interval: Duration::from_secs(SECS_PER_MINUTE),
-                period: Duration::from_secs(SECS_PER_HOUR),
-                offset: NO_OFFSET,
-                src_ip: None,
-                dst_ip: None,
-                node: Some("regression-missing".to_string()),
-                column: None,
-            };
-
-            // Confirm absence and check the documented zero return value.
-            LAST_TRANSFER_TIME
-                .write()
-                .await
-                .remove(&policy_id.to_string());
-            assert_eq!(policy.start_timestamp_nanos().await.unwrap(), 0_i64);
         }
     }
 }

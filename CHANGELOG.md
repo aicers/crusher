@@ -6,16 +6,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Changed
-
-- Made `giganto_name` required and removed the fallback that used the Giganto
-  address IP as the TLS server name.
-
 ### Added
 
 - Added `rev` support in `scripts/fetch-theme.sh` so maintainers can fetch an
   unreleased `docs-theme` commit for local testing, with `version` and `rev`
   treated as mutually exclusive source selectors in `docs/theme.toml`.
+- Added cooperative `SIGINT` and `SIGTERM` shutdown, including idle-mode
+  handling, bounded draining of accepted work, and joining of top-level tasks.
+  If draining cannot complete, Crusher exits with an error instead of starting
+  a new run generation.
+
+### Changed
+
+- Made `giganto_name` required and removed the fallback that used the Giganto
+  address IP as the TLS server name.
 
 ## [0.9.0] - 2026-06-19
 
