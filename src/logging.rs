@@ -67,3 +67,14 @@ macro_rules! info_or_print {
         }
     }
 }
+
+#[macro_export]
+macro_rules! warn_or_print {
+    ($($args:tt),*) => {
+        if tracing::dispatcher::has_been_set() {
+            tracing::warn!($($args),*);
+        } else {
+            println!($($args),*);
+        }
+    }
+}
