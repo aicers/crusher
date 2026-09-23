@@ -378,7 +378,7 @@ async fn main() -> Result<()> {
                     .await
                 {
                     IdleExitReason::Shutdown => {
-                        info!("Graceful shutdown complete; exiting");
+                        info_or_print!("Graceful shutdown complete; exiting");
                         return Ok(());
                     }
                     IdleExitReason::TlsReload => true,
@@ -390,13 +390,13 @@ async fn main() -> Result<()> {
         if should_reload_tls {
             match load_tls_material_with_bytes(&args) {
                 Ok((new_certs, new_bytes)) => {
-                    info!("Reloaded Giganto TLS material");
+                    info_or_print!("Reloaded Giganto TLS material");
                     certs = new_certs;
                     manager_tls.replace(new_bytes);
-                    info!("Refreshed manager/control TLS bytes for next reconnect");
+                    info_or_print!("Refreshed manager/control TLS bytes for next reconnect");
                 }
                 Err(e) => {
-                    warn!(
+                    warn_or_print!(
                         "Failed to reload TLS material; keeping last-known-good shared \
                          endpoint state and manager/control TLS bytes: {e:#}"
                     );

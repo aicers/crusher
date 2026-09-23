@@ -59,11 +59,11 @@ macro_rules! error_or_eprint {
 
 #[macro_export]
 macro_rules! info_or_print {
-    ($($args:tt),*) => {
+    ($($args:tt)*) => {
         if tracing::dispatcher::has_been_set() {
-            tracing::info!($($args),*);
+            tracing::info!($($args)*);
         } else {
-            println!($($args),*);
+            println!($($args)*);
         }
     }
 }
