@@ -244,12 +244,12 @@ pub(crate) fn register_tls_reload_signal_handler(tls_reload: Arc<Notify>) {
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
                     Ok(sig) => sig,
                     Err(e) => {
-                        warn!("Failed to install SIGHUP handler: {e}");
+                        warn_or_print!("Failed to install SIGHUP handler: {e}");
                         return;
                     }
                 };
             while hup.recv().await.is_some() {
-                info!("Received SIGHUP; requesting TLS reload for Giganto and Manager");
+                info_or_print!("Received SIGHUP; requesting TLS reload for Giganto and Manager");
                 tls_reload.notify_one();
             }
         });
@@ -278,25 +278,25 @@ pub(crate) fn register_shutdown_signal_handler(shutdown: Arc<Notify>) {
             let mut sigint = match signal(SignalKind::interrupt()) {
                 Ok(sig) => sig,
                 Err(e) => {
-                    warn!("Failed to install SIGINT handler: {e}");
+                    warn_or_print!("Failed to install SIGINT handler: {e}");
                     return;
                 }
             };
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(sig) => sig,
                 Err(e) => {
-                    warn!("Failed to install SIGTERM handler: {e}");
+                    warn_or_print!("Failed to install SIGTERM handler: {e}");
                     return;
                 }
             };
 
             tokio::select! {
                 _ = sigint.recv() => {
-                    info!("Received SIGINT; requesting graceful shutdown");
+                    info_or_print!("Received SIGINT; requesting graceful shutdown");
                     shutdown.notify_one();
                 }
                 _ = sigterm.recv() => {
-                    info!("Received SIGTERM; requesting graceful shutdown");
+                    info_or_print!("Received SIGTERM; requesting graceful shutdown");
                     shutdown.notify_one();
                 }
             }
@@ -306,7 +306,7 @@ pub(crate) fn register_shutdown_signal_handler(shutdown: Arc<Notify>) {
     {
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                info!("Received Ctrl-C; requesting graceful shutdown");
+                info_or_print!("Received Ctrl-C; requesting graceful shutdown");
                 shutdown.notify_one();
             }
         });
@@ -378,7 +378,7 @@ async fn main() -> Result<()> {
                     .await
                 {
                     IdleExitReason::Shutdown => {
-                        info!("Graceful shutdown complete; exiting");
+                        info_or_print!("Graceful shutdown complete; exiting");
                         return Ok(());
                     }
                     IdleExitReason::TlsReload => true,
@@ -390,13 +390,13 @@ async fn main() -> Result<()> {
         if should_reload_tls {
             match load_tls_material_with_bytes(&args) {
                 Ok((new_certs, new_bytes)) => {
-                    info!("Reloaded Giganto TLS material");
+                    info_or_print!("Reloaded Giganto TLS material");
                     certs = new_certs;
                     manager_tls.replace(new_bytes);
-                    info!("Refreshed manager/control TLS bytes for next reconnect");
+                    info_or_print!("Refreshed manager/control TLS bytes for next reconnect");
                 }
                 Err(e) => {
-                    warn!(
+                    warn_or_print!(
                         "Failed to reload TLS material; keeping last-known-good shared \
                          endpoint state and manager/control TLS bytes: {e:#}"
                     );

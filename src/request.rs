@@ -213,7 +213,7 @@ impl Client {
             return Ok(existing.clone());
         }
         *guard = Some(new_conn.clone());
-        info!(
+        info_or_print!(
             "Connection established to the manager server {}",
             self.server_address
         );
@@ -432,7 +432,7 @@ struct IdleModeHandler {
 #[async_trait]
 impl review_protocol::request::Handler for IdleModeHandler {
     async fn update_config(&mut self) -> Result<(), String> {
-        info!("Configuration update request received");
+        info_or_print!("Configuration update request received");
         self.config_reload.notify_one();
         Ok(())
     }
