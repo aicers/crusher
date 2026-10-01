@@ -582,7 +582,7 @@ mod tests {
         let (mut client, _dir, policy_handle) = create_test_client().await;
 
         // Verify empty initial state
-        assert!(policy_handle.get_all_policy_ids().is_empty());
+        assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
 
         let policy = create_test_policy(1);
         let result = client.sampling_policy_list(&[policy]).await;
@@ -609,7 +609,7 @@ mod tests {
             .delete_sampling_policy(&[1])
             .await
             .expect("Success to remove policy");
-        assert!(policy_handle.get_all_policy_ids().is_empty());
+        assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
 
         // Add policy again (should succeed since it was deleted)
         client
@@ -626,7 +626,7 @@ mod tests {
 
         let result = client.sampling_policy_list(&[]).await;
         assert!(result.is_ok());
-        assert!(policy_handle.get_all_policy_ids().is_empty());
+        assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -833,7 +833,7 @@ mod tests {
         }
 
         // Final state: empty active list
-        assert!(policy_handle.get_all_policy_ids().is_empty());
+        assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
     }
 
     // =========================================================================

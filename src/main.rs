@@ -710,7 +710,10 @@ last_timestamp_data = "{}"
         );
 
         let (certs, _raw_tls) = load_tls_material_with_bytes(&args).expect("load certs from disk");
-        assert!(!certs.certs.is_empty());
+        assert_ne!(
+            certs.certs,
+            [] as [rustls::pki_types::CertificateDer<'_>; 0]
+        );
         assert!(!certs.ca_certs.is_empty());
     }
 
