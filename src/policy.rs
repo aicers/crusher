@@ -461,7 +461,7 @@ mod tests {
     async fn startup_preserves_saved_timestamps_until_review_policy_restore() {
         run_test(async {
             let h = Harness::new(r#"{"42":1700000000000000000}"#).await;
-            assert!(h.handle.get_all_policy_ids().is_empty());
+            assert_eq!(h.handle.get_all_policy_ids(), [] as [u32; 0]);
             assert!(h.handle.stream_policy(42).await.unwrap().is_none());
             h.handle.add_policies(vec![policy(42)]).await.unwrap();
             assert_eq!(
