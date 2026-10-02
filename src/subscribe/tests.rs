@@ -928,7 +928,7 @@ fn start_reload_policy_manager(
                             &connection,
                             address,
                             ">=0",
-                            "0.48.0",
+                            crate::request::REQUIRED_MANAGER_VERSION,
                         )
                         .await
                         .is_err()
