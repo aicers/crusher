@@ -19,7 +19,7 @@ use crate::client::{SERVER_RETRY_INTERVAL, SharedTlsBytes};
 use crate::info_or_print;
 use crate::policy::PolicyHandle;
 
-pub(crate) const REQUIRED_MANAGER_VERSION: &str = "0.48.0";
+pub(crate) const REQUIRED_MANAGER_VERSION: &str = "0.49.0";
 const MAX_RETRIES: u8 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
