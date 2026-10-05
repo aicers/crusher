@@ -6,13 +6,13 @@ use async_trait::async_trait;
 use review_protocol::{
     client::{Connection, ConnectionBuilder},
     request::Handler as _,
-    types::{self as protocol_types, SamplingPolicy, Status},
+    types::{SamplingPolicy, Status},
 };
 use tokio::{
     sync::{Mutex, Notify},
     time::{Duration, sleep},
 };
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::cancellation::CancellationCoordinator;
 use crate::client::{SERVER_RETRY_INTERVAL, SharedTlsBytes};
@@ -20,7 +20,6 @@ use crate::info_or_print;
 use crate::policy::PolicyHandle;
 
 pub(crate) const REQUIRED_MANAGER_VERSION: &str = "0.49.0";
-const MAX_RETRIES: u8 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 enum ConnectErrorDisposition {
@@ -342,50 +341,6 @@ where
 
 #[async_trait]
 impl review_protocol::request::Handler for Client {
-    async fn reboot(&mut self) -> Result<(), String> {
-        info!("Received request to reboot system");
-        for attempt in 1..=MAX_RETRIES {
-            if let Err(e) = roxy::reboot() {
-                if attempt == MAX_RETRIES {
-                    error!("Cannot reboot system: {e}");
-                    return Err(format!("cannot restart the system: {e}"));
-                }
-            } else {
-                return Ok(());
-            }
-        }
-
-        Err(String::from("cannot restart the system"))
-    }
-
-    async fn shutdown(&mut self) -> Result<(), String> {
-        info!("Received request to shutdown system");
-        for attempt in 1..=MAX_RETRIES {
-            if let Err(e) = roxy::power_off() {
-                if attempt == MAX_RETRIES {
-                    error!("Cannot shutdown system: {e}");
-                    return Err(format!("cannot shutdown the system: {e}"));
-                }
-            } else {
-                return Ok(());
-            }
-        }
-
-        Err(String::from("cannot shutdown the system"))
-    }
-
-    async fn resource_usage(&mut self) -> Result<(String, protocol_types::ResourceUsage), String> {
-        let usg = roxy::resource_usage().await;
-        let usg = protocol_types::ResourceUsage {
-            cpu_usage: usg.cpu_usage,
-            total_memory: usg.total_memory,
-            used_memory: usg.used_memory,
-            disk_used_bytes: usg.disk_used_bytes,
-            disk_available_bytes: usg.disk_available_bytes,
-        };
-        Ok((roxy::hostname(), usg))
-    }
-
     async fn sampling_policy_list(&mut self, policies: &[SamplingPolicy]) -> Result<(), String> {
         let handle = self
             .policy_handle
@@ -406,22 +361,6 @@ impl review_protocol::request::Handler for Client {
         info!("Configuration update request received");
         self.config_reload.notify_one();
         Ok(())
-    }
-
-    async fn process_list(&mut self) -> Result<Vec<protocol_types::Process>, String> {
-        let list = roxy::process_list().await;
-        let list = list
-            .into_iter()
-            .map(|p| protocol_types::Process {
-                user: p.user,
-                cpu_usage: p.cpu_usage,
-                mem_usage: p.mem_usage,
-                start_time: p.start_time,
-                command: p.command,
-            })
-            .collect();
-
-        Ok(list)
     }
 }
 
@@ -523,6 +462,43 @@ mod tests {
         ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(server_crypto).expect("build quic server config"),
         ))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn node_requests_are_not_supported() {
+        let config_reload = Arc::new(Notify::new());
+        let mut client = Client::new(
+            "127.0.0.1:8080".parse().expect("valid test address"),
+            "test".to_string(),
+            SharedTlsBytes::new(TlsBytes::new(Vec::new(), Vec::new(), Vec::new())),
+            config_reload.clone(),
+        );
+
+        // Older managers may still send these requests to a module.
+        assert_eq!(client.reboot().await, Err("not supported".to_string()));
+        assert_eq!(client.shutdown().await, Err("not supported".to_string()));
+        assert_eq!(
+            client
+                .resource_usage()
+                .await
+                .expect_err("unsupported usage"),
+            "not supported"
+        );
+        assert_eq!(
+            client
+                .process_list()
+                .await
+                .expect_err("unsupported processes"),
+            "not supported"
+        );
+
+        client
+            .update_config()
+            .await
+            .expect("reload still supported");
+        tokio::time::timeout(Duration::from_millis(100), config_reload.notified())
+            .await
+            .expect("reload notification delivered after unsupported requests");
     }
 
     // =========================================================================
