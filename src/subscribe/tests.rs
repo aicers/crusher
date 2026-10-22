@@ -848,12 +848,17 @@ fn read_time_data_map(last_time_series_path: &Path) -> HashMap<String, i64> {
 fn config_server() -> ServerConfig {
     let certs = cert_key();
 
-    let client_auth =
-        rustls::server::WebPkiClientVerifier::builder(Arc::new(certs.ca_certs.clone()))
-            .build()
-            .expect("Failed to build client certificate verifier");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_auth = WebPkiClientVerifier::builder_with_provider(
+        Arc::new(certs.ca_certs.clone()),
+        Arc::clone(&provider),
+    )
+    .build()
+    .expect("Failed to build client certificate verifier");
 
-    let server_crypto = rustls::ServerConfig::builder()
+    let server_crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
         .with_client_cert_verifier(client_auth)
         .with_single_cert(certs.certs.clone(), certs.key.clone_key())
         .unwrap();
@@ -1080,13 +1085,17 @@ fn server_config_from_material(
     server_key_pem: &[u8],
     client_ca_pem: &[u8],
 ) -> ServerConfig {
-    let client_auth = WebPkiClientVerifier::builder(Arc::new(
-        Certs::to_ca_certs(&[client_ca_pem]).expect("parse client CA"),
-    ))
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_auth = WebPkiClientVerifier::builder_with_provider(
+        Arc::new(Certs::to_ca_certs(&[client_ca_pem]).expect("parse client CA")),
+        Arc::clone(&provider),
+    )
     .build()
     .expect("build client certificate verifier");
 
-    let server_crypto = rustls::ServerConfig::builder()
+    let server_crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
         .with_client_cert_verifier(client_auth)
         .with_single_cert(
             Certs::to_cert_chain(server_cert_pem).expect("parse server cert chain"),

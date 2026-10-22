@@ -153,9 +153,12 @@ pub(crate) fn config(certs: &Certs) -> Result<Endpoint> {
 /// binding a UDP socket. This is useful for validating candidate TLS
 /// material (including cert/key match-up) outside of an async runtime.
 pub(crate) fn client_config(certs: &Certs) -> Result<ClientConfig> {
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(certs.ca_certs.clone())
-        .with_client_auth_cert(certs.certs.clone(), certs.key.clone_key())?;
+    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(certs.ca_certs.clone())
+    .with_client_auth_cert(certs.certs.clone(), certs.key.clone_key())?;
 
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
@@ -423,10 +426,15 @@ mod tests {
         let server_key =
             Certs::to_private_key(server_bundle.key()).context("Failed to parse server key")?;
 
-        let client_cert_verifier = WebPkiClientVerifier::builder(Arc::new(server_ca_certs.clone()))
-            .build()
-            .context("Failed to build client certificate verifier")?;
-        let server_crypto_config = rustls::ServerConfig::builder()
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_cert_verifier = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(server_ca_certs.clone()),
+            Arc::clone(&provider),
+        )
+        .build()
+        .context("Failed to build client certificate verifier")?;
+        let server_crypto_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
             .with_client_cert_verifier(client_cert_verifier)
             .with_single_cert(server_chain, server_key)
             .context("Failed to create server TLS config")?;
