@@ -449,11 +449,17 @@ mod tests {
     }
 
     fn create_test_server_config(certs: &Certs) -> ServerConfig {
-        let client_auth = WebPkiClientVerifier::builder(Arc::new(certs.ca_certs.clone()))
-            .build()
-            .expect("build client cert verifier");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_auth = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(certs.ca_certs.clone()),
+            Arc::clone(&provider),
+        )
+        .build()
+        .expect("build client cert verifier");
 
-        let server_crypto = rustls::ServerConfig::builder()
+        let server_crypto = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default protocol versions")
             .with_client_cert_verifier(client_auth)
             .with_single_cert(certs.certs.clone(), certs.key.clone_key())
             .expect("build server tls config");
