@@ -10,12 +10,13 @@ use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cancellation::{CancellationCoordinator, CancellationPhase};
-use clap::Parser;
+use clap::{Parser, error::ErrorKind as ClapErrorKind};
 use client::{Certs, SharedTlsBytes, TlsBytes};
 use logging::init_tracing;
 use request::IdleExitReason;
@@ -23,7 +24,6 @@ use settings::Settings;
 use subscribe::clear_ingest_channel;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
-use tracing_appender::non_blocking::WorkerGuard;
 
 #[derive(Clone, Copy)]
 enum CompletedTopLevelTask {
@@ -244,12 +244,12 @@ pub(crate) fn register_tls_reload_signal_handler(tls_reload: Arc<Notify>) {
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
                     Ok(sig) => sig,
                     Err(e) => {
-                        warn_or_print!("Failed to install SIGHUP handler: {e}");
+                        warn!("Failed to install SIGHUP handler: {e}");
                         return;
                     }
                 };
             while hup.recv().await.is_some() {
-                info_or_print!("Received SIGHUP; requesting TLS reload for Giganto and Manager");
+                info!("Received SIGHUP; requesting TLS reload for Giganto and Manager");
                 tls_reload.notify_one();
             }
         });
@@ -278,25 +278,25 @@ pub(crate) fn register_shutdown_signal_handler(shutdown: Arc<Notify>) {
             let mut sigint = match signal(SignalKind::interrupt()) {
                 Ok(sig) => sig,
                 Err(e) => {
-                    warn_or_print!("Failed to install SIGINT handler: {e}");
+                    warn!("Failed to install SIGINT handler: {e}");
                     return;
                 }
             };
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(sig) => sig,
                 Err(e) => {
-                    warn_or_print!("Failed to install SIGTERM handler: {e}");
+                    warn!("Failed to install SIGTERM handler: {e}");
                     return;
                 }
             };
 
             tokio::select! {
                 _ = sigint.recv() => {
-                    info_or_print!("Received SIGINT; requesting graceful shutdown");
+                    info!("Received SIGINT; requesting graceful shutdown");
                     shutdown.notify_one();
                 }
                 _ = sigterm.recv() => {
-                    info_or_print!("Received SIGTERM; requesting graceful shutdown");
+                    info!("Received SIGTERM; requesting graceful shutdown");
                     shutdown.notify_one();
                 }
             }
@@ -306,7 +306,7 @@ pub(crate) fn register_shutdown_signal_handler(shutdown: Arc<Notify>) {
     {
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                info_or_print!("Received Ctrl-C; requesting graceful shutdown");
+                info!("Received Ctrl-C; requesting graceful shutdown");
                 shutdown.notify_one();
             }
         });
@@ -324,8 +324,43 @@ enum RunExitReason {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let args = CmdLineArgs::parse();
+async fn main() -> ExitCode {
+    let journal = logging::output_is_journal(std::env::var_os("JOURNAL_STREAM").as_deref());
+    let args = match CmdLineArgs::try_parse() {
+        Ok(args) => args,
+        Err(err) => match err.kind() {
+            ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion => err.exit(),
+            _ if journal => {
+                // Under the journal, clap's message on stderr would be
+                // stored at priority 6; log it as one error event instead.
+                if init_tracing(true).is_err() {
+                    err.exit();
+                }
+                error!("{}", err.render().to_string().trim_end());
+                return ExitCode::from(2);
+            }
+            _ => err.exit(),
+        },
+    };
+
+    let result = match init_tracing(journal) {
+        Ok(()) => run_main(args).await,
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            if journal {
+                error!("{err:#}");
+            } else {
+                eprintln!("Error: {err:?}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_main(args: CmdLineArgs) -> Result<()> {
     let (mut certs, tls_bytes) = load_tls_material_with_bytes(&args)?;
     let manager_tls = SharedTlsBytes::new(tls_bytes);
     let config_reload = Arc::new(Notify::new());
@@ -339,7 +374,6 @@ async fn main() -> Result<()> {
         manager_tls.clone(),
         config_reload.clone(),
     );
-    let mut guard = None;
 
     loop {
         let outcome = run(
@@ -349,7 +383,6 @@ async fn main() -> Result<()> {
             config_reload.clone(),
             tls_reload.clone(),
             shutdown.clone(),
-            &mut guard,
         )
         .await;
 
@@ -364,7 +397,7 @@ async fn main() -> Result<()> {
                 if !args.is_remote_mode() || e.downcast_ref::<ShutdownFailure>().is_some() {
                     return Err(e);
                 }
-                error_or_eprint!("Main processing encountered an error: {e}");
+                error!("Main processing encountered an error: {e:#}");
                 let health_check = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
                     matches!(
                         e.kind(),
@@ -378,7 +411,7 @@ async fn main() -> Result<()> {
                     .await
                 {
                     IdleExitReason::Shutdown => {
-                        info_or_print!("Graceful shutdown complete; exiting");
+                        info!("Graceful shutdown complete; exiting");
                         return Ok(());
                     }
                     IdleExitReason::TlsReload => true,
@@ -390,13 +423,13 @@ async fn main() -> Result<()> {
         if should_reload_tls {
             match load_tls_material_with_bytes(&args) {
                 Ok((new_certs, new_bytes)) => {
-                    info_or_print!("Reloaded Giganto TLS material");
+                    info!("Reloaded Giganto TLS material");
                     certs = new_certs;
                     manager_tls.replace(new_bytes);
-                    info_or_print!("Refreshed manager/control TLS bytes for next reconnect");
+                    info!("Refreshed manager/control TLS bytes for next reconnect");
                 }
                 Err(e) => {
-                    warn_or_print!(
+                    warn!(
                         "Failed to reload TLS material; keeping last-known-good shared \
                          endpoint state and manager/control TLS bytes: {e:#}"
                     );
@@ -414,7 +447,6 @@ async fn run(
     config_reload: Arc<Notify>,
     tls_reload: Arc<Notify>,
     shutdown: Arc<Notify>,
-    guard: &mut Option<WorkerGuard>,
 ) -> Result<RunExitReason> {
     let (settings, is_local_config) = if let Some(local_config) = args.config.as_deref() {
         (Settings::from_file(local_config)?, true)
@@ -424,9 +456,6 @@ async fn run(
             false,
         )
     };
-    if guard.is_none() {
-        *guard = Some(init_tracing(settings.log_path.as_deref())?);
-    }
     info!(
         "Time series generator has been configured with {} settings",
         if is_local_config { "local" } else { "remote" }
@@ -540,7 +569,6 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
     use tokio::sync::Notify;
-    use tracing_appender::non_blocking::WorkerGuard;
 
     use super::*;
 
@@ -586,13 +614,6 @@ last_timestamp_data = "{}"
         )
         .expect("write local config");
         config_path.to_str().expect("utf-8 config path").to_string()
-    }
-
-    /// Prevents `run()` from installing a global tracing subscriber (which
-    /// would panic on subsequent `run()`-based tests in the same process).
-    fn test_tracing_guard() -> WorkerGuard {
-        let (_writer, guard) = tracing_appender::non_blocking(std::io::sink());
-        guard
     }
 
     /// Local-config harness for `run()` integration tests (no external services).
@@ -647,7 +668,7 @@ last_timestamp_data = "{}"
             })
         }
 
-        async fn run(&self, guard: &mut Option<WorkerGuard>) -> Result<RunExitReason> {
+        async fn run(&self) -> Result<RunExitReason> {
             run(
                 &self.args,
                 &self.certs,
@@ -655,7 +676,6 @@ last_timestamp_data = "{}"
                 self.config_reload.clone(),
                 self.tls_reload.clone(),
                 self.shutdown.clone(),
-                guard,
             )
             .await
         }
@@ -921,9 +941,6 @@ last_timestamp_data = "{}"
                 .to_string(),
         );
 
-        // Reuse the test guard so this settings test neither installs a global
-        // subscriber nor writes application logs outside the test capture.
-        let mut guard = Some(test_tracing_guard());
         // Preload the notification so this local-settings test does not
         // depend on whatever process may use the fixed Manager test port.
         tls_reload.notify_one();
@@ -934,7 +951,6 @@ last_timestamp_data = "{}"
             config_reload,
             tls_reload,
             shutdown,
-            &mut guard,
         );
         tokio::pin!(run_future);
 
@@ -1266,11 +1282,10 @@ last_timestamp_data = "{}"
         let Some(harness) = RunTestHarness::try_new() else {
             return;
         };
-        let mut guard = Some(test_tracing_guard());
         let shutdown = harness.shutdown.clone();
         tokio::spawn(notify_shutdown_after_startup_delay(shutdown));
 
-        let reason = tokio::time::timeout(Duration::from_secs(3), harness.run(&mut guard))
+        let reason = tokio::time::timeout(Duration::from_secs(3), harness.run())
             .await
             .expect("main run should exit promptly on shutdown")
             .expect("main run should complete cleanly");
@@ -1284,11 +1299,10 @@ last_timestamp_data = "{}"
             return;
         };
         register_shutdown_signal_handler(harness.shutdown.clone());
-        let mut guard = Some(test_tracing_guard());
 
         tokio::spawn(raise_signal_after_startup_delay(signal));
 
-        let reason = tokio::time::timeout(Duration::from_secs(3), harness.run(&mut guard))
+        let reason = tokio::time::timeout(Duration::from_secs(3), harness.run())
             .await
             .expect("main run should exit promptly after signal-driven shutdown")
             .expect("main run should complete cleanly");

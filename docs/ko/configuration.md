@@ -8,7 +8,6 @@
 | giganto_ingest_srv_addr | 집계 결과를 전송할 서버 주소 | - |
 | giganto_publish_srv_addr | 이벤트 데이터를 받아올 서버 주소 | - |
 | last_timestamp_data | 마지막 전송 시각 저장 파일 경로 (필수) | - |
-| log_path | 로그 파일 경로 | 미지정 시 stdout |
 
 ## 설정 예시
 
@@ -17,14 +16,15 @@ giganto_name = "giganto.example.local"
 giganto_ingest_srv_addr = "10.10.10.20:38370"
 giganto_publish_srv_addr = "10.10.10.20:38371"
 last_timestamp_data = "/path/to/last_timestamp.json"
-log_path = "/path/to/crusher.log"
 ```
 
-`log-path` 동작
+로그
 
-- 미지정: stdout로 출력
-- 지정 + 쓰기 가능: 해당 파일로 출력
-- 지정 + 쓰기 불가: Crusher 종료
+crusher는 로그를 표준 출력에 씁니다. 수준은 `RUST_LOG`로 정하며 기본값은 `info`입니다. 표준 출력이나 표준 오류가
+systemd 저널에 연결되어 있으면(`JOURNAL_STREAM`) 각 이벤트를 syslog 우선순위(`<3>` 오류, `<4>` 경고,
+`<6>` 정보, `<7>` 디버그·트레이스)로 시작하는 한 줄로, 타임스탬프와 색상 코드 없이 쓰고, 이벤트 안의 줄바꿈은 `\n`으로
+씁니다. 패닉은 오류 항목 하나로 기록합니다. 그 밖의 경우 색상 코드는 터미널에만 씁니다. `log_path`는 제거되었으며 이를 지정한
+설정은 거부됩니다.
 
 `last_timestamp_data` 파일 형식
 

@@ -6,11 +6,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- When its standard output or standard error is connected to the systemd
+  journal, Crusher writes each log event as one line that starts with the
+  event's syslog priority, so the journal stores warnings and errors at their
+  own priority, without a timestamp or colour codes and with line breaks
+  inside an event written as `\n`; a panic is logged as one error entry.
+  Messages printed before logging started are now log events. Elsewhere the
+  output is unchanged, except that colour codes are written only to a
+  terminal.
+
 ### Removed
 
 - Crusher no longer handles reboot, shutdown, resource-usage or process-list
   requests from the Central Manager. The Host Agent handles reboot, shutdown
   and resource usage.
+- **Breaking.** The `log_path` option. Crusher always logs to standard output;
+  a local configuration naming it is refused at startup, and a configuration
+  from the Central Manager naming it is refused, leaving Crusher idle until
+  the next configuration update.
 
 ## [0.10.0] - 2026-10-02
 

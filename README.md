@@ -81,14 +81,20 @@ In the configuration file, you can specify the following options:
 | `giganto_ingest_srv_addr`  | Giganto's ingest IP address and port number                                     | Yes      | -          |
 | `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                    | Yes      | -          |
 | `last_timestamp_data`      | JSON file that stores the timestamp of the last time series per sampling policy | Yes      | -          |
-| `log_path`                 | Log file path                                                                   | No       | -          |
 
 <!-- markdownlint-enable MD013 -->
 
 - `giganto_name`, `giganto_publish_srv_addr`, and `giganto_ingest_srv_addr`
   are required.
 - `giganto_name`: This must match with the DNS name in the certificate.
-- `log_path`: If not provided, logs are printed to stdout.
+- Logging: crusher writes its log to standard output; `RUST_LOG` sets the level
+  (default `info`); when standard output or standard error is connected to the
+  systemd journal (`JOURNAL_STREAM`), each event is one line starting with its
+  syslog priority (`<3>` error, `<4>` warning, `<6>` info, `<7>` debug and
+  trace), without a timestamp or colour codes, line breaks inside an event
+  written as `\n`, and a panic is logged as one error entry; elsewhere colour
+  codes are written only to a terminal. `log_path` was removed, and a
+  configuration naming it is refused.
 
 ## Configuration Examples
 
@@ -97,7 +103,6 @@ giganto_name = "my-giganto"
 giganto_ingest_srv_addr = "127.0.0.1:38370"
 giganto_publish_srv_addr = "127.0.0.1:38371"
 last_timestamp_data = "path/to/time_data.json"
-log_path = "path/to/time_series_generator.log"
 ```
 
 ## Documentation
