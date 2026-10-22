@@ -4,7 +4,7 @@
 
 - Verify that the certificate, private key, and CA certificate paths are correct
 - In local configuration mode, verify that the configuration file path is correct
-- If a log path is specified, verify that the file has write permissions
+- Read the log with `journalctl -u <unit>` (under systemd) or on standard output
 
 ## `last_timestamp_data` File Issues
 

@@ -16,7 +16,6 @@ use tracing::{info, warn};
 
 use crate::cancellation::CancellationCoordinator;
 use crate::client::{SERVER_RETRY_INTERVAL, SharedTlsBytes};
-use crate::info_or_print;
 use crate::policy::PolicyHandle;
 
 pub(crate) const REQUIRED_MANAGER_VERSION: &str = "0.49.0";
@@ -212,7 +211,7 @@ impl Client {
             return Ok(existing.clone());
         }
         *guard = Some(new_conn.clone());
-        info_or_print!(
+        info!(
             "Connection established to the manager server {}",
             self.server_address
         );
@@ -220,7 +219,7 @@ impl Client {
     }
 
     pub(crate) async fn get_config(&mut self) -> Result<String> {
-        info_or_print!("Fetching a configuration");
+        info!("Fetching a configuration");
         self.connect()
             .await?
             .get_config()
@@ -247,7 +246,7 @@ impl Client {
         tls_reload: Arc<Notify>,
         shutdown: Arc<Notify>,
     ) -> IdleExitReason {
-        info_or_print!("Entering idle mode");
+        info!("Entering idle mode");
         self.status = Status::Idle;
         let config_reload = self.config_reload.clone();
         let reason = tokio::select! {
@@ -255,11 +254,11 @@ impl Client {
                 loop {
                     match self.try_connect(health_check).await {
                         Ok(()) => {
-                            info_or_print!("The Manager server is now online");
+                            info!("The Manager server is now online");
                             return
                         },
                         Err(e) => {
-                            info_or_print!("Connection attempt failed: {e}, retrying");
+                            info!("Connection attempt failed: {e}, retrying");
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                         },
                     }
@@ -284,7 +283,7 @@ impl Client {
         F: for<'a> FnMut(&'a mut Client, bool) -> Fut,
         Fut: Future<Output = Result<()>> + Send,
     {
-        info_or_print!("Entering idle mode");
+        info!("Entering idle mode");
         self.status = Status::Idle;
         let config_reload = self.config_reload.clone();
         let reason = tokio::select! {
@@ -292,11 +291,11 @@ impl Client {
                 loop {
                     match try_connect(self, health_check).await {
                         Ok(()) => {
-                            info_or_print!("The Manager server is now online");
+                            info!("The Manager server is now online");
                             return
                         },
                         Err(e) => {
-                            info_or_print!("Connection attempt failed: {e}, retrying");
+                            info!("Connection attempt failed: {e}, retrying");
                             sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
                         },
                     }
@@ -371,7 +370,7 @@ struct IdleModeHandler {
 #[async_trait]
 impl review_protocol::request::Handler for IdleModeHandler {
     async fn update_config(&mut self) -> Result<(), String> {
-        info_or_print!("Configuration update request received");
+        info!("Configuration update request received");
         self.config_reload.notify_one();
         Ok(())
     }
@@ -1089,8 +1088,21 @@ mod tests {
 
     struct TestManagerHandler;
 
+    /// A configuration naming the removed `log_path` key.
+    const LOG_PATH_CONFIG: &str = r#"
+giganto_name = "localhost"
+giganto_ingest_srv_addr = "[::1]:9"
+giganto_publish_srv_addr = "[::1]:9"
+last_timestamp_data = "/tmp/time_data.json"
+log_path = "/tmp/crusher.log"
+"#;
+
     #[async_trait::async_trait]
     impl review_protocol::server::Handler for TestManagerHandler {
+        async fn get_config(&self, _peer: &str) -> Result<String, String> {
+            Ok(LOG_PATH_CONFIG.to_string())
+        }
+
         async fn get_sampling_policy_list(
             &self,
             _peer: &str,
@@ -1099,18 +1111,17 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn syncs_sampling_policies_on_startup() {
-        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+    /// Spawns a server that performs the review-protocol handshake and
+    /// answers requests with `TestManagerHandler`. Returns the server address
+    /// and a handle to the driver task.
+    fn spawn_test_manager_server(certs: &Certs) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let server_endpoint = Endpoint::server(
-            create_test_server_config(&certs),
+            create_test_server_config(certs),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
         )
         .expect("create server endpoint");
         let server_addr = server_endpoint.local_addr().expect("read server address");
 
-        // Spawn a server that performs the review-protocol handshake
-        // and responds to get_sampling_policy_list requests.
         let server_task = tokio::spawn(async move {
             if let Some(conn) = server_endpoint.accept().await {
                 let connection = conn.await.expect("accept connection");
@@ -1132,6 +1143,13 @@ mod tests {
                 }
             }
         });
+        (server_addr, server_task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn syncs_sampling_policies_on_startup() {
+        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+        let (server_addr, server_task) = spawn_test_manager_server(&certs);
 
         let dir = tempfile::tempdir().unwrap();
         let tls_bytes = SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
@@ -1162,6 +1180,50 @@ mod tests {
         drop(client);
         drop(policy_handle);
         actor.await.unwrap().unwrap();
+
+        server_task.abort();
+    }
+
+    /// A configuration the Manager server pushes that names the removed
+    /// `log_path` key ends `run()` with the removal error, which the main
+    /// loop logs before entering idle mode.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_refuses_pushed_config_naming_log_path() {
+        let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
+        let (server_addr, server_task) = spawn_test_manager_server(&certs);
+
+        let request_client = Client::new(
+            server_addr,
+            "localhost".to_string(),
+            SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem)),
+            Arc::new(Notify::new()),
+        );
+        let args = crate::CmdLineArgs {
+            config: None,
+            cert: CERT_PATH.to_string(),
+            key: KEY_PATH.to_string(),
+            ca_certs: vec![CA_CERT_PATH.to_string()],
+            manager_server: format!("localhost@{server_addr}")
+                .parse()
+                .expect("manager server address"),
+        };
+        assert!(args.is_remote_mode());
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::run(
+                &args,
+                &certs,
+                request_client,
+                Arc::new(Notify::new()),
+                Arc::new(Notify::new()),
+                Arc::new(Notify::new()),
+            ),
+        )
+        .await
+        .expect("run returns within timeout")
+        .expect_err("a pushed configuration naming log_path must be refused");
+        assert_eq!(format!("{err:#}"), crate::settings::LOG_PATH_REMOVED);
 
         server_task.abort();
     }

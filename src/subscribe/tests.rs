@@ -1801,8 +1801,6 @@ async fn reload_does_not_open_policy_queued_by_previous_run() {
             .parse()
             .expect("manager server address"),
     };
-    let (_writer, tracing_guard) = tracing_appender::non_blocking(std::io::sink());
-    let mut tracing_guard = Some(tracing_guard);
 
     let first_tls_reload = Arc::new(Notify::new());
     let first_tls_reload_for_driver = first_tls_reload.clone();
@@ -1823,7 +1821,6 @@ async fn reload_does_not_open_policy_queued_by_previous_run() {
                 Arc::new(Notify::new()),
                 first_tls_reload,
                 Arc::new(Notify::new()),
-                &mut tracing_guard,
             ),
             driver,
         );
@@ -1877,7 +1874,6 @@ async fn reload_does_not_open_policy_queued_by_previous_run() {
                 Arc::new(Notify::new()),
                 Arc::new(Notify::new()),
                 second_shutdown,
-                &mut tracing_guard,
             ),
             driver,
         );

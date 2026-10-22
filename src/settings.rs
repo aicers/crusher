@@ -1,7 +1,7 @@
 //! Configurations for the application.
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use config::{Config as cfg, File};
 use serde::{Deserialize, Deserializer, de::Error};
 
@@ -14,7 +14,18 @@ pub(crate) struct Settings {
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub(crate) giganto_publish_srv_addr: SocketAddr, // IP address & port to giganto
     pub(crate) last_timestamp_data: PathBuf, // Path to the last series timestamp data file
-    pub(crate) log_path: Option<PathBuf>,
+}
+
+/// The error for a configuration that names the removed `log_path` key.
+pub(crate) const LOG_PATH_REMOVED: &str =
+    "log_path was removed; logs go to standard output (the journal under systemd)";
+
+/// Refuses a configuration that names a removed key.
+fn refuse_removed_keys(config: &cfg) -> Result<()> {
+    if config.get::<config::Value>("log_path").is_ok() {
+        bail!(LOG_PATH_REMOVED);
+    }
+    Ok(())
 }
 
 impl Settings {
@@ -30,6 +41,7 @@ impl Settings {
             .add_source(File::with_name(cfg_path))
             .build()
             .with_context(|| format!("failed to load configuration file: {cfg_path}"))?;
+        refuse_removed_keys(&s)?;
 
         s.try_deserialize()
             .context("failed to parse configuration file")
@@ -40,13 +52,14 @@ impl FromStr for Settings {
     type Err = anyhow::Error;
 
     fn from_str(config_toml: &str) -> Result<Self> {
-        cfg::builder()
+        let s = cfg::builder()
             .add_source(config::File::from_str(
                 config_toml,
                 config::FileFormat::Toml,
             ))
-            .build()?
-            .try_deserialize()
+            .build()?;
+        refuse_removed_keys(&s)?;
+        s.try_deserialize()
             .context("Failed to parse the configuration string")
     }
 }
@@ -82,6 +95,14 @@ last_timestamp_data = "/tmp/timestamp.dat"
 
     /// Full TOML config with all fields explicitly set.
     const FULL_CONFIG: &str = r#"
+giganto_name = "custom-host"
+giganto_ingest_srv_addr = "192.168.1.100:38370"
+giganto_publish_srv_addr = "192.168.1.100:38371"
+last_timestamp_data = "/var/lib/crusher/timestamp.dat"
+"#;
+
+    /// `FULL_CONFIG` with the removed `log_path` key.
+    const LOG_PATH_CONFIG: &str = r#"
 giganto_name = "custom-host"
 giganto_ingest_srv_addr = "192.168.1.100:38370"
 giganto_publish_srv_addr = "192.168.1.100:38371"
@@ -131,7 +152,6 @@ last_timestamp_data = "/tmp/timestamp.dat"
             settings.last_timestamp_data,
             PathBuf::from("/var/lib/crusher/timestamp.dat")
         );
-        assert_eq!(settings.log_path, Some(PathBuf::from("/var/log/crusher")));
     }
 
     /// Helper to create a temporary file with .toml extension.
@@ -170,7 +190,26 @@ last_timestamp_data = "/tmp/timestamp.dat"
             settings.last_timestamp_data,
             PathBuf::from("/var/lib/crusher/timestamp.dat")
         );
-        assert_eq!(settings.log_path, Some(PathBuf::from("/var/log/crusher")));
+    }
+
+    #[test]
+    fn from_str_refuses_log_path() {
+        let err = LOG_PATH_CONFIG
+            .parse::<Settings>()
+            .expect_err("log_path must be refused");
+        assert_eq!(format!("{err:#}"), LOG_PATH_REMOVED);
+    }
+
+    #[test]
+    fn from_file_refuses_log_path() {
+        let mut temp_file = create_temp_toml_file();
+        temp_file
+            .write_all(LOG_PATH_CONFIG.as_bytes())
+            .expect("should write config");
+
+        let path = temp_file.path().to_str().expect("valid path");
+        let err = Settings::from_file(path).expect_err("log_path must be refused");
+        assert_eq!(format!("{err:#}"), LOG_PATH_REMOVED);
     }
 
     #[test]
