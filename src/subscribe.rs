@@ -3,7 +3,12 @@ mod tests;
 mod time_series;
 
 use std::sync::{LazyLock, Mutex};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use async_channel::{Receiver, Sender};
@@ -24,10 +29,10 @@ use giganto_client::{
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
 use review_protocol::types::SamplingKind;
-use time_series::{SECOND_TO_NANO, TimeSeries};
+use time_series::{TimeSeries, WindowBuilder};
 use tokio::{
-    sync::{Notify, RwLock},
-    time::{Duration, sleep, timeout, timeout_at},
+    sync::{Notify, RwLock, mpsc},
+    time::{Duration, Instant, MissedTickBehavior, interval, sleep, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker as ConnectionTaskTracker;
@@ -43,6 +48,56 @@ pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.28.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a stream must have received no event before the timer closes its
+/// open window. The idle gate keeps the timer from cutting a window that a
+/// replay of stored events is still filling.
+const CLOSE_IDLE_SECS: u64 = 30;
+
+/// How often a stream worker checks whether its open window is due to close.
+const CLOSE_CHECK_SECS: u64 = 10;
+
+/// Decides when a stream worker closes the open window of a quiet stream:
+/// every `check_interval`, once no event has been received for `idle` and the
+/// wall clock is past the window's end plus its grace.
+#[derive(Clone)]
+struct CloseTimer {
+    /// The wall clock, in seconds since the Unix epoch.
+    now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    check_interval: Duration,
+    idle: Duration,
+}
+
+#[cfg(test)]
+impl CloseTimer {
+    fn new(
+        now: impl Fn() -> i64 + Send + Sync + 'static,
+        check_interval: Duration,
+        idle: Duration,
+    ) -> Self {
+        Self {
+            now: Arc::new(now),
+            check_interval,
+            idle,
+        }
+    }
+}
+
+impl Default for CloseTimer {
+    fn default() -> Self {
+        Self {
+            now: Arc::new(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |elapsed| {
+                        i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+                    })
+            }),
+            check_interval: Duration::from_secs(CLOSE_CHECK_SECS),
+            idle: Duration::from_secs(CLOSE_IDLE_SECS),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ConnectionLifecycle {
@@ -101,6 +156,24 @@ enum Event {
 }
 
 impl Event {
+    fn orig_addr(&self) -> IpAddr {
+        match self {
+            Self::Conn(evt) => evt.orig_addr,
+            Self::Dns(evt) => evt.orig_addr,
+            Self::Http(evt) => evt.orig_addr,
+            Self::Rdp(evt) => evt.orig_addr,
+        }
+    }
+
+    fn resp_addr(&self) -> IpAddr {
+        match self {
+            Self::Conn(evt) => evt.resp_addr,
+            Self::Dns(evt) => evt.resp_addr,
+            Self::Http(evt) => evt.resp_addr,
+            Self::Rdp(evt) => evt.resp_addr,
+        }
+    }
+
     fn column_value(&self, column: u32) -> f64 {
         match self {
             Self::Conn(evt) => evt.column_value(column),
@@ -150,6 +223,7 @@ pub(crate) struct Client {
     publish_addr: SocketAddr,
     server_name: String,
     endpoint: Endpoint,
+    close_timer: CloseTimer,
 }
 
 impl Client {
@@ -165,7 +239,14 @@ impl Client {
             publish_addr,
             server_name,
             endpoint,
+            close_timer: CloseTimer::default(),
         })
+    }
+
+    #[cfg(test)]
+    fn with_close_timer(mut self, close_timer: CloseTimer) -> Self {
+        self.close_timer = close_timer;
+        self
     }
 
     // Keeps the shutdown stages together so resource ownership and endpoint
@@ -200,6 +281,7 @@ impl Client {
                     policy_handle,
                     connection_notify.clone(),
                     coordinator.clone(),
+                    self.close_timer.clone(),
                 )
             )
         });
@@ -462,6 +544,7 @@ async fn publish_connection_control(
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
+    close_timer: CloseTimer,
 ) -> Result<()> {
     loop {
         let connected = tokio::select! {
@@ -480,6 +563,7 @@ async fn publish_connection_control(
                     requests.clone(),
                     lifecycle.clone(),
                     coordinator.clone(),
+                    close_timer.clone(),
                 ));
                 let mut dispatcher = coordinator.tracker().spawn(dispatcher);
                 let outcome = tokio::select! {
@@ -695,6 +779,7 @@ async fn run_inbound_dispatcher(
     requests: PublishRequests,
     connection_lifecycle: ConnectionLifecycle,
     coordinator: CancellationCoordinator,
+    close_timer: CloseTimer,
 ) {
     loop {
         let recv_result = tokio::select! {
@@ -738,9 +823,17 @@ async fn run_inbound_dispatcher(
         let coord = coordinator.clone();
         let worker_lifecycle = connection_lifecycle.clone();
         let policy_id = state.policy.id;
+        let close_timer = close_timer.clone();
         let worker = connection_lifecycle.tasks.track_future(async move {
-            if let Err(e) =
-                run_stream_worker(recv, sender, state, worker_lifecycle.token, coord).await
+            if let Err(e) = run_stream_worker(
+                recv,
+                sender,
+                state,
+                worker_lifecycle.token,
+                coord,
+                close_timer,
+            )
+            .await
             {
                 warn!(policy_id, "Stream worker failed: {e:#}");
             }
@@ -752,8 +845,13 @@ async fn run_inbound_dispatcher(
 /// Per-stream worker, spawned by [`run_inbound_dispatcher`] only after
 /// the inbound stream has been bound to its policy by id. The worker
 /// owns the recv stream and is responsible for decoding events,
-/// reacting to per-policy deletion (`policy_token`), and global
-/// cancellation.
+/// building and writing their windows, closing a quiet stream's window
+/// on `close_timer`, reacting to per-policy deletion (`policy_token`),
+/// and global cancellation.
+///
+/// Shutdown, deletion and a replaced connection drop the open window
+/// without writing it: it has not ended, and the resume rebuilds it from
+/// the events Giganto stores.
 ///
 /// When the inbound stream finishes or errors, the worker exits
 /// silently; reconnection is driven by `conn.closed()` in
@@ -767,6 +865,7 @@ async fn run_stream_worker(
     state: StreamPolicy,
     connection_token: tokio_util::sync::CancellationToken,
     coordinator: CancellationCoordinator,
+    close_timer: CloseTimer,
 ) -> Result<()> {
     let StreamPolicy {
         policy,
@@ -775,27 +874,47 @@ async fn run_stream_worker(
     } = state;
     info!("Raw event {:?} has been connected", policy.kind);
     let id = policy.id;
-    let mut series = TimeSeries::try_new(&policy, start)?;
+    let mut windows = WindowBuilder::try_new(&policy, start)?;
 
-    loop {
-        tokio::select! {
-            biased;
-            () = coordinator.cancelled() => {
-                info!("Stream worker for policy {id} shutting down");
+    // The timer must not interrupt a partly read event, so the stream is read
+    // by its own future, which hands each complete event over this channel.
+    let (event_send, mut event_recv) = mpsc::channel(1);
+    let reader = async {
+        while let Ok(event) = receive_time_series_generator_data(&mut recv).await {
+            if event_send.send(event).await.is_err() {
                 break;
             }
-            () = policy_token.cancelled() => {
-                info!("Policy {id} deleted, stopping stream worker");
-                recv.stop(VarInt::default())?;
-                break;
-            }
-            () = connection_token.cancelled() => {
-                info!("Stream worker for policy {id} stopping; publish connection replaced");
-                break;
-            }
-            result = receive_time_series_generator_data(&mut recv) => {
-                if let Ok((raw_event, timestamp_nanos)) = result {
-                    let time_secs = timestamp_nanos.div_euclid(SECOND_TO_NANO);
+        }
+        // Dropping the sender tells the builder that the stream ended once it
+        // has taken the events already handed over.
+        drop(event_send);
+        std::future::pending::<()>().await;
+    };
+    let builder = async {
+        let mut check = interval(close_timer.check_interval);
+        check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_received = Instant::now();
+        loop {
+            tokio::select! {
+                biased;
+                () = coordinator.cancelled() => {
+                    info!("Stream worker for policy {id} shutting down");
+                    return Ok(false);
+                }
+                () = policy_token.cancelled() => {
+                    info!("Policy {id} deleted, stopping stream worker");
+                    return Ok(true);
+                }
+                () = connection_token.cancelled() => {
+                    info!("Stream worker for policy {id} stopping; publish connection replaced");
+                    return Ok(false);
+                }
+                received = event_recv.recv() => {
+                    let Some((raw_event, timestamp_nanos)) = received else {
+                        info!("Stream for policy {id} ended");
+                        return Ok(false);
+                    };
+                    last_received = Instant::now();
                     let Ok(event) = Event::try_new(policy.kind, &raw_event) else {
                         warn!(
                             "Failed to deserialize raw_event for sampling kind: {:?}",
@@ -803,16 +922,52 @@ async fn run_stream_worker(
                         );
                         continue;
                     };
-                    if let Err(e) = series.fill(&policy, time_secs, &event, &sender).await {
-                        warn!("Failed to generate time series: {}", e);
+                    match windows.add(timestamp_nanos, &event) {
+                        Ok(Some(series)) => write_window(&sender, series).await?,
+                        Ok(None) => {}
+                        Err(e) => warn!("Failed to generate time series: {}", e),
                     }
-                } else {
-                    info!("Stream for policy {id} ended");
-                    break;
+                }
+                _ = check.tick() => {
+                    if last_received.elapsed() < close_timer.idle {
+                        continue;
+                    }
+                    if let Some(series) = windows.close_if_due((close_timer.now)()) {
+                        write_window(&sender, series).await?;
+                    }
                 }
             }
         }
+    };
+    let deleted: Result<bool> = tokio::select! {
+        result = builder => result,
+        () = reader => unreachable!("the stream reader never completes"),
+    };
+    if deleted? {
+        recv.stop(VarInt::default())?;
     }
+    Ok(())
+}
+
+/// Hands a window to the policy's ingest sender, or to the ingest control
+/// when the policy has none, or its sender closed with a replaced ingest
+/// connection.
+async fn write_window(send_channel: &Sender<TimeSeries>, series: TimeSeries) -> Result<()> {
+    // Clone the sender out of the lock to avoid holding the RwLock read
+    // guard across an await point.
+    let cached_sender = INGEST_CHANNEL
+        .read()
+        .await
+        .get(&series.sampling_policy_id)
+        .cloned();
+    let series = match cached_sender {
+        Some(sender) => match sender.send(series).await {
+            Ok(()) => return Ok(()),
+            Err(async_channel::SendError(series)) => series,
+        },
+        None => series,
+    };
+    send_channel.send(series).await?;
     Ok(())
 }
 
@@ -984,7 +1139,7 @@ async fn send_time_series_record(
     let serde_series = bincode::serialize(series)?;
     let timestamp_nanos = series
         .start_secs
-        .checked_mul(SECOND_TO_NANO)
+        .checked_mul(time_series::SECOND_TO_NANO)
         .unwrap_or(i64::MAX);
     send_event_in_batch(series_sender, &[(timestamp_nanos, serde_series)]).await
 }

@@ -1,12 +1,28 @@
 use anyhow::{Context, Result, bail};
-use async_channel::Sender;
 use review_protocol::types::SamplingPolicy;
 use serde::Serialize;
+use tracing::warn;
 
-use super::{Event, INGEST_CHANNEL};
+use super::Event;
 
 pub(super) const SECOND_TO_NANO: i64 = 1_000_000_000;
 const SECONDS_PER_DAY: i64 = 86_400;
+
+/// The longest a Sensor holds an event before sending it (piglet 0.23.0
+/// `BATCH_INTERVAL`, `src/output/event.rs:39`); events are keyed by
+/// completion time, so an event completed just before a window's end arrives
+/// up to this long after it.
+const SENSOR_BATCH_SECS: i64 = 600;
+
+/// Clock skew between the Sensor and this host.
+const CLOSE_SKEW_SECS: i64 = 300;
+
+/// How long after its end a window on a quiet stream is closed by the timer.
+///
+/// Covers a Sensor batch of up to 600 s (piglet 0.23.0 `BATCH_INTERVAL`) plus
+/// 300 s of skew; a shorter batch interval in a later Sensor needs no change,
+/// only less latency.
+pub(super) const CLOSE_GRACE_SECS: i64 = SENSOR_BATCH_SECS + CLOSE_SKEW_SECS;
 
 #[cfg_attr(test, derive(serde::Deserialize))]
 #[derive(Default, Clone, Debug, Serialize)]
@@ -17,8 +33,30 @@ pub(super) struct TimeSeries {
     pub(super) series: Vec<f64>,
 }
 
-impl TimeSeries {
-    /// Creates a new `TimeSeries` from the given sampling policy.
+/// Builds one stream's windows from its events.
+///
+/// A window exists only once an event is counted in it, so a window without
+/// events is never written. At most one window is open; the last closed one
+/// is kept so that an event arriving after its window closed can still be
+/// counted there, and the window written again under the same key.
+pub(super) struct WindowBuilder {
+    policy: SamplingPolicy,
+    policy_id: String,
+    interval_secs: i64,
+    period_secs: i64,
+    slots: usize,
+    /// The stream's request start, in nanoseconds. Giganto replays the events
+    /// from here, so an older event is not part of this stream's history.
+    request_start: i64,
+    open: Option<TimeSeries>,
+    last_closed: Option<TimeSeries>,
+    /// Events dropped since the previous close.
+    dropped: u64,
+}
+
+impl WindowBuilder {
+    /// Creates a builder for the stream of `policy` requested from
+    /// `request_start` (nanoseconds).
     ///
     /// # Errors
     ///
@@ -29,7 +67,7 @@ impl TimeSeries {
     ///   `period % interval != 0`).
     /// - The policy's period is not a divisor of 1 day (86400 seconds).
     /// - The series length overflows `usize`.
-    pub(super) fn try_new(policy: &SamplingPolicy, start_timestamp: i64) -> Result<Self> {
+    pub(super) fn try_new(policy: &SamplingPolicy, request_start: i64) -> Result<Self> {
         let interval_secs = policy.interval.as_secs();
         let period_secs = policy.period.as_secs();
         if interval_secs == 0 {
@@ -45,64 +83,159 @@ impl TimeSeries {
             bail!("period must be a multiple of interval");
         }
 
-        let start_secs = start_timestamp.div_euclid(SECOND_TO_NANO);
-        let len = usize::try_from(period_secs / interval_secs)?;
-        let series = vec![0_f64; len];
-        Ok(TimeSeries {
-            sampling_policy_id: policy.id.to_string(),
-            start_secs,
-            series,
+        Ok(Self {
+            policy: policy.clone(),
+            policy_id: policy.id.to_string(),
+            interval_secs: i64::try_from(interval_secs)?,
+            period_secs: i64::try_from(period_secs)?,
+            slots: usize::try_from(period_secs / interval_secs)?,
+            request_start,
+            open: None,
+            last_closed: None,
+            dropped: 0,
         })
     }
 
-    pub(super) async fn fill(
-        &mut self,
-        policy: &SamplingPolicy,
-        time_secs: i64,
-        event: &Event,
-        send_channel: &Sender<TimeSeries>,
-    ) -> Result<()> {
-        let period = i64::try_from(policy.period.as_secs())?;
-        let elapsed = time_secs
-            .checked_sub(self.start_secs)
-            .context("failed to calculate elapsed time")?;
+    /// Counts an event at `timestamp` (nanoseconds) in its window, and
+    /// returns the window to write, if any: the open window when the event
+    /// belongs to a later one, or the last closed window when the event was
+    /// counted in it.
+    ///
+    /// An event rejected by the policy's address filter still advances time:
+    /// it may close the open window, but it neither opens a window nor counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event's window start or slot overflows.
+    pub(super) fn add(&mut self, timestamp: i64, event: &Event) -> Result<Option<TimeSeries>> {
+        let counted = self.accepts(event);
+        if timestamp < self.request_start {
+            self.drop_event(counted);
+            return Ok(None);
+        }
+        let time_secs = timestamp.div_euclid(SECOND_TO_NANO);
+        let window_start = start_time(&self.policy, time_secs)?;
+        let value = event_value(self.policy.column, event);
 
-        if elapsed > period {
-            // Clone the sender out of the lock to avoid holding the
-            // RwLock read guard across an await point.
-            let cached_sender = INGEST_CHANNEL
-                .read()
-                .await
-                .get(&self.sampling_policy_id)
-                .cloned();
-            if let Some(sender) = cached_sender {
-                sender.send(self.clone()).await?;
-            } else {
-                send_channel.send(self.clone()).await?;
+        let interval_secs = self.interval_secs;
+        match self.open.as_mut() {
+            Some(open) if window_start == open.start_secs => {
+                if counted {
+                    count(open, interval_secs, time_secs, value)?;
+                }
+                return Ok(None);
             }
-            self.start_secs = start_time(policy, time_secs)?;
-            self.series.fill(0_f64);
+            Some(open) if window_start > open.start_secs => {
+                let closed = self.close_open();
+                if counted {
+                    self.open_window(window_start, time_secs, value)?;
+                }
+                return Ok(closed);
+            }
+            _ => {}
         }
 
-        let time_slot = time_slot(policy, time_secs)?;
-        let Some(value) = self.series.get_mut(time_slot) else {
-            bail!("cannot access the time slot");
-        };
-        *value += event_value(policy.column, event);
+        // No window is open, or the event is older than the open one.
+        if let Some(last) = self
+            .last_closed
+            .as_mut()
+            .filter(|last| last.start_secs == window_start)
+        {
+            if !counted {
+                return Ok(None);
+            }
+            count(last, interval_secs, time_secs, value)?;
+            return Ok(Some(last.clone()));
+        }
+        let newer_than_last = self
+            .last_closed
+            .as_ref()
+            .is_none_or(|last| window_start > last.start_secs);
+        if self.open.is_none() && newer_than_last {
+            if counted {
+                self.open_window(window_start, time_secs, value)?;
+            }
+            return Ok(None);
+        }
+        // Older than the last closed window, or a window that was never
+        // written because no event arrived before a later one opened.
+        self.drop_event(counted);
+        Ok(None)
+    }
 
+    /// Closes the open window once the wall clock `now_secs` is at least
+    /// [`CLOSE_GRACE_SECS`] past its end, and returns it for writing.
+    pub(super) fn close_if_due(&mut self, now_secs: i64) -> Option<TimeSeries> {
+        let open_start = self.open.as_ref()?.start_secs;
+        let due = open_start
+            .saturating_add(self.period_secs)
+            .saturating_add(CLOSE_GRACE_SECS);
+        if now_secs < due {
+            return None;
+        }
+        self.close_open()
+    }
+
+    fn accepts(&self, event: &Event) -> bool {
+        self.policy
+            .src_ip
+            .is_none_or(|src_ip| event.orig_addr() == src_ip)
+            && self
+                .policy
+                .dst_ip
+                .is_none_or(|dst_ip| event.resp_addr() == dst_ip)
+    }
+
+    fn drop_event(&mut self, counted: bool) {
+        if counted {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// Opens the window starting at `start_secs` with its first event.
+    fn open_window(&mut self, start_secs: i64, time_secs: i64, value: f64) -> Result<()> {
+        let mut window = TimeSeries {
+            sampling_policy_id: self.policy_id.clone(),
+            start_secs,
+            series: vec![0_f64; self.slots],
+        };
+        count(&mut window, self.interval_secs, time_secs, value)?;
+        self.open = Some(window);
         Ok(())
+    }
+
+    /// Makes the open window the last closed one and returns it for writing.
+    fn close_open(&mut self) -> Option<TimeSeries> {
+        let closed = self.open.take()?;
+        if self.dropped > 0 {
+            warn!(
+                policy_id = %self.policy_id,
+                dropped = self.dropped,
+                "Dropped late events that neither the open nor the last closed window takes"
+            );
+            self.dropped = 0;
+        }
+        self.last_closed = Some(closed.clone());
+        Some(closed)
     }
 }
 
-fn time_slot(policy: &SamplingPolicy, time_secs: i64) -> Result<usize> {
-    let Some(offset_time) = time_secs.checked_add(i64::from(policy.offset)) else {
-        bail!("failed to apply policy offset to timestamp");
+/// Adds `value` to the slot of `time_secs` in `window`.
+fn count(window: &mut TimeSeries, interval_secs: i64, time_secs: i64, value: f64) -> Result<()> {
+    let slot = slot(interval_secs, window.start_secs, time_secs)?;
+    let Some(slot_value) = window.series.get_mut(slot) else {
+        bail!("cannot access the time slot");
     };
-    let seconds_of_day = u64::try_from(offset_time.rem_euclid(SECONDS_PER_DAY))?;
-    let interval = policy.interval.as_secs();
-    let period = policy.period.as_secs();
-    let time_slot = seconds_of_day % period / interval;
-    Ok(usize::try_from(time_slot)?)
+    *slot_value += value;
+    Ok(())
+}
+
+/// Returns the slot of `time_secs` in the window starting at `window_start`.
+fn slot(interval_secs: i64, window_start: i64, time_secs: i64) -> Result<usize> {
+    let elapsed = time_secs
+        .checked_sub(window_start)
+        .context("failed to calculate elapsed time")?;
+    Ok(usize::try_from(elapsed / interval_secs)?)
 }
 
 fn event_value(sum_column: Option<u32>, event: &Event) -> f64 {
@@ -144,7 +277,6 @@ mod tests {
     use std::time::Duration;
 
     use review_protocol::types::{SamplingKind, SamplingPolicy};
-    use serial_test::serial;
     use time::{Date, Month};
 
     use super::*;
@@ -230,6 +362,12 @@ mod tests {
             .expect("time is valid")
             .assume_utc()
             .unix_timestamp()
+    }
+
+    /// Returns the slot of `time_secs` in its own window.
+    fn time_slot(policy: &SamplingPolicy, time_secs: i64) -> Result<usize> {
+        let interval = i64::try_from(policy.interval.as_secs())?;
+        slot(interval, start_time(policy, time_secs)?, time_secs)
     }
 
     // =========================================================================
@@ -566,64 +704,39 @@ mod tests {
         }
     }
 
-    /// Helper to create a `TimeSeries` for testing fill behavior
-    fn create_test_series(policy_id: &str, num_slots: usize, start_timestamp: i64) -> TimeSeries {
-        TimeSeries {
-            sampling_policy_id: policy_id.to_string(),
-            start_secs: start_timestamp,
-            series: vec![0_f64; num_slots],
-        }
-    }
-
-    async fn reset_ingest_channel() {
-        INGEST_CHANNEL.write().await.clear();
-    }
-
     // =========================================================================
-    // Tests for TimeSeries::fill and column aggregation
+    // Tests for WindowBuilder::add and column aggregation
     // =========================================================================
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_single_event_counts_as_one() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_single_event_counts_as_one() {
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: None => count events (each event adds 1.0)
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        // Create a time series starting at midnight
-        let midnight = datetime_from_utc("2024/1/15 00:00:00");
-        let mut series = create_test_series("1", 4, midnight);
-
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Event at 00:05:00 => slot 0
         let event_time = datetime_from_utc("2024/1/15 00:05:00");
         let conn = create_test_conn();
-        series
-            .fill(&policy, event_time, &Event::Conn(conn), &sender)
-            .await
-            .expect("fill should succeed");
+        builder
+            .add(nanos(event_time), &Event::Conn(conn))
+            .expect("add should succeed");
 
         // Verify slot 0 has value 1.0
-        assert_eq!(series.series[0], 1.0);
-        assert_eq!(series.series[1], 0.0);
-        assert_eq!(series.series[2], 0.0);
-        assert_eq!(series.series[3], 0.0);
+        assert_eq!(open(&builder).series[0], 1.0);
+        assert_eq!(open(&builder).series[1], 0.0);
+        assert_eq!(open(&builder).series[2], 0.0);
+        assert_eq!(open(&builder).series[3], 0.0);
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_multiple_events_same_slot_aggregates() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_multiple_events_same_slot_aggregates() {
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: None => count events
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00");
-        let mut series = create_test_series("1", 4, midnight);
-
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Three events at different times within slot 0 (00:00 - 00:15)
         let event_times = [
@@ -634,27 +747,21 @@ mod tests {
         for event_time in event_times {
             let event_time = datetime_from_utc(event_time);
             let conn = create_test_conn();
-            series
-                .fill(&policy, event_time, &Event::Conn(conn), &sender)
-                .await
-                .expect("fill should succeed");
+            builder
+                .add(nanos(event_time), &Event::Conn(conn))
+                .expect("add should succeed");
         }
 
         // Verify slot 0 has value 3.0 (three events aggregated)
-        assert_eq!(series.series[0], 3.0);
+        assert_eq!(open(&builder).series[0], 3.0);
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_events_in_different_slots() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_events_in_different_slots() {
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00");
-        let mut series = create_test_series("1", 4, midnight);
-
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Events in each slot
         // Slot 0: 00:05:00 (2 events)
@@ -676,13 +783,12 @@ mod tests {
             for &event_time in *times {
                 let event_time = datetime_from_utc(event_time);
                 let conn = create_test_conn();
-                series
-                    .fill(&policy, event_time, &Event::Conn(conn), &sender)
-                    .await
-                    .expect("fill should succeed");
+                builder
+                    .add(nanos(event_time), &Event::Conn(conn))
+                    .expect("add should succeed");
             }
             assert_eq!(
-                series.series[slot],
+                open(&builder).series[slot],
                 times.len() as f64,
                 "slot {} should have {} events",
                 slot,
@@ -691,18 +797,13 @@ mod tests {
         }
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_with_column_aggregation_duration() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_with_column_aggregation_duration() {
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: Some(5) => sum duration values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(5));
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00");
-        let mut series = create_test_series("1", 4, midnight);
-
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Add events with different durations to slot 0
         let durations = [1_000_000_000_i64, 2_000_000_000, 500_000_000];
@@ -714,33 +815,29 @@ mod tests {
         for (&duration, event_time) in durations.iter().zip(event_times) {
             let event_time = datetime_from_utc(event_time);
             let conn = create_conn_with_values(duration, 0, 0, 0, 0);
-            series
-                .fill(&policy, event_time, &Event::Conn(conn), &sender)
-                .await
-                .expect("fill should succeed");
+            builder
+                .add(nanos(event_time), &Event::Conn(conn))
+                .expect("add should succeed");
         }
 
         // Verify slot 0 has sum of durations
         let expected_sum: f64 = durations.iter().map(|&d| d as f64).sum();
         assert_eq!(
-            series.series[0], expected_sum,
+            open(&builder).series[0],
+            expected_sum,
             "expected {} but got {}",
-            expected_sum, series.series[0]
+            expected_sum,
+            open(&builder).series[0]
         );
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_with_column_aggregation_bytes() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_with_column_aggregation_bytes() {
         // Period: 1 hour, Interval: 15 min => 4 slots
         // column: Some(7) => sum orig_bytes values
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(7));
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00");
-        let mut series = create_test_series("1", 4, midnight);
-
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Add events with different orig_bytes to slot 1 (15-30 minutes)
         let bytes_values = [100_u64, 200, 300, 400];
@@ -753,36 +850,32 @@ mod tests {
         for (&bytes, event_time) in bytes_values.iter().zip(event_times) {
             let event_time = datetime_from_utc(event_time);
             let conn = create_conn_with_values(0, bytes, 0, 0, 0);
-            series
-                .fill(&policy, event_time, &Event::Conn(conn), &sender)
-                .await
-                .expect("fill should succeed");
+            builder
+                .add(nanos(event_time), &Event::Conn(conn))
+                .expect("add should succeed");
         }
 
         // Verify slot 0 is empty
-        assert_eq!(series.series[0], 0.0);
+        assert_eq!(open(&builder).series[0], 0.0);
 
         // Verify slot 1 has sum of orig_bytes
         let expected_sum: f64 = bytes_values.iter().map(|&b| b as f64).sum();
         assert_eq!(
-            series.series[1], expected_sum,
+            open(&builder).series[1],
+            expected_sum,
             "expected {} but got {}",
-            expected_sum, series.series[1]
+            expected_sum,
+            open(&builder).series[1]
         );
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_with_column_aggregation_packets() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_with_column_aggregation_packets() {
         // Period: 1 hour, Interval: 30 min => 2 slots
         // column: Some(9) => sum orig_pkts values
         let policy = create_policy(1, SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 0, Some(9));
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00");
-        let mut series = create_test_series("1", 2, midnight);
-
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Add events to both slots
         // Slot 0: packets 10, 20, 30
@@ -795,10 +888,9 @@ mod tests {
         for (event_time, packets) in slot_0_events {
             let event_time = datetime_from_utc(event_time);
             let conn = create_conn_with_values(0, 0, 0, packets, 0);
-            series
-                .fill(&policy, event_time, &Event::Conn(conn), &sender)
-                .await
-                .expect("fill should succeed");
+            builder
+                .add(nanos(event_time), &Event::Conn(conn))
+                .expect("add should succeed");
         }
 
         // Slot 1: 35 min and 45 min
@@ -806,79 +898,63 @@ mod tests {
         for (event_time, packets) in slot_1_events {
             let event_time = datetime_from_utc(event_time);
             let conn = create_conn_with_values(0, 0, 0, packets, 0);
-            series
-                .fill(&policy, event_time, &Event::Conn(conn), &sender)
-                .await
-                .expect("fill should succeed");
+            builder
+                .add(nanos(event_time), &Event::Conn(conn))
+                .expect("add should succeed");
         }
 
         // Verify slot 0: 10 + 20 + 50 = 80 (minutes 5=>10, 10=>20, 25=>50)
         assert_eq!(
-            series.series[0], 80.0,
+            open(&builder).series[0],
+            80.0,
             "slot 0 expected 80 but got {}",
-            series.series[0]
+            open(&builder).series[0]
         );
 
         // Verify slot 1: 2 + 7 = 9 (minutes 35=>2, 45=>7)
         assert_eq!(
-            series.series[1], 9.0,
+            open(&builder).series[1],
+            9.0,
             "slot 1 expected 9 but got {}",
-            series.series[1]
+            open(&builder).series[1]
         );
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_period_boundary_sends_and_resets() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_period_boundary_sends_and_resets() {
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
-
-        let midnight = datetime_from_utc("2024/1/15 00:00:00");
-        let mut series = create_test_series("1", 4, midnight);
-
-        let (sender, receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Add an event in the first period (slot 0)
-        let event_time = datetime_from_utc("2024/1/15 00:05:00");
-        let conn = create_test_conn();
-        series
-            .fill(&policy, event_time, &Event::Conn(conn), &sender)
-            .await
-            .expect("fill should succeed");
+        let written = add_at(&mut builder, "2024/1/15 00:05:00");
+        assert!(written.is_none());
+        assert_eq!(open(&builder).series[0], 1.0);
 
-        assert_eq!(series.series[0], 1.0);
+        // An event of the next period writes the first window and opens the
+        // next one with that event.
+        let sent_series =
+            add_at(&mut builder, "2024/1/15 01:01:05").expect("the first window is written");
+        assert_eq!(
+            sent_series.start_secs,
+            datetime_from_utc("2024/1/15 00:00:00")
+        );
+        assert_eq!(sent_series.series, [1.0, 0.0, 0.0, 0.0]);
 
-        // Add an event beyond the period boundary (> 1 hour later)
-        // This should trigger sending the current series and resetting
-        let event_time_next_period = datetime_from_utc("2024/1/15 01:01:05");
-        let conn = create_test_conn();
-        series
-            .fill(&policy, event_time_next_period, &Event::Conn(conn), &sender)
-            .await
-            .expect("fill should succeed");
-
-        // The series should have been reset (slot 0 now has a new event)
-        // The old series was sent to the channel
-        let sent_series = receiver.try_recv().expect("should have received a series");
-        assert_eq!(sent_series.series[0], 1.0);
-
-        // The current series should have the new event
-        // The new event at 61:05 falls into slot 0 of the new period
-        assert_eq!(series.series[0], 1.0);
-        assert_eq!(series.series[1], 0.0);
+        // The new event at 01:01:05 falls into slot 0 of the new period
+        assert_eq!(
+            open(&builder).start_secs,
+            datetime_from_utc("2024/1/15 01:00:00")
+        );
+        assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_kst_offset_events_aggregate_same_slot() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_kst_offset_events_aggregate_same_slot() {
         // Period: 1 day, Interval: 15 min => 96 slots
         // Offset: +9 hours (KST)
         let policy = create_policy(1, SECS_PER_DAY, 15 * SECS_PER_MINUTE, 32_400, None);
-        let midnight = datetime_from_utc("2022/11/17 00:00:00");
-        let mut series = create_test_series("1", 96, midnight);
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(1);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         for event_time in [
             "2022/11/17 00:03:00",
@@ -886,63 +962,49 @@ mod tests {
             "2022/11/17 00:09:00",
         ] {
             let conn = create_test_conn();
-            series
-                .fill(
-                    &policy,
-                    datetime_from_utc(event_time),
-                    &Event::Conn(conn),
-                    &sender,
-                )
-                .await
-                .expect("fill should succeed");
+            builder
+                .add(nanos(datetime_from_utc(event_time)), &Event::Conn(conn))
+                .expect("add should succeed");
         }
 
         // UTC 00:03/00:06/00:09 becomes KST 09:03/09:06/09:09, which is slot 36.
-        assert_eq!(series.series[36], 3.0);
+        assert_eq!(open(&builder).series[36], 3.0);
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_with_offset_affects_slot_calculation() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_with_offset_affects_slot_calculation() {
         // Period: 1 day, Interval: 1 hour => 24 slots
         // Offset: +9 hours (32400s) - KST adjustment
         let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
 
         let kst_midnight_utc = datetime_from_utc("2024/1/14 15:00:00");
-        let mut series = create_test_series("1", 24, kst_midnight_utc);
-
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        // The window opens at its first event's KST midnight.
 
         // KST midnight (UTC 15:00) event maps to slot 0
         let event_time = datetime_from_utc("2024/1/14 15:00:00");
         let conn = create_test_conn();
-        series
-            .fill(&policy, event_time, &Event::Conn(conn), &sender)
-            .await
-            .expect("fill should succeed");
+        builder
+            .add(nanos(event_time), &Event::Conn(conn))
+            .expect("add should succeed");
 
-        assert_eq!(series.series[0], 1.0);
+        assert_eq!(open(&builder).start_secs, kst_midnight_utc);
+        assert_eq!(open(&builder).series[0], 1.0);
 
         // All other slots should be empty
-        for (i, &value) in series.series.iter().enumerate() {
+        for (i, &value) in open(&builder).series.iter().enumerate() {
             if i != 0 {
                 assert_eq!(value, 0.0, "slot {i} should be 0 but is {value}");
             }
         }
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_missing_slots_remain_zero() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_missing_slots_remain_zero() {
         // Period: 1 hour, Interval: 10 min => 6 slots
         let policy = create_policy(1, SECS_PER_HOUR, 10 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00");
-        let mut series = create_test_series("1", 6, midnight);
-
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Only add events to slots 0, 2, and 5 (skip 1, 3, 4)
         let event_times = [
@@ -953,121 +1015,359 @@ mod tests {
         for event_time in event_times {
             let event_time = datetime_from_utc(event_time);
             let conn = create_test_conn();
-            series
-                .fill(&policy, event_time, &Event::Conn(conn), &sender)
-                .await
-                .expect("fill should succeed");
+            builder
+                .add(nanos(event_time), &Event::Conn(conn))
+                .expect("add should succeed");
         }
 
         // Verify only specific slots have values
-        assert_eq!(series.series[0], 1.0);
-        assert_eq!(series.series[1], 0.0); // missing
-        assert_eq!(series.series[2], 1.0);
-        assert_eq!(series.series[3], 0.0); // missing
-        assert_eq!(series.series[4], 0.0); // missing
-        assert_eq!(series.series[5], 1.0);
+        assert_eq!(open(&builder).series[0], 1.0);
+        assert_eq!(open(&builder).series[1], 0.0); // missing
+        assert_eq!(open(&builder).series[2], 1.0);
+        assert_eq!(open(&builder).series[3], 0.0); // missing
+        assert_eq!(open(&builder).series[4], 0.0); // missing
+        assert_eq!(open(&builder).series[5], 1.0);
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_fill_duplicate_timestamps_aggregate() {
-        reset_ingest_channel().await;
+    #[test]
+    fn test_add_duplicate_timestamps_aggregate() {
         // Period: 1 hour, Interval: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
 
-        let midnight = datetime_from_utc("2024/1/15 00:00:00");
-        let mut series = create_test_series("1", 4, midnight);
-
-        let (sender, _receiver) = async_channel::bounded::<TimeSeries>(10);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Add multiple events with exactly the same timestamp
         let event_time = datetime_from_utc("2024/1/15 00:05:00");
         for _ in 0..5 {
             let conn = create_test_conn();
-            series
-                .fill(&policy, event_time, &Event::Conn(conn), &sender)
-                .await
-                .expect("fill should succeed");
+            builder
+                .add(nanos(event_time), &Event::Conn(conn))
+                .expect("add should succeed");
         }
 
         // All 5 events should aggregate into slot 0
-        assert_eq!(series.series[0], 5.0);
+        assert_eq!(open(&builder).series[0], 5.0);
     }
 
     // =========================================================================
     // Tests for TimeSeries construction
     // =========================================================================
     #[test]
-    fn try_new_uses_explicit_resume_timestamp() {
+    fn try_new_opens_no_window_at_the_request_start() {
         let policy = create_simple_policy(60, 3600);
-        for (nanos, seconds) in [(1_700_003_600_000_000_001, 1_700_003_600), (-1, -1), (0, 0)] {
-            let series = TimeSeries::try_new(&policy, nanos).unwrap();
-            assert_eq!(series.start_secs, seconds);
-            assert_eq!(series.series.len(), 60);
+        for request_start in [1_700_003_600_000_000_001, -1, 0] {
+            let builder = WindowBuilder::try_new(&policy, request_start).unwrap();
+            assert_eq!(builder.request_start, request_start);
+            assert!(builder.open.is_none());
+            assert!(builder.last_closed.is_none());
         }
     }
 
-    #[tokio::test]
-    async fn try_new_valid_period_interval() {
+    #[test]
+    fn try_new_valid_period_interval() {
         // period (3600) is a multiple of interval (60)
         let policy = create_simple_policy(60, 3600);
-        let result = TimeSeries::try_new(&policy, 0);
+        let result = WindowBuilder::try_new(&policy, 0);
         assert!(result.is_ok());
         let ts = result.unwrap();
-        assert_eq!(ts.series.len(), 60); // 3600 / 60 = 60
+        assert_eq!(ts.slots, 60); // 3600 / 60 = 60
     }
 
-    #[tokio::test]
-    async fn try_new_invalid_period_not_divisor_of_1_day() {
+    #[test]
+    fn try_new_invalid_period_not_divisor_of_1_day() {
         // period (777) is not a divisor of 1 day (86400 seconds)
         let policy = create_simple_policy(7, 777);
-        let result = TimeSeries::try_new(&policy, 0);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let result = WindowBuilder::try_new(&policy, 0);
+        let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
             err_msg.contains("period must be a divisor of 1 day (86400 seconds)"),
             "unexpected error message: {err_msg}"
         );
     }
 
-    #[tokio::test]
-    async fn try_new_invalid_period_not_multiple_of_interval() {
+    #[test]
+    fn try_new_invalid_period_not_multiple_of_interval() {
         // period (100) is not a multiple of interval (30)
         let policy = create_simple_policy(30, 100);
-        let result = TimeSeries::try_new(&policy, 0);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let result = WindowBuilder::try_new(&policy, 0);
+        let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
             err_msg.contains("period must be a multiple of interval"),
             "unexpected error message: {err_msg}"
         );
     }
 
-    #[tokio::test]
-    async fn try_new_interval_zero() {
+    #[test]
+    fn try_new_interval_zero() {
         // interval is 0, should error before division
         let policy = create_simple_policy(0, 3600);
-        let result = TimeSeries::try_new(&policy, 0);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let result = WindowBuilder::try_new(&policy, 0);
+        let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
             err_msg.contains("interval must be greater than 0"),
             "unexpected error message: {err_msg}"
         );
     }
 
-    #[tokio::test]
-    async fn try_new_period_zero() {
+    #[test]
+    fn try_new_period_zero() {
         // period is 0, should error
         let policy = create_simple_policy(60, 0);
-        let result = TimeSeries::try_new(&policy, 0);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let result = WindowBuilder::try_new(&policy, 0);
+        let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
             err_msg.contains("period must be greater than 0"),
             "unexpected error message: {err_msg}"
         );
     }
+
+    // =========================================================================
+    // Tests for window routing, the timer close and the address filter
+    // =========================================================================
+
+    fn nanos(secs: i64) -> i64 {
+        secs * SECOND_TO_NANO
+    }
+
+    fn open(builder: &WindowBuilder) -> &TimeSeries {
+        builder.open.as_ref().expect("a window is open")
+    }
+
+    /// Adds a counted event at `datetime` and returns the window to write.
+    fn add_at(builder: &mut WindowBuilder, datetime: &str) -> Option<TimeSeries> {
+        builder
+            .add(
+                nanos(datetime_from_utc(datetime)),
+                &Event::Conn(create_test_conn()),
+            )
+            .expect("add should succeed")
+    }
+
+    fn conn_between(orig_addr: &str, resp_addr: &str) -> Event {
+        Event::Conn(giganto_client::ingest::network::Conn {
+            orig_addr: orig_addr.parse().unwrap(),
+            resp_addr: resp_addr.parse().unwrap(),
+            ..create_test_conn()
+        })
+    }
+
+    #[test]
+    fn first_event_opens_its_window_and_the_first_close_writes_it() {
+        // Period: 1 hour, Interval: 15 min. No checkpoint: the request starts at 0.
+        for (offset, window_start, next_event) in [
+            (0, "2024/1/15 05:00:00", "2024/1/15 06:10:00"),
+            // With offset 13200 (3h40m) an hourly window starts at hh:20.
+            (13_200, "2024/1/15 05:20:00", "2024/1/15 06:25:00"),
+        ] {
+            let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, offset, None);
+            let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+
+            assert!(add_at(&mut builder, "2024/1/15 05:40:00").is_none());
+            assert_eq!(open(&builder).start_secs, datetime_from_utc(window_start));
+
+            let written = add_at(&mut builder, next_event).expect("the first window is written");
+            assert_eq!(written.start_secs, datetime_from_utc(window_start));
+            assert_ne!(written.start_secs, 0);
+            assert_eq!(written.series.iter().sum::<f64>(), 1.0);
+        }
+    }
+
+    #[test]
+    fn resume_rewrites_the_last_window_and_writes_no_zero_row() {
+        // The checkpoint is the start of the last written window, 05:00. The
+        // window after it, 06:00, had no events.
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let checkpoint = datetime_from_utc("2024/1/15 05:00:00");
+        let mut builder = WindowBuilder::try_new(&policy, nanos(checkpoint)).unwrap();
+
+        let mut written = Vec::new();
+        for event in [
+            "2024/1/15 05:00:00",
+            "2024/1/15 05:20:00",
+            "2024/1/15 05:50:00",
+            "2024/1/15 07:05:00",
+        ] {
+            written.extend(add_at(&mut builder, event));
+        }
+
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(written[0].start_secs, checkpoint);
+        assert_eq!(written[0].series, [1.0, 1.0, 0.0, 1.0]);
+        assert_eq!(
+            open(&builder).start_secs,
+            datetime_from_utc("2024/1/15 07:00:00")
+        );
+    }
+
+    #[test]
+    fn late_event_for_the_last_closed_window_rewrites_it() {
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        add_at(&mut builder, "2024/1/15 00:05:00");
+        let first = add_at(&mut builder, "2024/1/15 01:05:00").expect("00:00 is written");
+        assert_eq!(first.series, [1.0, 0.0, 0.0, 0.0]);
+
+        let rewritten = add_at(&mut builder, "2024/1/15 00:35:00").expect("00:00 is rewritten");
+        assert_eq!(rewritten.start_secs, first.start_secs);
+        assert_eq!(rewritten.series, [1.0, 0.0, 1.0, 0.0]);
+
+        // The open window is unchanged.
+        assert_eq!(
+            open(&builder).start_secs,
+            datetime_from_utc("2024/1/15 01:00:00")
+        );
+        assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(builder.dropped, 0);
+    }
+
+    #[test]
+    fn event_older_than_the_last_closed_window_is_dropped_and_counted() {
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        add_at(&mut builder, "2024/1/15 00:05:00");
+        add_at(&mut builder, "2024/1/15 01:05:00").expect("00:00 is written");
+        add_at(&mut builder, "2024/1/15 02:05:00").expect("01:00 is written");
+
+        assert!(add_at(&mut builder, "2024/1/15 00:10:00").is_none());
+        assert_eq!(builder.dropped, 1);
+        assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            builder.last_closed.as_ref().unwrap().series,
+            [1.0, 0.0, 0.0, 0.0]
+        );
+
+        // A gap window, never written because it had no events, takes none.
+        add_at(&mut builder, "2024/1/15 04:05:00").expect("02:00 is written");
+        assert_eq!(builder.dropped, 0, "the close reports and resets the count");
+        assert!(add_at(&mut builder, "2024/1/15 03:05:00").is_none());
+        assert_eq!(builder.dropped, 1);
+    }
+
+    #[test]
+    fn event_before_the_request_start_is_dropped_and_opens_no_window() {
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let request_start = nanos(datetime_from_utc("2024/1/15 05:00:00"));
+        let mut builder = WindowBuilder::try_new(&policy, request_start).unwrap();
+
+        let written = builder
+            .add(request_start - 1, &Event::Conn(create_test_conn()))
+            .unwrap();
+        assert!(written.is_none());
+        assert!(builder.open.is_none());
+        assert_eq!(builder.dropped, 1);
+
+        builder
+            .add(request_start, &Event::Conn(create_test_conn()))
+            .unwrap();
+        assert_eq!(open(&builder).start_secs, request_start / SECOND_TO_NANO);
+    }
+
+    #[test]
+    fn timer_closes_the_open_window_after_its_grace() {
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        add_at(&mut builder, "2024/1/15 00:05:00");
+        let end = datetime_from_utc("2024/1/15 01:00:00");
+
+        assert_eq!(CLOSE_GRACE_SECS, 900);
+        assert!(builder.close_if_due(end + 899).is_none());
+        let written = builder.close_if_due(end + 900).expect("due at end + 900 s");
+        assert_eq!(written.start_secs, datetime_from_utc("2024/1/15 00:00:00"));
+        assert_eq!(written.series, [1.0, 0.0, 0.0, 0.0]);
+        assert!(builder.open.is_none());
+        assert!(builder.close_if_due(end + 10_000).is_none(), "written once");
+
+        // A straggler after the timer close rewrites the window.
+        let rewritten = add_at(&mut builder, "2024/1/15 00:50:00").expect("rewritten");
+        assert_eq!(rewritten.start_secs, written.start_secs);
+        assert_eq!(rewritten.series, [1.0, 0.0, 0.0, 1.0]);
+        assert!(builder.open.is_none());
+    }
+
+    #[test]
+    fn filter_rejected_event_closes_but_neither_opens_nor_counts() {
+        let mut policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        policy.src_ip = Some("10.0.0.1".parse().unwrap());
+        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let accepted = conn_between("10.0.0.1", "10.0.0.9");
+        let rejected = conn_between("10.0.0.2", "10.0.0.9");
+        let at = |datetime| nanos(datetime_from_utc(datetime));
+
+        // A rejected event neither opens a window nor counts.
+        assert!(
+            builder
+                .add(at("2024/1/15 00:01:00"), &rejected)
+                .unwrap()
+                .is_none()
+        );
+        assert!(builder.open.is_none());
+        builder.add(at("2024/1/15 00:05:00"), &accepted).unwrap();
+        builder.add(at("2024/1/15 00:06:00"), &rejected).unwrap();
+        assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
+
+        // A rejected event of a later window closes the open one.
+        let written = builder
+            .add(at("2024/1/15 01:05:00"), &rejected)
+            .unwrap()
+            .expect("the open window is written");
+        assert_eq!(written.series, [1.0, 0.0, 0.0, 0.0]);
+        assert!(builder.open.is_none());
+
+        // It does not rewrite the last closed window either.
+        assert!(
+            builder
+                .add(at("2024/1/15 00:30:00"), &rejected)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            builder.last_closed.as_ref().unwrap().series,
+            [1.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(builder.dropped, 0);
+
+        builder.add(at("2024/1/15 01:10:00"), &accepted).unwrap();
+        assert_eq!(
+            open(&builder).start_secs,
+            datetime_from_utc("2024/1/15 01:00:00")
+        );
+        assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn address_filter_truth_table() {
+        const SRC: &str = "10.0.0.1";
+        const DST: &str = "10.0.0.2";
+        const OTHER: &str = "10.0.0.3";
+        let events = [
+            ("src→dst", conn_between(SRC, DST)),
+            ("src→other", conn_between(SRC, OTHER)),
+            ("other→dst", conn_between(OTHER, DST)),
+            ("other→other", conn_between(OTHER, OTHER)),
+            // The filter is directional: a reversed flow does not match.
+            ("dst→src", conn_between(DST, SRC)),
+        ];
+        let cases: [(Option<&str>, Option<&str>, [bool; 5]); 4] = [
+            (None, None, [true, true, true, true, true]),
+            (Some(SRC), None, [true, true, false, false, false]),
+            (None, Some(DST), [true, false, true, false, false]),
+            (Some(SRC), Some(DST), [true, false, false, false, false]),
+        ];
+        for (src_ip, dst_ip, expected) in cases {
+            let mut policy = create_simple_policy(60, 3600);
+            policy.src_ip = src_ip.map(|ip| ip.parse().unwrap());
+            policy.dst_ip = dst_ip.map(|ip| ip.parse().unwrap());
+            let builder = WindowBuilder::try_new(&policy, 0).unwrap();
+            for ((name, event), expected) in events.iter().zip(expected) {
+                assert_eq!(
+                    builder.accepts(event),
+                    expected,
+                    "src_ip {src_ip:?}, dst_ip {dst_ip:?}, event {name}"
+                );
+            }
+        }
+    }
+
     // time-handling code against a stable baseline. They prefer integer Unix
     // timestamps and literal expected values over runtime-derived ones.
     // =========================================================================
@@ -1222,14 +1522,11 @@ mod tests {
             );
         }
 
-        #[serial]
-        #[tokio::test]
-        async fn fill_at_exact_period_boundary_does_not_reset() {
-            // The reset condition in `fill` uses `>` (strict), not `>=`. An
-            // event at exactly start + period must therefore land in the
-            // current series, not trigger a reset. Pin this so any rewrite
-            // preserves the inclusive lower / exclusive upper convention.
-            reset_ingest_channel().await;
+        #[test]
+        fn event_at_exact_period_end_opens_the_next_window() {
+            // Windows are [start, start + period). An event at exactly
+            // start + period belongs to the next window, so it writes the
+            // current one and opens the next.
             let policy = create_policy(
                 TEST_POLICY_ID,
                 SECS_PER_HOUR,
@@ -1237,35 +1534,20 @@ mod tests {
                 NO_OFFSET,
                 None,
             );
+            let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
             let start_ts = datetime_from_utc("2024/1/15 00:00:00");
-            let mut series = create_test_series(TEST_POLICY_ID.to_string().as_ref(), 4, start_ts);
-            let (sender, receiver) = async_channel::bounded::<TimeSeries>(4);
+            assert!(add_at(&mut builder, "2024/1/15 00:59:59").is_none());
+            assert_eq!(open(&builder).start_secs, start_ts);
+            assert_eq!(open(&builder).series, [0.0, 0.0, 0.0, 1.0]);
 
-            // time - start = 3600, which is NOT > 3600.
             let boundary = datetime_from_utc("2024/1/15 01:00:00");
-            series
-                .fill(&policy, boundary, &Event::Conn(create_test_conn()), &sender)
-                .await
-                .expect("fill should succeed at the exact boundary");
-
-            assert!(
-                receiver.try_recv().is_err(),
-                "no series should be sent at the exact period boundary",
-            );
-            assert_eq!(series.start_secs, start_ts);
-            assert_eq!(series.series[0], 1.0);
-
-            // One second past the boundary triggers send + reset (3601 > 3600).
-            let past = datetime_from_utc("2024/1/15 01:00:01");
-            series
-                .fill(&policy, past, &Event::Conn(create_test_conn()), &sender)
-                .await
-                .expect("fill should succeed");
-            let sent = receiver
-                .try_recv()
-                .expect("series should be sent past the boundary");
-            assert_eq!(sent.series[0], 1.0);
+            let sent = add_at(&mut builder, "2024/1/15 01:00:00")
+                .expect("the window is written at its exact end");
+            assert_eq!(sent.start_secs, start_ts);
+            assert_eq!(sent.series, [0.0, 0.0, 0.0, 1.0]);
+            assert_eq!(open(&builder).start_secs, boundary);
+            assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
         }
 
         #[test]

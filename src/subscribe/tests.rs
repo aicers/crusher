@@ -45,6 +45,9 @@ const SECS_PER_MINUTE: u64 = 60;
 const SECS_PER_DAY: u64 = 86_400;
 const DEFAULT_POLICY_ID: u32 = 1;
 const BASE_TS_NANOS: i64 = 1_700_000_000_000_000_000;
+const DAY_NANOS: i64 = 86_400_000_000_000;
+/// The start of the 1-day window of [`BASE_TS_NANOS`] for [`new_policy`].
+const BASE_WINDOW_START_NANOS: i64 = 1_699_920_000_000_000_000;
 // Functional waits allow for CI scheduling and disk latency. Tests of the
 // production shutdown deadline keep their own explicit timing assertions.
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -113,8 +116,12 @@ struct FakeGigantoServer {
     server_config: ServerConfig,
     server_address: SocketAddr,
     ingest_notify: Option<async_channel::Sender<u32>>,
+    series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
     peer_cert_notify: Option<async_channel::Sender<PeerCertEvent>>,
-    publish_repeat_count: usize,
+    publish_timestamps: Vec<i64>,
+    /// Keeps each default stream open after its events, as Giganto does,
+    /// instead of finishing it.
+    publish_hold_streams: bool,
     publish_repeat_delay: Duration,
     publish_behavior: PublishBehavior,
     ingest_behavior: IngestBehavior,
@@ -135,8 +142,10 @@ impl FakeGigantoServer {
             server_config,
             server_address,
             ingest_notify: None,
+            series_notify: None,
             peer_cert_notify: None,
-            publish_repeat_count: 0,
+            publish_timestamps: Vec::new(),
+            publish_hold_streams: false,
             publish_repeat_delay: Duration::from_millis(0),
             publish_behavior: PublishBehavior::Default,
             ingest_behavior: IngestBehavior::Default,
@@ -149,8 +158,10 @@ impl FakeGigantoServer {
             server_config,
             server_address,
             ingest_notify: None,
+            series_notify: None,
             peer_cert_notify: None,
-            publish_repeat_count: 0,
+            publish_timestamps: Vec::new(),
+            publish_hold_streams: false,
             publish_repeat_delay: Duration::from_millis(0),
             publish_behavior: PublishBehavior::Default,
             ingest_behavior: IngestBehavior::Default,
@@ -164,8 +175,10 @@ impl FakeGigantoServer {
             server_config,
             server_address,
             ingest_notify: None,
+            series_notify: None,
             peer_cert_notify: None,
-            publish_repeat_count: 3,
+            publish_timestamps: one_window_then_next(),
+            publish_hold_streams: false,
             publish_repeat_delay: Duration::from_millis(200),
             publish_behavior: PublishBehavior::Default,
             ingest_behavior: IngestBehavior::Default,
@@ -178,12 +191,29 @@ impl FakeGigantoServer {
             server_config,
             server_address,
             ingest_notify: None,
+            series_notify: None,
             peer_cert_notify: None,
-            publish_repeat_count: 3,
+            publish_timestamps: one_window_then_next(),
+            publish_hold_streams: false,
             publish_repeat_delay: Duration::from_millis(200),
             publish_behavior: PublishBehavior::Default,
             ingest_behavior: IngestBehavior::Default,
         }
+    }
+
+    fn with_publish_timestamps(mut self, timestamps: Vec<i64>) -> Self {
+        self.publish_timestamps = timestamps;
+        self
+    }
+
+    fn with_held_streams(mut self) -> Self {
+        self.publish_hold_streams = true;
+        self
+    }
+
+    fn with_series_notify(mut self, notify: async_channel::Sender<(i64, TimeSeries)>) -> Self {
+        self.series_notify = Some(notify);
+        self
     }
 
     fn with_notify(mut self, notify: async_channel::Sender<u32>) -> Self {
@@ -210,6 +240,7 @@ impl FakeGigantoServer {
         let endpoint = Endpoint::server(self.server_config, self.server_address).expect("endpoint");
         let local_addr = endpoint.local_addr().expect("local_addr");
         let ingest_notify = self.ingest_notify.clone();
+        let series_notify = self.series_notify.clone();
         let peer_cert_notify = self.peer_cert_notify.clone();
         let behavior = self.ingest_behavior;
         let handle = tokio::spawn(async move {
@@ -217,6 +248,7 @@ impl FakeGigantoServer {
                 tokio::select! {
                     Some(conn) = endpoint.accept() => {
                         let notify = ingest_notify.clone();
+                        let series_notify = series_notify.clone();
                         let peer_cert_notify = peer_cert_notify.clone();
                         let behavior = behavior.clone();
                         tokio::spawn(async move {
@@ -224,6 +256,7 @@ impl FakeGigantoServer {
                                 handle_ingest_connection(
                                     connection,
                                     notify,
+                                    series_notify,
                                     peer_cert_notify,
                                     behavior,
                                 )
@@ -244,8 +277,9 @@ impl FakeGigantoServer {
     fn start_publish(self, shutdown: Arc<Notify>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let endpoint = Endpoint::server(self.server_config, self.server_address).expect("endpoint");
         let local_addr = endpoint.local_addr().expect("local_addr");
-        let publish_repeat_count = self.publish_repeat_count;
+        let publish_timestamps: Arc<[i64]> = self.publish_timestamps.into();
         let publish_repeat_delay = self.publish_repeat_delay;
+        let hold_streams = self.publish_hold_streams;
         let peer_cert_notify = self.peer_cert_notify.clone();
         let behavior = self.publish_behavior;
         let handle = tokio::spawn(async move {
@@ -254,12 +288,14 @@ impl FakeGigantoServer {
                     Some(conn) = endpoint.accept() => {
                         let peer_cert_notify = peer_cert_notify.clone();
                         let behavior = behavior.clone();
+                        let publish_timestamps = publish_timestamps.clone();
                         tokio::spawn(async move {
                             if let Ok(connection) = conn.await {
                                 handle_publish_connection(
                                     connection,
-                                    publish_repeat_count,
+                                    &publish_timestamps,
                                     publish_repeat_delay,
+                                    hold_streams,
                                     peer_cert_notify,
                                     behavior,
                                 )
@@ -281,6 +317,7 @@ impl FakeGigantoServer {
 async fn handle_ingest_connection(
     connection: Connection,
     notify: Option<async_channel::Sender<u32>>,
+    series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
     peer_cert_notify: Option<async_channel::Sender<PeerCertEvent>>,
     behavior: IngestBehavior,
 ) {
@@ -298,17 +335,19 @@ async fn handle_ingest_connection(
 
     while let Ok((send, recv)) = connection.accept_bi().await {
         let notify = notify.clone();
+        let series_notify = series_notify.clone();
         let behavior = behavior.clone();
         tokio::spawn(async move {
-            handle_ingest_stream(send, recv, notify, behavior).await;
+            handle_ingest_stream(send, recv, notify, series_notify, behavior).await;
         });
     }
 }
 
 async fn handle_publish_connection(
     connection: Connection,
-    repeat_count: usize,
+    timestamps: &[i64],
     repeat_delay: Duration,
+    hold_streams: bool,
     peer_cert_notify: Option<async_channel::Sender<PeerCertEvent>>,
     behavior: PublishBehavior,
 ) {
@@ -326,20 +365,27 @@ async fn handle_publish_connection(
 
     match behavior {
         PublishBehavior::Default => {
-            handle_default_publish(&connection, &mut recv, repeat_count, repeat_delay).await;
+            handle_default_publish(
+                &connection,
+                &mut recv,
+                timestamps,
+                repeat_delay,
+                hold_streams,
+            )
+            .await;
         }
         PublishBehavior::ReverseOrder { expected } => {
             handle_reverse_order_publish(
                 &connection,
                 &mut recv,
                 expected,
-                repeat_count,
+                timestamps,
                 repeat_delay,
             )
             .await;
         }
         PublishBehavior::StaleIdFirst { stale_id } => {
-            handle_stale_id_publish(&connection, &mut recv, stale_id, repeat_count, repeat_delay)
+            handle_stale_id_publish(&connection, &mut recv, stale_id, timestamps, repeat_delay)
                 .await;
         }
         PublishBehavior::HoldUntilSignal {
@@ -353,7 +399,7 @@ async fn handle_publish_connection(
                 expected,
                 request_received,
                 release,
-                repeat_count,
+                timestamps,
                 repeat_delay,
             )
             .await;
@@ -368,26 +414,32 @@ async fn handle_publish_connection(
             }
         }
     }
+    // Dropping the connection would discard stream data still in flight, such
+    // as the event that closes a window. Close only once the client does.
+    connection.closed().await;
 }
 
 async fn open_and_emit_stream(
     connection: &Connection,
     policy_id_bytes: &[u8],
     record_bytes: &[u8],
-    repeat_count: usize,
+    timestamps: &[i64],
     repeat_delay: Duration,
+    hold_open: bool,
 ) {
     let Ok(mut uni) = connection.open_uni().await else {
         return;
     };
     let _ = send_raw(&mut uni, policy_id_bytes).await;
-    for idx in 0..repeat_count {
-        let ts = BASE_TS_NANOS + i64::try_from(idx).expect("test repeat count fits in i64");
+    for (idx, ts) in timestamps.iter().enumerate() {
         let _ = send_bytes(&mut uni, &ts.to_le_bytes()).await;
         let _ = send_raw(&mut uni, record_bytes).await;
-        if idx + 1 < repeat_count {
+        if idx + 1 < timestamps.len() {
             sleep(repeat_delay).await;
         }
+    }
+    if hold_open {
+        connection.closed().await;
     }
     let _ = uni.finish();
 }
@@ -395,8 +447,9 @@ async fn open_and_emit_stream(
 async fn handle_default_publish(
     connection: &Connection,
     recv: &mut RecvStream,
-    repeat_count: usize,
+    timestamps: &[i64],
     repeat_delay: Duration,
+    hold_streams: bool,
 ) {
     loop {
         let Ok(payload) = receive_stream_request(recv).await else {
@@ -412,8 +465,9 @@ async fn handle_default_publish(
             connection,
             policy_id.as_bytes(),
             &record_bytes,
-            repeat_count,
+            timestamps,
             repeat_delay,
+            hold_streams,
         )
         .await;
     }
@@ -423,7 +477,7 @@ async fn handle_reverse_order_publish(
     connection: &Connection,
     recv: &mut RecvStream,
     expected: usize,
-    repeat_count: usize,
+    timestamps: &[i64],
     repeat_delay: Duration,
 ) {
     let mut requests = Vec::with_capacity(expected);
@@ -441,8 +495,9 @@ async fn handle_reverse_order_publish(
             connection,
             policy_id.as_bytes(),
             &record_bytes,
-            repeat_count,
+            timestamps,
             repeat_delay,
+            false,
         )
         .await;
     }
@@ -452,7 +507,7 @@ async fn handle_stale_id_publish(
     connection: &Connection,
     recv: &mut RecvStream,
     stale_id: u32,
-    repeat_count: usize,
+    timestamps: &[i64],
     repeat_delay: Duration,
 ) {
     loop {
@@ -468,14 +523,23 @@ async fn handle_stale_id_publish(
         let stale = stale_id.to_string();
         // First open a uni stream announcing the stale id; the
         // dispatcher must drop it without breaking the connection.
-        open_and_emit_stream(connection, stale.as_bytes(), &record_bytes, 1, repeat_delay).await;
+        open_and_emit_stream(
+            connection,
+            stale.as_bytes(),
+            &record_bytes,
+            &timestamps[..1],
+            repeat_delay,
+            false,
+        )
+        .await;
         // Then the real stream — must be processed normally.
         open_and_emit_stream(
             connection,
             policy_id.as_bytes(),
             &record_bytes,
-            repeat_count,
+            timestamps,
             repeat_delay,
+            false,
         )
         .await;
     }
@@ -487,7 +551,7 @@ async fn handle_hold_until_signal_publish(
     expected: usize,
     request_received: Arc<Notify>,
     release: Arc<Notify>,
-    repeat_count: usize,
+    timestamps: &[i64],
     repeat_delay: Duration,
 ) {
     let mut requests = Vec::with_capacity(expected);
@@ -506,8 +570,9 @@ async fn handle_hold_until_signal_publish(
             connection,
             policy_id.as_bytes(),
             &record_bytes,
-            repeat_count,
+            timestamps,
             repeat_delay,
+            false,
         )
         .await;
     }
@@ -517,6 +582,7 @@ async fn handle_ingest_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     notify: Option<async_channel::Sender<u32>>,
+    series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
     behavior: IngestBehavior,
 ) {
     let mut header_buf = [0_u8; 4];
@@ -552,7 +618,12 @@ async fn handle_ingest_stream(
             .and_then(|(_, payload)| bincode::deserialize::<TimeSeries>(payload).ok())
             .and_then(|series| series.sampling_policy_id.parse::<u32>().ok())
             .unwrap_or(0);
-        for (timestamp, _) in batch {
+        for (timestamp, payload) in batch {
+            if let Some(series_notify) = &series_notify
+                && let Ok(series) = bincode::deserialize::<TimeSeries>(&payload)
+            {
+                let _ = series_notify.send((timestamp, series)).await;
+            }
             if send_bytes(&mut send, &timestamp.to_be_bytes())
                 .await
                 .is_err()
@@ -772,6 +843,17 @@ fn new_policy(id: u32) -> SamplingPolicy {
     }
 }
 
+/// Events of the window of [`BASE_TS_NANOS`], then one a period later for
+/// [`new_policy`], which closes that window so that it is written.
+fn one_window_then_next() -> Vec<i64> {
+    vec![
+        BASE_TS_NANOS,
+        BASE_TS_NANOS + 1,
+        BASE_TS_NANOS + 2,
+        BASE_TS_NANOS + DAY_NANOS,
+    ]
+}
+
 fn spawn_subscribe_client(
     certs: &Certs,
     actor_task: tokio::task::JoinHandle<Result<()>>,
@@ -780,8 +862,29 @@ fn spawn_subscribe_client(
     policy_handle: PolicyHandle,
     coordinator: CancellationCoordinator,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_subscribe_client_with_timer(
+        certs,
+        actor_task,
+        ingest_addr,
+        publish_addr,
+        policy_handle,
+        coordinator,
+        CloseTimer::default(),
+    )
+}
+
+fn spawn_subscribe_client_with_timer(
+    certs: &Certs,
+    actor_task: tokio::task::JoinHandle<Result<()>>,
+    ingest_addr: SocketAddr,
+    publish_addr: SocketAddr,
+    policy_handle: PolicyHandle,
+    coordinator: CancellationCoordinator,
+    close_timer: CloseTimer,
+) -> tokio::task::JoinHandle<()> {
     let client = Client::new(ingest_addr, publish_addr, HOST.to_string(), certs)
-        .expect("test client should build an endpoint");
+        .expect("test client should build an endpoint")
+        .with_close_timer(close_timer);
 
     tokio::spawn(async move {
         client
@@ -1224,7 +1327,9 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
 
     let map = harness.wait_for_timestamp(&[policy.id]).await;
     assert!(harness.last_time_series_path.exists());
-    let expected: HashMap<String, i64> = [(policy.id.to_string(), 0)].into_iter().collect();
+    let expected: HashMap<String, i64> = [(policy.id.to_string(), BASE_WINDOW_START_NANOS)]
+        .into_iter()
+        .collect();
     assert_eq!(map, expected);
 
     harness.cleanup().await;
@@ -1246,7 +1351,9 @@ async fn sampling_policy_notify_flow_with_delete() {
 
     let map = harness.wait_for_timestamp(&[policy.id]).await;
     assert!(harness.last_time_series_path.exists());
-    let expected: HashMap<String, i64> = [(policy.id.to_string(), 0)].into_iter().collect();
+    let expected: HashMap<String, i64> = [(policy.id.to_string(), BASE_WINDOW_START_NANOS)]
+        .into_iter()
+        .collect();
     assert_eq!(map, expected);
 
     harness
@@ -1299,10 +1406,12 @@ async fn sampling_policy_multiple_streams() {
         .wait_for_timestamp(&[policy_a.id, policy_b.id])
         .await;
     assert!(harness.last_time_series_path.exists());
-    let expected: HashMap<String, i64> =
-        [(policy_a.id.to_string(), 0), (policy_b.id.to_string(), 0)]
-            .into_iter()
-            .collect();
+    let expected: HashMap<String, i64> = [
+        (policy_a.id.to_string(), BASE_WINDOW_START_NANOS),
+        (policy_b.id.to_string(), BASE_WINDOW_START_NANOS),
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(map, expected);
 
     harness.cleanup().await;
@@ -1767,6 +1876,239 @@ async fn restart_state_consistency() {
     cleanup_test_resources(coordinator2, client_handle2, server_handles2).await;
 }
 
+/// Servers whose Publish side emits `publish_timestamps` on every stream and
+/// then keeps it open, as Giganto does, and whose Ingest side reports every
+/// written window with its timestamp.
+struct WindowServers {
+    series: async_channel::Receiver<(i64, TimeSeries)>,
+    handles: TestServerHandlers,
+    ingest_addr: SocketAddr,
+    publish_addr: SocketAddr,
+}
+
+fn start_window_servers(publish_timestamps: Vec<i64>) -> WindowServers {
+    let (series_send, series) = async_channel::unbounded();
+    let ingest_server = FakeGigantoServer::new_ingest().with_series_notify(series_send);
+    let publish_server = FakeGigantoServer::new_publish()
+        .with_publish_timestamps(publish_timestamps)
+        .with_held_streams();
+    let ingest_shutdown = Arc::new(Notify::new());
+    let publish_shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = ingest_server.start_ingest(ingest_shutdown.clone());
+    let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
+    WindowServers {
+        series,
+        handles: TestServerHandlers {
+            ingest_shutdown,
+            publish_shutdown,
+            ingest_handle,
+            publish_handle,
+        },
+        ingest_addr,
+        publish_addr,
+    }
+}
+
+async fn next_written_window(
+    series: &async_channel::Receiver<(i64, TimeSeries)>,
+) -> (i64, TimeSeries) {
+    timeout(TEST_TIMEOUT, series.recv())
+        .await
+        .expect("a window should be written before the test deadline")
+        .expect("the written-window channel should remain open")
+}
+
+/// A source that falls silent after the events of one window gets that window
+/// written by the timer, once the wall clock is past its end plus the grace and
+/// no event has been received for the idle gate.
+#[serial]
+#[tokio::test]
+async fn silent_source_window_is_written_by_the_timer() {
+    const IDLE: Duration = Duration::from_millis(1500);
+    let servers = start_window_servers(vec![BASE_TS_NANOS, BASE_TS_NANOS + 1, BASE_TS_NANOS + 2]);
+    let coordinator = CancellationCoordinator::new();
+    let (mut review, actor_task, path, _dir, policy_handle) =
+        setup_request_client(None, &coordinator).await;
+    let policy = new_policy(DEFAULT_POLICY_ID);
+    review
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+
+    // The injected wall clock is exactly at the window's end plus the grace.
+    let window_end_secs = (BASE_WINDOW_START_NANOS + DAY_NANOS) / 1_000_000_000;
+    let now = window_end_secs + time_series::CLOSE_GRACE_SECS;
+    let close_timer = CloseTimer::new(move || now, Duration::from_millis(50), IDLE);
+    let started = Instant::now();
+    let client_handle = spawn_subscribe_client_with_timer(
+        &cert_key(),
+        actor_task,
+        servers.ingest_addr,
+        servers.publish_addr,
+        policy_handle.clone(),
+        coordinator.clone(),
+        close_timer,
+    );
+
+    let (timestamp, series) = next_written_window(&servers.series).await;
+    // The server spaces the three events by its repeat delay, and the timer
+    // waits for the idle gate after the last of them.
+    assert!(
+        started.elapsed() >= IDLE + 2 * FakeGigantoServer::new_publish().publish_repeat_delay,
+        "written after {:?}, before the idle gate",
+        started.elapsed()
+    );
+    assert_eq!(timestamp, BASE_WINDOW_START_NANOS);
+    assert_eq!(series.sampling_policy_id, policy.id.to_string());
+    assert_eq!(series.series.iter().sum::<f64>(), 3.0);
+    let map = timeout(TEST_TIMEOUT, wait_for_policy_ids(&path, &[policy.id], true))
+        .await
+        .expect("the timer-closed window is acknowledged");
+    assert_eq!(map[&policy.id.to_string()], BASE_WINDOW_START_NANOS);
+
+    // The window is written once.
+    assert!(
+        timeout(IDLE * 2, servers.series.recv()).await.is_err(),
+        "a timer-closed window must not be written again without a new event"
+    );
+
+    drop(review);
+    drop(policy_handle);
+    cleanup_test_resources(coordinator, client_handle, servers.handles).await;
+}
+
+/// The window open at shutdown is not written. The next run resumes at the
+/// saved checkpoint, rewrites that window from the replay, writes the one that
+/// was open once a later event closes it, and never writes a zero row.
+#[serial]
+#[tokio::test]
+async fn restart_writes_the_window_open_at_shutdown_and_no_zero_row() {
+    let first_window = vec![BASE_TS_NANOS, BASE_TS_NANOS + 1, BASE_TS_NANOS + 2];
+    let open_window = BASE_TS_NANOS + DAY_NANOS;
+    let open_window_start = BASE_WINDOW_START_NANOS + DAY_NANOS;
+    let policy = new_policy(DEFAULT_POLICY_ID);
+    // Not past any window's end: only events close windows in this test.
+    let not_due = || {
+        CloseTimer::new(
+            || BASE_TS_NANOS / 1_000_000_000,
+            Duration::from_millis(50),
+            Duration::ZERO,
+        )
+    };
+
+    // --- First run: the first window is written, the next one stays open ---
+    let mut first_run = first_window.clone();
+    first_run.push(open_window);
+    let servers = start_window_servers(first_run);
+    let coordinator = CancellationCoordinator::new();
+    let (mut review, actor_task, path, dir, policy_handle) =
+        setup_request_client(None, &coordinator).await;
+    review
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+    let client_handle = spawn_subscribe_client_with_timer(
+        &cert_key(),
+        actor_task,
+        servers.ingest_addr,
+        servers.publish_addr,
+        policy_handle.clone(),
+        coordinator.clone(),
+        not_due(),
+    );
+    let (timestamp, series) = next_written_window(&servers.series).await;
+    assert_eq!(timestamp, BASE_WINDOW_START_NANOS);
+    assert_eq!(series.series.iter().sum::<f64>(), 3.0);
+    timeout(TEST_TIMEOUT, wait_for_policy_ids(&path, &[policy.id], true))
+        .await
+        .expect("the first window is acknowledged");
+    // Give the worker time to count the event of the open window.
+    sleep(Duration::from_millis(300)).await;
+    drop(review);
+    drop(policy_handle);
+    cleanup_test_resources(coordinator, client_handle, servers.handles).await;
+    assert!(
+        servers.series.try_recv().is_err(),
+        "the window open at shutdown must not be written"
+    );
+    assert_eq!(
+        read_time_data_map(&path)[&policy.id.to_string()],
+        BASE_WINDOW_START_NANOS
+    );
+
+    // --- Second run: resume from the saved checkpoint ---
+    let mut second_run = first_window;
+    second_run.extend([open_window, open_window + DAY_NANOS]);
+    let servers = start_window_servers(second_run);
+    let coordinator = CancellationCoordinator::new();
+    let (mut review, actor_task, _, _keep_dir, policy_handle) =
+        setup_request_client(Some(&path), &coordinator).await;
+    review
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_handle
+            .stream_policy(policy.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .start,
+        BASE_WINDOW_START_NANOS,
+        "the resume starts at the last written window"
+    );
+    let client_handle = spawn_subscribe_client_with_timer(
+        &cert_key(),
+        actor_task,
+        servers.ingest_addr,
+        servers.publish_addr,
+        policy_handle.clone(),
+        coordinator.clone(),
+        not_due(),
+    );
+    let written = [
+        next_written_window(&servers.series).await,
+        next_written_window(&servers.series).await,
+    ];
+    assert_eq!(
+        written[0].0, BASE_WINDOW_START_NANOS,
+        "rewritten from the replay"
+    );
+    assert_eq!(written[0].1.series.iter().sum::<f64>(), 3.0);
+    assert_eq!(
+        written[1].0, open_window_start,
+        "the window open at shutdown"
+    );
+    assert_eq!(written[1].1.series.iter().sum::<f64>(), 1.0);
+    let map = timeout(TEST_TIMEOUT, async {
+        loop {
+            let map = read_time_data_map(&path);
+            if map.get(&policy.id.to_string()) == Some(&open_window_start) {
+                return map;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the checkpoint advances to the window open at shutdown");
+    assert_eq!(map.len(), 1);
+
+    drop(review);
+    drop(policy_handle);
+    cleanup_test_resources(coordinator, client_handle, servers.handles).await;
+    for (timestamp, series) in written
+        .into_iter()
+        .chain(std::iter::from_fn(|| servers.series.try_recv().ok()))
+    {
+        assert_ne!(timestamp, 0, "no window is written at 1970-01-01");
+        assert!(
+            series.series.iter().any(|value| *value != 0.0),
+            "no all-zero window is written: {series:?}"
+        );
+    }
+    drop(dir);
+}
+
 /// Verifies that a policy queued in an ending `run()` generation cannot be
 /// consumed by the next generation after reload.
 #[serial]
@@ -2081,9 +2423,11 @@ async fn inbound_stream_dispatch_is_id_keyed() {
 
     let mut expected_ids = vec![policy_a.id, policy_b.id];
     for _ in 0..2 {
-        let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
+        // Each stream's window is written when its closing event arrives, and
+        // the server emits the reversed streams one after the other.
+        let id = timeout(TEST_TIMEOUT, ingest_ack_recv.recv())
             .await
-            .expect("ACK should arrive within 5s")
+            .expect("ACK should arrive before the test deadline")
             .expect("ACK channel should remain open");
         expected_ids.retain(|e| *e != id);
     }
@@ -2177,9 +2521,17 @@ async fn inbound_stream_arrival_after_delete_is_dropped() {
     // bind policy_b normally and drop policy_a (deleted) silently.
     release.notify_one();
 
-    // Drain any ACKs arriving within a short window — only policy_b
-    // should produce ACKs.
+    // Collect ACKs until policy_b's window is written, which happens only
+    // after the server has emitted both streams, then any that follow
+    // shortly. Only policy_b should produce ACKs.
     let mut received = Vec::new();
+    timeout(TEST_TIMEOUT, async {
+        while !received.contains(&policy_b.id) {
+            received.push(ingest_ack_recv.recv().await.expect("ACK channel open"));
+        }
+    })
+    .await
+    .expect("policy_b's window should be written");
     while let Ok(Ok(id)) = timeout(Duration::from_millis(800), ingest_ack_recv.recv()).await {
         received.push(id);
     }
@@ -2549,6 +2901,7 @@ mod policy_lifecycle {
                     handle,
                     Arc::new(Notify::new()),
                     coordinator,
+                    CloseTimer::default(),
                 )
                 .await
             });
@@ -2670,7 +3023,8 @@ mod policy_lifecycle {
             // No policy-change notification is emitted after disconnect.
             let (_, resumed) = probe.next().await;
             assert_eq!(resumed.id, "42");
-            assert_eq!(resumed.start, 86_400_000_000_123);
+            // The resume starts at the saved window itself, to write it again.
+            assert_eq!(resumed.start, 123);
             assert_eq!(resumed.src_ip, policy.src_ip);
             assert_eq!(resumed.dst_ip, policy.dst_ip);
             assert_eq!(resumed.sensor, policy.node);
@@ -2761,6 +3115,7 @@ mod policy_lifecycle {
                 state,
                 connection_token.clone(),
                 coordinator.clone(),
+                CloseTimer::default(),
             ));
             // Join this worker itself, not an assumed total number of unrelated tasks.
             // Neither policy nor connection cancellation can account for its exit.
@@ -2836,6 +3191,7 @@ mod policy_lifecycle {
                 control_handle,
                 Arc::new(Notify::new()),
                 control_coordinator,
+                CloseTimer::default(),
             )
             .await
         });

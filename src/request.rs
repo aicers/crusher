@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use review_protocol::{
     client::{Connection, ConnectionBuilder},
@@ -25,6 +25,44 @@ enum ConnectErrorDisposition {
     Retry,
     InvalidPeerCertificate,
     Other,
+}
+
+/// The Manager answered a configuration request without a configuration, as
+/// it does before this instance is configured (`… unregistered`). The main
+/// loop treats this as a normal wait.
+#[derive(Debug)]
+pub(crate) struct ConfigUnavailable(pub(crate) std::io::Error);
+
+impl std::fmt::Display for ConfigUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ConfigUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Separates the Manager's refusal to supply a configuration from a failed
+/// exchange.
+///
+/// review-protocol returns the Manager's own error message as an
+/// `ErrorKind::Other` error. A failed exchange usually has a specific kind, but
+/// quinn also reports some lost connections (a transport error, a locally
+/// closed connection) as `ErrorKind::Other`, so those are recognized by their
+/// source.
+fn classify_config_error(error: std::io::Error) -> anyhow::Error {
+    let connection_lost = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<quinn::ConnectionError>())
+        .is_some();
+    if error.kind() == ErrorKind::Other && !connection_lost {
+        anyhow::Error::new(ConfigUnavailable(error))
+    } else {
+        anyhow::Error::new(error).context("Failed to get the configuration from the Manager server")
+    }
 }
 
 /// Tells the main loop how `enter_idle_mode` returned so it can decide
@@ -243,13 +281,17 @@ impl Client {
         Ok((new_conn, guard.id))
     }
 
+    /// Fetches this instance's configuration from the Manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigUnavailable`] if the Manager answers without a
+    /// configuration, as it does before this instance is configured, or
+    /// another error if the Manager cannot be reached or the request fails.
     pub(crate) async fn get_config(&mut self) -> Result<String> {
         info!("Fetching a configuration");
-        self.connect()
-            .await?
-            .get_config()
-            .await
-            .context("Failed to get the configuration from the Manager server")
+        let connection = self.connect().await?;
+        connection.get_config().await.map_err(classify_config_error)
     }
 
     /// Enters the idle mode when a recoverable error occurs.
@@ -1080,6 +1122,28 @@ mod tests {
             "connection reset",
         ));
         assert_eq!(classify_connect_error(&err), ConnectErrorDisposition::Retry);
+    }
+
+    #[test]
+    fn classify_config_error_marks_only_the_managers_reason_as_a_wait() {
+        let refused = classify_config_error(std::io::Error::other("001.crusher unregistered"));
+        let reason = refused
+            .downcast_ref::<ConfigUnavailable>()
+            .expect("the Manager's reason is a wait");
+        assert_eq!(reason.to_string(), "001.crusher unregistered");
+
+        // quinn reports these lost connections as `ErrorKind::Other` too.
+        for lost in [
+            quinn::ConnectionError::LocallyClosed,
+            quinn::ConnectionError::CidsExhausted,
+        ] {
+            let error = classify_config_error(lost.into());
+            assert!(error.downcast_ref::<ConfigUnavailable>().is_none());
+            assert!(error.downcast_ref::<std::io::Error>().is_some());
+        }
+
+        let reset = classify_config_error(std::io::ErrorKind::ConnectionReset.into());
+        assert!(reset.downcast_ref::<ConfigUnavailable>().is_none());
     }
 
     // =========================================================================
