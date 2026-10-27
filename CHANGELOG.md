@@ -4,22 +4,45 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.0] - 2026-10-28
 
 ### Changed
 
-- **Breaking.** Requires REview X.Y.Z or later, which delivers each Crusher
+- **Breaking.** Requires REview 0.65.0 or later, which delivers each Crusher
   only the sampling policies assigned to it, as a complete list. Each list
   received from the Central Manager replaces the active policies: a policy
   absent from it stops producing, and an empty list stops every policy. A
   stopped policy keeps its saved position, so if it is assigned again it
-  resumes after its last completed window. A policy whose settings changed
+  resumes from its last written window. A policy whose settings changed
   under the same ID starts over from the beginning instead of resuming.
   Policies without a sensor are skipped with a warning.
 - Crusher requests its sampling policies from the Central Manager on every new
   connection, not only when it starts or reloads, so changes made while it was
   disconnected take effect when it reconnects. A failed request keeps the
   current policies and is retried.
+- While the Central Manager has no configuration for this instance, as before
+  the instance is configured (`… unregistered`), Crusher logs
+  `Waiting for a configuration from the Manager: <reason>` as a warning instead
+  of an error before it waits in idle mode.
+
+### Fixed
+
+- A new policy no longer writes an all-zero series dated 1970-01-01 as its
+  first window, and a restart or reconnect no longer writes an all-zero series
+  for a window without events. A window without events is never written;
+  instead, a restart or reconnect writes the last written window once more,
+  rebuilt from the events the Data Store holds.
+- The last window of a source that falls silent is written, at most about 15
+  minutes after the window's end, instead of only when an event of a later
+  window arrives.
+- An event in the first second of a window is counted in that window, not in
+  the first slot of the window before it.
+- An event that arrives after its window was written, such as one in a late
+  Sensor batch or one sent again after a reconnect, is counted in its own
+  window, which is written again, or dropped with a warning if it is older than
+  the last written window. It was counted in whichever window was open.
+- A policy's source and destination address filters apply to live events as
+  well, not only to the stored events replayed when its stream starts.
 
 ## [0.11.0] - 2026-10-26
 
@@ -342,7 +365,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
-[Unreleased]: https://github.com/aicers/crusher/compare/0.11.0...main
+[0.12.0]: https://github.com/aicers/crusher/compare/0.11.0...0.12.0
 [0.11.0]: https://github.com/aicers/crusher/compare/0.10.0...0.11.0
 [0.10.0]: https://github.com/aicers/crusher/compare/0.9.0...0.10.0
 [0.9.0]: https://github.com/aicers/crusher/compare/0.8.0...0.9.0

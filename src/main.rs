@@ -19,7 +19,7 @@ use cancellation::{CancellationCoordinator, CancellationPhase};
 use clap::{Parser, error::ErrorKind as ClapErrorKind};
 use client::{Certs, SharedTlsBytes, TlsBytes};
 use logging::init_tracing;
-use request::IdleExitReason;
+use request::{ConfigUnavailable, IdleExitReason};
 use settings::Settings;
 use subscribe::clear_ingest_channel;
 use tokio::sync::Notify;
@@ -107,6 +107,19 @@ impl fmt::Display for ShutdownFailure {
 impl std::error::Error for ShutdownFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
+    }
+}
+
+/// Logs an error that ends `run()` in remote mode, before idle mode.
+///
+/// The Manager's refusal to supply a configuration is a normal wait before
+/// this instance is configured, so it is logged at WARN; every other error is
+/// logged at ERROR.
+fn log_run_error(error: &anyhow::Error) {
+    if let Some(reason) = error.downcast_ref::<ConfigUnavailable>() {
+        warn!("Waiting for a configuration from the Manager: {reason}");
+    } else {
+        error!("Main processing encountered an error: {error:#}");
     }
 }
 
@@ -397,7 +410,7 @@ async fn run_main(args: CmdLineArgs) -> Result<()> {
                 if !args.is_remote_mode() || e.downcast_ref::<ShutdownFailure>().is_some() {
                     return Err(e);
                 }
-                error!("Main processing encountered an error: {e:#}");
+                log_run_error(&e);
                 let health_check = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
                     matches!(
                         e.kind(),
