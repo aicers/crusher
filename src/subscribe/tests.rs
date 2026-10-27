@@ -1779,6 +1779,110 @@ async fn shutdown_drain_writes_series_queued_in_the_ingest_control() {
     INGEST_CHANNEL.write().await.clear();
 }
 
+/// A window and its correction still in the ingest control at shutdown follow
+/// the original write on its sender's stream, and so does the next window.
+/// A second sender would carry them on their own stream, which Giganto could
+/// store first: the original would then replace its correction, and the next
+/// window's ACK would move the checkpoint past it, so no resume rebuilds it.
+#[serial]
+#[tokio::test]
+async fn shutdown_drain_keeps_corrections_behind_the_window_they_replace() {
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::DelayFirstStream(Duration::from_millis(500)))
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let timestamps_path = dir.path().join("timestamps.json");
+    let (policy_handle, actor_task) = spawn_policy_actor(timestamps_path.clone(), &coordinator)
+        .await
+        .unwrap();
+    policy_handle
+        .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .await
+        .unwrap();
+
+    let window_start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
+    let next_start_secs = (BASE_WINDOW_START_NANOS + DAY_NANOS) / 1_000_000_000;
+    let window = |start_secs, value| TimeSeries {
+        sampling_policy_id: DEFAULT_POLICY_ID.to_string(),
+        start_secs,
+        series: vec![value],
+    };
+    let (series_send, series_recv) = async_channel::unbounded();
+    series_send
+        .try_send(window(window_start_secs, 1.0))
+        .unwrap();
+    let control = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                Arc::new(Notify::new()),
+                coordinator,
+            )
+            .await
+            .expect("ingest control exits cleanly");
+            endpoint
+        }
+    });
+    wait_for_ingest_channel(&DEFAULT_POLICY_ID.to_string(), true)
+        .await
+        .expect("the original write starts the policy's sender");
+
+    // Let the sender observe the cancellation before the drain takes the
+    // correction and the next window.
+    coordinator.request_cancellation("shutdown ordering test");
+    sleep(Duration::from_millis(100)).await;
+    series_send
+        .try_send(window(window_start_secs, 2.0))
+        .unwrap();
+    series_send.try_send(window(next_start_secs, 3.0)).unwrap();
+    drop(series_send);
+
+    let mut writes = Vec::new();
+    for _ in 0..3 {
+        let (timestamp, series) = timeout(TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("all three writes are stored")
+            .unwrap();
+        writes.push((timestamp, series.series));
+    }
+    assert_eq!(
+        writes,
+        [
+            (BASE_WINDOW_START_NANOS, vec![1.0]),
+            (BASE_WINDOW_START_NANOS, vec![2.0]),
+            (BASE_WINDOW_START_NANOS + DAY_NANOS, vec![3.0]),
+        ],
+        "the correction is stored after the window it replaces"
+    );
+
+    let endpoint = control.await.expect("ingest control joins");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    assert_eq!(
+        read_time_data_map(&timestamps_path).get(&DEFAULT_POLICY_ID.to_string()),
+        Some(&(BASE_WINDOW_START_NANOS + DAY_NANOS)),
+        "the checkpoint is the last written window"
+    );
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
 /// A series accepted into an existing per-policy ingest queue before
 /// cancellation must still be transmitted before the sender exits.
 #[serial]
@@ -1848,6 +1952,8 @@ async fn cancellation_drains_queued_time_series() {
         .try_send(second)
         .expect("second series is queued before cancellation");
     coordinator.request_cancellation("queued-series drain test");
+    // The ingest control closes the queues once its own drain is done.
+    close_ingest_queues().await;
 
     sender_task
         .await

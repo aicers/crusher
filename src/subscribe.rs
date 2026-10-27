@@ -509,6 +509,10 @@ async fn ingest_connection_control(
 /// Producers observe the same cancellation as the ingest control and drop
 /// their senders. Keep receiving until the outer queue closes so a series
 /// already queued at the shutdown boundary is still handed to an ingest worker.
+///
+/// Ingest senders keep taking windows at shutdown until this drain closes
+/// their queues, so a correction still in the outer queue follows the window
+/// it replaces on that window's stream.
 async fn drain_series_at_shutdown(
     series_recv: &Receiver<TimeSeries>,
     coordinator: &CancellationCoordinator,
@@ -532,6 +536,7 @@ async fn drain_series_at_shutdown(
         )
         .await;
     }
+    close_ingest_queues().await;
 }
 
 /// Recovery decision for errors returned by [`process_network_stream`].
@@ -1021,6 +1026,14 @@ async fn register_ingest_queue(sampling_policy_id: &str) -> Receiver<TimeSeries>
     recv_channel
 }
 
+/// Closes every policy's ingest queue. Each sender writes what is queued and
+/// then finishes its stream.
+async fn close_ingest_queues() {
+    for sender in INGEST_CHANNEL.read().await.values() {
+        sender.close();
+    }
+}
+
 /// Clears all cached senders from the global ingest channel map.
 /// Should be called after top-level drain has completed to ensure no
 /// stale senders survive into a subsequent run.
@@ -1125,11 +1138,20 @@ async fn send_time_series(
             tokio::select! {
                 biased;
                 () = coordinator.cancelled() => {
-                    // Stop accepting new work, then transmit everything
-                    // that was already accepted into this policy's queue.
-                    recv_channel.close();
-                    while let Ok(series) = recv_channel.recv().await {
-                        send_time_series_record(&mut series_sender, &series).await?;
+                    // Keep taking windows until the ingest control's drain
+                    // closes this queue: a correction it still holds must
+                    // follow the window it replaces on this stream. A
+                    // replaced or closed connection ends the drain instead.
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = recv_channel.recv() => {
+                                let Ok(series) = result else { break };
+                                send_time_series_record(&mut series_sender, &series).await?;
+                            }
+                            () = connection_lifecycle.token.cancelled() => break,
+                            _ = connection.closed() => break,
+                        }
                     }
                     info!("send_time_series drained and shutting down");
                     break;
