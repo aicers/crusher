@@ -1,6 +1,9 @@
 mod checkpoint;
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result};
 use review_protocol::types::SamplingPolicy;
@@ -9,7 +12,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cancellation::CancellationCoordinator;
 
@@ -17,7 +20,7 @@ const POLICY_COMMAND_CHANNEL_SIZE: usize = 32;
 const SECOND_TO_NANO: i64 = 1_000_000_000;
 
 enum PolicyCommand {
-    AddPolicies {
+    ReplacePolicies {
         policies: Vec<SamplingPolicy>,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -41,6 +44,7 @@ struct PolicyEntry {
 }
 
 /// A consistent view of the policy, its cancellation signal and resume position.
+#[derive(Clone)]
 pub(crate) struct StreamPolicy {
     pub(crate) policy: SamplingPolicy,
     pub(crate) token: CancellationToken,
@@ -56,10 +60,15 @@ pub(crate) struct PolicyHandle {
 }
 
 impl PolicyHandle {
-    pub(crate) async fn add_policies(&self, policies: Vec<SamplingPolicy>) -> Result<(), String> {
+    /// Makes `policies` the complete active set. Success means any checkpoint
+    /// removed for changed content was persisted.
+    pub(crate) async fn replace_policies(
+        &self,
+        policies: Vec<SamplingPolicy>,
+    ) -> Result<(), String> {
         let (reply, received) = oneshot::channel();
         self.tx
-            .send(PolicyCommand::AddPolicies { policies, reply })
+            .send(PolicyCommand::ReplacePolicies { policies, reply })
             .await
             .map_err(|_| "policy actor closed".to_string())?;
         received
@@ -169,26 +178,23 @@ async fn run_actor(
     // every producer has released its handle, then drain and flush before exit.
     while let Some(command) = commands.recv().await {
         match command {
-            PolicyCommand::AddPolicies {
-                policies: added,
-                reply,
-            } => {
-                let mut changed = false;
-                for policy in added {
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        active.entry(policy.id)
-                    {
-                        entry.insert(PolicyEntry {
-                            policy,
-                            token: CancellationToken::new(),
-                        });
-                        changed = true;
-                    }
-                }
-                if changed {
+            PolicyCommand::ReplacePolicies { policies, reply } => {
+                let outcome = replace_policies(&mut active, &mut timestamps, policies);
+                if outcome.changed {
                     policy_ids.send_replace(active.keys().copied().collect());
                 }
-                let _ = reply.send(Ok(()));
+                let result = if outcome.checkpoint_removed {
+                    checkpoint::write_timestamp_file(&path, timestamps.clone()).await
+                } else {
+                    Ok(())
+                };
+                let _ = reply.send(
+                    result
+                        .as_ref()
+                        .copied()
+                        .map_err(|error| format!("{error:#}")),
+                );
+                result?;
             }
             PolicyCommand::DeletePolicies { ids, reply } => {
                 for id in ids {
@@ -236,6 +242,100 @@ async fn run_actor(
     checkpoint::write_timestamp_file(&path, timestamps).await?;
     info!("Policy actor flushed timestamps and shutting down");
     Ok(())
+}
+
+struct ReplaceOutcome {
+    changed: bool,
+    checkpoint_removed: bool,
+}
+
+/// Applies a complete policy list to the active set.
+///
+/// An absent ID is stopped but keeps its checkpoint: the Central Manager never
+/// gives a deleted policy's ID to another policy, so the entry is inert, and a
+/// policy that returns resumes after its last flushed window instead of
+/// rebuilding windows whose raw events may be gone. An ID whose content changed
+/// is restarted from the beginning, because the old checkpoint describes the
+/// old content's windows.
+fn replace_policies(
+    active: &mut HashMap<u32, PolicyEntry>,
+    timestamps: &mut HashMap<String, i64>,
+    policies: Vec<SamplingPolicy>,
+) -> ReplaceOutcome {
+    let mut received: HashMap<u32, SamplingPolicy> = HashMap::with_capacity(policies.len());
+    for policy in policies {
+        if policy.node.is_none() {
+            warn!("Skipping sampling policy {} without a sensor", policy.id);
+            continue;
+        }
+        match received.entry(policy.id) {
+            Entry::Vacant(entry) => {
+                entry.insert(policy);
+            }
+            Entry::Occupied(entry) => {
+                if !same_content(entry.get(), &policy) {
+                    warn!(
+                        "Ignoring a second, different sampling policy {} in one list",
+                        policy.id
+                    );
+                }
+            }
+        }
+    }
+
+    let mut outcome = ReplaceOutcome {
+        changed: false,
+        checkpoint_removed: false,
+    };
+    active.retain(|id, entry| {
+        if received.contains_key(id) {
+            return true;
+        }
+        info!("Stopping sampling policy {id}, which is no longer assigned");
+        entry.token.cancel();
+        outcome.changed = true;
+        false
+    });
+    for (id, policy) in received {
+        match active.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(PolicyEntry {
+                    policy,
+                    token: CancellationToken::new(),
+                });
+                outcome.changed = true;
+            }
+            Entry::Occupied(mut entry) => {
+                if same_content(&entry.get().policy, &policy) {
+                    continue;
+                }
+                warn!("Sampling policy {id} changed; restarting it without its checkpoint");
+                entry.get().token.cancel();
+                entry.insert(PolicyEntry {
+                    policy,
+                    token: CancellationToken::new(),
+                });
+                if timestamps.remove(&id.to_string()).is_some() {
+                    outcome.checkpoint_removed = true;
+                }
+                outcome.changed = true;
+            }
+        }
+    }
+    outcome
+}
+
+/// Compares every field that shapes a policy's series. `SamplingPolicy` has no
+/// `PartialEq`, and the comparison is Crusher's to define.
+fn same_content(a: &SamplingPolicy, b: &SamplingPolicy) -> bool {
+    a.kind == b.kind
+        && a.interval == b.interval
+        && a.period == b.period
+        && a.offset == b.offset
+        && a.column == b.column
+        && a.src_ip == b.src_ip
+        && a.dst_ip == b.dst_ip
+        && a.node == b.node
 }
 
 fn start_timestamp(policy: &SamplingPolicy, last: Option<i64>) -> Result<i64> {
@@ -330,25 +430,204 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_publishes_latest_policy_ids_without_a_relay() {
+    async fn replace_publishes_latest_policy_ids_without_a_relay() {
         run_test(async {
             let h = Harness::new("{}").await;
             let mut snapshot = h.handle.subscribe();
             assert!(snapshot.borrow().is_empty());
             h.handle
-                .add_policies(vec![policy(1), policy(2)])
+                .replace_policies(vec![policy(1), policy(2)])
                 .await
                 .unwrap();
             assert!(snapshot.has_changed().unwrap());
             let mut ids = snapshot.borrow_and_update().clone();
             ids.sort_unstable();
             assert_eq!(ids, [1, 2]);
-            let mut duplicate = policy(1);
-            duplicate.node = Some("different".into());
-            h.handle.add_policies(vec![duplicate]).await.unwrap();
+            h.handle
+                .replace_policies(vec![policy(2), policy(1)])
+                .await
+                .unwrap();
             assert!(!snapshot.has_changed().unwrap());
+            h.handle
+                .replace_policies(vec![policy(2), policy(3)])
+                .await
+                .unwrap();
+            assert!(snapshot.has_changed().unwrap());
+            let mut ids = snapshot.borrow_and_update().clone();
+            ids.sort_unstable();
+            assert_eq!(ids, [2, 3]);
+            h.finish().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn absent_policy_stops_but_keeps_checkpoint_and_resumes_when_it_returns() {
+        run_test(async {
+            let h = Harness::new(r#"{"42":100,"7":200}"#).await;
+            h.handle
+                .replace_policies(vec![policy(42), policy(7)])
+                .await
+                .unwrap();
+            let token = h.handle.get_policy_token(42).await.unwrap();
+            let kept = h.handle.get_policy_token(7).await.unwrap();
+            h.handle.replace_policies(vec![policy(7)]).await.unwrap();
+            assert!(token.is_cancelled());
+            assert!(!kept.is_cancelled());
+            assert!(h.handle.stream_policy(42).await.unwrap().is_none());
+            assert_eq!(h.handle.get_all_policy_ids(), [7]);
             assert_eq!(
-                h.handle.get_policy(1).await.unwrap().node.as_deref(),
+                h.saved(),
+                HashMap::from([("42".into(), 100), ("7".into(), 200)])
+            );
+            // An ACK of the stopped policy cannot move its kept checkpoint.
+            h.handle.record_ack(42, 999).await.unwrap();
+            h.handle
+                .replace_policies(vec![policy(42), policy(7)])
+                .await
+                .unwrap();
+            let state = h.handle.stream_policy(42).await.unwrap().unwrap();
+            assert_eq!(state.start, 3_600_000_000_100);
+            assert!(!state.token.is_cancelled());
+            assert!(!kept.is_cancelled());
+            h.finish().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn empty_list_stops_every_policy_and_keeps_every_checkpoint() {
+        run_test(async {
+            let h = Harness::new(r#"{"42":100,"7":200,"99":300}"#).await;
+            h.handle
+                .replace_policies(vec![policy(42), policy(7)])
+                .await
+                .unwrap();
+            let tokens = [
+                h.handle.get_policy_token(42).await.unwrap(),
+                h.handle.get_policy_token(7).await.unwrap(),
+            ];
+            let mut snapshot = h.handle.subscribe();
+            snapshot.borrow_and_update();
+            h.handle.replace_policies(Vec::new()).await.unwrap();
+            assert!(snapshot.has_changed().unwrap());
+            assert!(snapshot.borrow_and_update().is_empty());
+            assert!(tokens.iter().all(CancellationToken::is_cancelled));
+            assert_eq!(
+                h.saved(),
+                HashMap::from([("42".into(), 100), ("7".into(), 200), ("99".into(), 300)])
+            );
+            h.finish().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn changed_content_restarts_policy_without_its_checkpoint() {
+        type Change = (&'static str, fn(&mut SamplingPolicy));
+        let changes: [Change; 8] = [
+            ("kind", |p| p.kind = SamplingKind::Dns),
+            ("interval", |p| p.interval = Duration::from_secs(30)),
+            ("period", |p| p.period = Duration::from_hours(24)),
+            ("offset", |p| p.offset = 32_400),
+            ("column", |p| p.column = Some(3)),
+            ("src_ip", |p| p.src_ip = Some("10.0.0.1".parse().unwrap())),
+            ("dst_ip", |p| p.dst_ip = Some("10.0.0.2".parse().unwrap())),
+            ("node", |p| p.node = Some("other".into())),
+        ];
+        run_test(async {
+            for (field, change) in changes {
+                let h = Harness::new(r#"{"42":100,"7":200}"#).await;
+                h.handle
+                    .replace_policies(vec![policy(42), policy(7)])
+                    .await
+                    .unwrap();
+                let old = h.handle.get_policy_token(42).await.unwrap();
+                let kept = h.handle.get_policy_token(7).await.unwrap();
+                let mut snapshot = h.handle.subscribe();
+                snapshot.borrow_and_update();
+                let mut replacement = policy(42);
+                change(&mut replacement);
+                h.handle
+                    .replace_policies(vec![replacement, policy(7)])
+                    .await
+                    .unwrap();
+                assert!(old.is_cancelled(), "{field}: old worker stops");
+                assert!(!kept.is_cancelled(), "{field}: other policy runs on");
+                // The ID set is unchanged, but Publish must observe the update.
+                assert!(snapshot.has_changed().unwrap(), "{field}: publish notified");
+                assert_eq!(
+                    h.saved(),
+                    HashMap::from([("7".into(), 200)]),
+                    "{field}: checkpoint removed and persisted"
+                );
+                let state = h.handle.stream_policy(42).await.unwrap().unwrap();
+                assert_eq!(state.start, 0, "{field}: restarts from 0");
+                assert!(!state.token.is_cancelled(), "{field}: fresh token");
+                h.finish().await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn identical_content_changes_nothing() {
+        run_test(async {
+            let h = Harness::new(r#"{"42":100}"#).await;
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
+            let token = h.handle.get_policy_token(42).await.unwrap();
+            let mut snapshot = h.handle.subscribe();
+            snapshot.borrow_and_update();
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
+            assert!(!snapshot.has_changed().unwrap());
+            assert!(!token.is_cancelled());
+            assert_eq!(h.saved(), HashMap::from([("42".into(), 100)]));
+            assert_eq!(
+                h.handle.stream_policy(42).await.unwrap().unwrap().start,
+                3_600_000_000_100
+            );
+            h.finish().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn node_less_policy_is_skipped() {
+        run_test(async {
+            let h = Harness::new(r#"{"42":100}"#).await;
+            let mut node_less = policy(42);
+            node_less.node = None;
+            h.handle
+                .replace_policies(vec![node_less.clone(), policy(7)])
+                .await
+                .unwrap();
+            assert_eq!(h.handle.get_all_policy_ids(), [7]);
+            // A running policy that arrives without a node is absent from the
+            // list, so it stops and keeps its checkpoint.
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
+            let token = h.handle.get_policy_token(42).await.unwrap();
+            h.handle.replace_policies(vec![node_less]).await.unwrap();
+            assert!(token.is_cancelled());
+            assert_eq!(h.handle.get_all_policy_ids(), [] as [u32; 0]);
+            assert_eq!(h.saved(), HashMap::from([("42".into(), 100)]));
+            h.finish().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_id_in_one_list_keeps_the_first() {
+        run_test(async {
+            let h = Harness::new("{}").await;
+            let mut second = policy(42);
+            second.node = Some("second".into());
+            h.handle
+                .replace_policies(vec![policy(42), second])
+                .await
+                .unwrap();
+            assert_eq!(h.handle.get_all_policy_ids(), [42]);
+            assert_eq!(
+                h.handle.get_policy(42).await.unwrap().node.as_deref(),
                 Some("test")
             );
             h.finish().await;
@@ -363,7 +642,7 @@ mod tests {
             let mut snapshot = h.handle.subscribe();
             // Publish has not consumed any notification, as during a Giganto outage.
             h.handle
-                .add_policies((0..3).map(policy).collect())
+                .replace_policies((0..3).map(policy).collect())
                 .await
                 .unwrap();
             h.handle.delete_policies((0..2).collect()).await.unwrap();
@@ -382,7 +661,7 @@ mod tests {
     async fn deletion_before_any_worker_persists_before_success() {
         run_test(async {
             let h = Harness::new(r#"{"42":1700000000000000000,"99":123}"#).await;
-            h.handle.add_policies(vec![policy(42)]).await.unwrap();
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             let token = h.handle.get_policy_token(42).await.unwrap();
             h.handle.delete_policies(vec![42]).await.unwrap();
             assert!(token.is_cancelled());
@@ -409,7 +688,7 @@ mod tests {
         run_test(async {
             let h = Harness::new("{}").await;
             h.handle
-                .add_policies(vec![policy(42), policy(7)])
+                .replace_policies(vec![policy(42), policy(7)])
                 .await
                 .unwrap();
             h.handle.record_ack(42, 100).await.unwrap();
@@ -429,14 +708,14 @@ mod tests {
     async fn readd_after_completed_delete_starts_from_zero_and_accepts_new_ack() {
         run_test(async {
             let h = Harness::new(r#"{"42":123}"#).await;
-            h.handle.add_policies(vec![policy(42)]).await.unwrap();
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             let mut snapshot = h.handle.subscribe();
             assert_eq!(*snapshot.borrow_and_update(), [42]);
             let old = h.handle.get_policy_token(42).await.unwrap();
             h.handle.delete_policies(vec![42]).await.unwrap();
             let mut replacement = policy(42);
             replacement.node = Some("replacement".into());
-            h.handle.add_policies(vec![replacement]).await.unwrap();
+            h.handle.replace_policies(vec![replacement]).await.unwrap();
             // The final ID list is unchanged, but Publish must still observe the update
             // and use the actor's new policy and token after the completed deletion.
             assert!(snapshot.has_changed().unwrap());
@@ -463,7 +742,7 @@ mod tests {
             let h = Harness::new(r#"{"42":1700000000000000000}"#).await;
             assert_eq!(h.handle.get_all_policy_ids(), [] as [u32; 0]);
             assert!(h.handle.stream_policy(42).await.unwrap().is_none());
-            h.handle.add_policies(vec![policy(42)]).await.unwrap();
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             assert_eq!(
                 h.handle.stream_policy(42).await.unwrap().unwrap().start,
                 1_700_003_600_000_000_000
@@ -478,7 +757,7 @@ mod tests {
         run_test(async {
             let h = Harness::new(r#"{"42":100,"7":200}"#).await;
             h.handle
-                .add_policies(vec![policy(42), policy(7)])
+                .replace_policies(vec![policy(42), policy(7)])
                 .await
                 .unwrap();
             h.handle.delete_policies(vec![42]).await.unwrap();
@@ -488,7 +767,7 @@ mod tests {
                 .await
                 .unwrap();
             handle
-                .add_policies(vec![policy(42), policy(7)])
+                .replace_policies(vec![policy(42), policy(7)])
                 .await
                 .unwrap();
             assert_eq!(handle.stream_policy(42).await.unwrap().unwrap().start, 0);
@@ -507,7 +786,7 @@ mod tests {
         run_test(async {
             let h = Harness::new(r#"{"42":100}"#).await;
             h.handle
-                .add_policies(vec![policy(42), policy(7)])
+                .replace_policies(vec![policy(42), policy(7)])
                 .await
                 .unwrap();
             h.coordinator
@@ -530,7 +809,7 @@ mod tests {
     async fn cancelled_delete_caller_does_not_cancel_accepted_deletion() {
         run_test(async {
             let h = Harness::new(r#"{"42":100}"#).await;
-            h.handle.add_policies(vec![policy(42)]).await.unwrap();
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             let (reply, received) = oneshot::channel();
             h.handle
                 .tx
@@ -555,7 +834,7 @@ mod tests {
             let (reply, received) = oneshot::channel();
             h.handle
                 .tx
-                .send(PolicyCommand::AddPolicies {
+                .send(PolicyCommand::ReplacePolicies {
                     policies: vec![policy(42)],
                     reply,
                 })
@@ -572,14 +851,14 @@ mod tests {
     async fn delete_write_failure_is_returned_and_actor_fails() {
         run_test(async {
             let h = Harness::new(r#"{"42":100}"#).await;
-            h.handle.add_policies(vec![policy(42)]).await.unwrap();
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             // Replacing the target with a directory deterministically fails rename,
             // including when tests run with elevated filesystem permissions.
             std::fs::remove_file(&h.path).unwrap();
             std::fs::create_dir(&h.path).unwrap();
             assert!(h.handle.delete_policies(vec![42]).await.is_err());
             assert!(join_actor(h.task).await.is_err());
-            assert!(h.handle.add_policies(vec![policy(7)]).await.is_err());
+            assert!(h.handle.replace_policies(vec![policy(7)]).await.is_err());
             assert!(h.handle.delete_policies(vec![7]).await.is_err());
             assert!(h.handle.record_ack(7, 1).await.is_err());
             assert!(h.handle.stream_policy(7).await.is_err());
@@ -588,10 +867,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_content_write_failure_is_returned_and_actor_fails() {
+        run_test(async {
+            let h = Harness::new(r#"{"42":100}"#).await;
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
+            std::fs::remove_file(&h.path).unwrap();
+            std::fs::create_dir(&h.path).unwrap();
+            let mut changed = policy(42);
+            changed.interval = Duration::from_secs(30);
+            assert!(h.handle.replace_policies(vec![changed]).await.is_err());
+            assert!(join_actor(h.task).await.is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn ack_write_failure_is_reported_by_actor_task() {
         run_test(async {
             let h = Harness::new("{}").await;
-            h.handle.add_policies(vec![policy(42)]).await.unwrap();
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             std::fs::remove_file(&h.path).unwrap();
             std::fs::create_dir(&h.path).unwrap();
             h.handle.record_ack(42, 100).await.unwrap();
@@ -621,7 +915,7 @@ mod tests {
             let h = Harness::new("{}").await;
             let values = [0, 1, -1, 1_700_000_000_000_000_001, i64::MIN, i64::MAX];
             h.handle
-                .add_policies((0..6).map(policy).collect())
+                .replace_policies((0..6).map(policy).collect())
                 .await
                 .unwrap();
             for (id, value) in (0..6).zip(values) {

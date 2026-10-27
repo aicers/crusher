@@ -4,6 +4,23 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking.** Requires REview X.Y.Z or later, which delivers each Crusher
+  only the sampling policies assigned to it, as a complete list. Each list
+  received from the Central Manager replaces the active policies: a policy
+  absent from it stops producing, and an empty list stops every policy. A
+  stopped policy keeps its saved position, so if it is assigned again it
+  resumes after its last completed window. A policy whose settings changed
+  under the same ID starts over from the beginning instead of resuming.
+  Policies without a sensor are skipped with a warning.
+- Crusher requests its sampling policies from the Central Manager on every new
+  connection, not only when it starts or reloads, so changes made while it was
+  disconnected take effect when it reconnects. A failed request keeps the
+  current policies and is retried.
+
 ## [0.11.0] - 2026-10-26
 
 ### Changed
@@ -325,6 +342,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.11.0...main
 [0.11.0]: https://github.com/aicers/crusher/compare/0.10.0...0.11.0
 [0.10.0]: https://github.com/aicers/crusher/compare/0.9.0...0.10.0
 [0.9.0]: https://github.com/aicers/crusher/compare/0.8.0...0.9.0
