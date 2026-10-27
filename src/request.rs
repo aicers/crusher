@@ -71,7 +71,17 @@ fn classify_connect_error(error: &anyhow::Error) -> ConnectErrorDisposition {
 /// retained handle in `main` keeps the connection alive so the next
 /// reconnect attempt reuses it instead of tearing down the manager/
 /// control path.
-type SharedConnection = Arc<Mutex<Option<Connection>>>;
+type SharedConnection = Arc<Mutex<ConnectionSlot>>;
+
+/// The installed manager connection and the ID `connect()` gave it.
+///
+/// Each newly installed connection gets the next ID, so a caller can tell a
+/// reconnect from a reuse of the same connection.
+#[derive(Default)]
+struct ConnectionSlot {
+    connection: Option<Connection>,
+    id: u64,
+}
 
 #[derive(Clone)]
 pub(crate) struct Client {
@@ -94,7 +104,7 @@ impl Client {
         Client {
             server_address,
             server_name,
-            connection: Arc::new(Mutex::new(None)),
+            connection: Arc::new(Mutex::new(ConnectionSlot::default())),
             tls_bytes,
             config_reload,
             status: Status::Ready,
@@ -110,45 +120,52 @@ impl Client {
         run_until_cancelled(coordinator, self.handle_incoming()).await
     }
 
-    async fn sync_sampling_policies(&mut self) {
-        match self.connect().await {
-            Ok(connection) => match connection.get_sampling_policy_list().await {
-                Ok(policies) => {
-                    if policies.is_empty() {
-                        info!("No sampling policies to restore from Manager");
-                        return;
-                    }
-                    info!(
-                        "Restoring {} sampling policies from Manager",
-                        policies.len()
-                    );
-                    if let Err(e) = self.sampling_policy_list(&policies).await {
-                        warn!("Failed to register restored sampling policies: {e}");
-                    }
+    /// Pulls the complete policy list and applies it as a replacement.
+    ///
+    /// Returns whether the list was applied. On failure nothing changes, so
+    /// every policy and checkpoint is kept.
+    async fn sync_sampling_policies(&mut self, connection: &Connection) -> bool {
+        match connection.get_sampling_policy_list().await {
+            Ok(policies) => {
+                info!(
+                    "Applying {} sampling policies from the Manager",
+                    policies.len()
+                );
+                if let Err(e) = self.sampling_policy_list(&policies).await {
+                    warn!("Failed to apply sampling policies from the Manager: {e}");
+                    return false;
                 }
-                Err(e) => {
-                    warn!("Failed to retrieve sampling policy list: {e}");
-                }
-            },
+                true
+            }
             Err(e) => {
-                warn!("Failed to connect for sampling policy sync: {e}");
+                warn!("Failed to retrieve sampling policy list: {e}");
+                false
             }
         }
     }
 
     async fn handle_incoming(&mut self) -> Result<()> {
-        self.sync_sampling_policies().await;
+        // The connection whose policy list was last applied. A change made
+        // while Crusher was disconnected arrives only through a pull, so each
+        // new connection is pulled before its first push is accepted. A failed
+        // pull is retried before the next push on the same connection.
+        let mut synced = None;
         loop {
-            match self.connect().await {
-                Ok(connection) => match connection.accept_bi().await {
-                    Ok((mut send, mut recv)) => {
-                        review_protocol::request::handle(self, &mut send, &mut recv).await?;
+            match self.connect_with_id().await {
+                Ok((connection, id)) => {
+                    if synced != Some(id) && self.sync_sampling_policies(&connection).await {
+                        synced = Some(id);
                     }
-                    Err(e) => {
-                        warn!("Failed to accept bidirectional stream: {:?}, retrying", e);
-                        sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                    match connection.accept_bi().await {
+                        Ok((mut send, mut recv)) => {
+                            review_protocol::request::handle(self, &mut send, &mut recv).await?;
+                        }
+                        Err(e) => {
+                            warn!("Failed to accept bidirectional stream: {:?}, retrying", e);
+                            sleep(Duration::from_secs(SERVER_RETRY_INTERVAL)).await;
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     match classify_connect_error(&e) {
                         ConnectErrorDisposition::Retry => {
@@ -171,14 +188,21 @@ impl Client {
     }
 
     async fn connect(&self) -> Result<Connection> {
+        self.connect_with_id()
+            .await
+            .map(|(connection, _)| connection)
+    }
+
+    /// Returns the live connection, establishing one if needed, with its ID.
+    async fn connect_with_id(&self) -> Result<(Connection, u64)> {
         // Fast path: if a live connection is already installed, return a
         // clone without holding the mutex across an async boundary.
         {
             let guard = self.connection.lock().await;
-            if let Some(conn) = guard.as_ref()
+            if let Some(conn) = guard.connection.as_ref()
                 && conn.close_reason().is_none()
             {
-                return Ok(conn.clone());
+                return Ok((conn.clone(), guard.id));
             }
         }
 
@@ -205,17 +229,18 @@ impl Client {
         // Reacquire the lock and install the new connection only if
         // another caller has not already installed a live one.
         let mut guard = self.connection.lock().await;
-        if let Some(existing) = guard.as_ref()
+        if let Some(existing) = guard.connection.as_ref()
             && existing.close_reason().is_none()
         {
-            return Ok(existing.clone());
+            return Ok((existing.clone(), guard.id));
         }
-        *guard = Some(new_conn.clone());
+        guard.connection = Some(new_conn.clone());
+        guard.id += 1;
         info!(
             "Connection established to the manager server {}",
             self.server_address
         );
-        Ok(new_conn)
+        Ok((new_conn, guard.id))
     }
 
     pub(crate) async fn get_config(&mut self) -> Result<String> {
@@ -345,7 +370,7 @@ impl review_protocol::request::Handler for Client {
             .policy_handle
             .as_ref()
             .ok_or("policy actor not initialized")?;
-        handle.add_policies(policies.to_vec()).await
+        handle.replace_policies(policies.to_vec()).await
     }
 
     async fn delete_sampling_policy(&mut self, policy_ids: &[u32]) -> Result<(), String> {
@@ -378,6 +403,7 @@ impl review_protocol::request::Handler for IdleModeHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fs;
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
     use std::sync::{
@@ -414,7 +440,7 @@ mod tests {
         let client = Client {
             server_address: "127.0.0.1:8080".parse().unwrap(),
             server_name: "test".to_string(),
-            connection: Arc::new(Mutex::new(None)),
+            connection: Arc::new(Mutex::new(ConnectionSlot::default())),
             tls_bytes: SharedTlsBytes::new(TlsBytes::new(Vec::new(), Vec::new(), Vec::new())),
             config_reload,
             status: Status::Ready,
@@ -507,7 +533,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Policy Addition Tests: `sampling_policy_list()`
+    // Policy Replacement Tests: `sampling_policy_list()`
     // =========================================================================
 
     #[tokio::test(flavor = "current_thread")]
@@ -535,26 +561,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn add_policy_multiple_entries() {
-        // Test: Adding multiple policies, some duplicates
+    async fn policy_list_replaces_the_active_set() {
+        // Test: Each list is the complete set; an absent ID stops.
         let (mut client, _dir, policy_handle) = create_test_client().await;
         let policy1 = create_test_policy(1);
         let policy2 = create_test_policy(2);
 
-        // Add both policies
         let result = client
             .sampling_policy_list(&[policy1.clone(), policy2.clone()])
             .await;
         assert!(result.is_ok());
         assert_eq!(policy_handle.get_all_policy_ids().len(), 2);
+        let token2 = policy_handle.get_policy_token(2).await.unwrap();
 
-        // Try to add policy1 again as duplicate, and policy3 as new
+        // policy1 is kept, policy2 is absent, and policy3 is new.
         let policy3 = create_test_policy(3);
         let result = client.sampling_policy_list(&[policy1, policy3]).await;
         assert!(result.is_ok());
 
-        // Should have 3 policies now (policy1 was duplicate, policy3 is new)
-        assert_eq!(policy_handle.get_all_policy_ids().len(), 3);
+        let mut ids = policy_handle.get_all_policy_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 3]);
+        assert!(token2.is_cancelled());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -601,18 +629,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn add_policy_empty_list() {
-        // Test: Empty policy list should be handled correctly
+    async fn empty_policy_list_stops_every_policy() {
         let (mut client, _dir, policy_handle) = create_test_client().await;
 
+        let result = client.sampling_policy_list(&[]).await;
+        assert!(result.is_ok());
+        assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
+
+        client
+            .sampling_policy_list(&[create_test_policy(1), create_test_policy(2)])
+            .await
+            .expect("Success to add policies");
         let result = client.sampling_policy_list(&[]).await;
         assert!(result.is_ok());
         assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn add_policy_ignores_update_on_conflict() {
-        // Test: Duplicate ID should not update existing policy data
+    async fn changed_policy_content_replaces_the_stored_policy() {
         let (mut client, _dir, policy_handle) = create_test_client().await;
         let original_policy = create_test_policy(1);
 
@@ -620,20 +654,21 @@ mod tests {
             .sampling_policy_list(std::slice::from_ref(&original_policy))
             .await
             .expect("Success to add policy");
+        let old = policy_handle.get_policy_token(1).await.unwrap();
 
-        // Duplicate IDs leave the existing policy unchanged.
-        let mut conflicting_policy = create_test_policy(1);
-        conflicting_policy.interval = Duration::from_secs(30);
-        conflicting_policy.node = Some("updated_node".to_string());
+        let mut changed_policy = create_test_policy(1);
+        changed_policy.interval = Duration::from_secs(30);
+        changed_policy.node = Some("updated_node".to_string());
 
         client
-            .sampling_policy_list(&[conflicting_policy])
+            .sampling_policy_list(&[changed_policy])
             .await
             .expect("No error or failure");
 
+        assert!(old.is_cancelled());
         let stored = policy_handle.get_policy(1).await.unwrap();
-        assert_eq!(stored.interval, original_policy.interval);
-        assert_eq!(stored.node.as_deref(), original_policy.node.as_deref());
+        assert_eq!(stored.interval, Duration::from_secs(30));
+        assert_eq!(stored.node.as_deref(), Some("updated_node"));
     }
 
     // =========================================================================
@@ -1172,7 +1207,8 @@ log_path = "/tmp/crusher.log"
         );
         client.set_policy_handle(policy_handle.clone());
 
-        client.sync_sampling_policies().await;
+        let connection = client.connect().await.expect("connect to manager");
+        assert!(client.sync_sampling_policies(&connection).await);
 
         // Verify policies were restored into the active list
         let mut ids = policy_handle.get_all_policy_ids();
@@ -1232,6 +1268,268 @@ log_path = "/tmp/crusher.log"
         assert_eq!(format!("{err:#}"), crate::settings::LOG_PATH_REMOVED);
 
         server_task.abort();
+    }
+
+    // =========================================================================
+    // Reconnect pull tests
+    // =========================================================================
+
+    type PullResponses = Arc<std::sync::Mutex<VecDeque<Result<Vec<SamplingPolicy>, String>>>>;
+
+    /// Answers each policy pull with the next scripted response.
+    #[derive(Clone)]
+    struct ScriptedPullHandler {
+        responses: PullResponses,
+        pulls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl review_protocol::server::Handler for ScriptedPullHandler {
+        async fn get_sampling_policy_list(
+            &self,
+            _peer: &str,
+        ) -> Result<Vec<SamplingPolicy>, String> {
+            self.pulls.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .unwrap_or_else(|| Err("no scripted response".to_string()))
+        }
+    }
+
+    /// A fake Manager that serves scripted pulls on every connection and
+    /// keeps the latest one so a test can push to it or close it.
+    struct ScriptedManager {
+        addr: SocketAddr,
+        pulls: Arc<AtomicUsize>,
+        latest_conn: Arc<std::sync::Mutex<Option<quinn::Connection>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl ScriptedManager {
+        fn spawn(certs: &Certs, responses: Vec<Result<Vec<SamplingPolicy>, String>>) -> Self {
+            let server_endpoint = Endpoint::server(
+                create_test_server_config(certs),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+            )
+            .expect("create server endpoint");
+            let addr = server_endpoint.local_addr().expect("read server address");
+            let handler = ScriptedPullHandler {
+                responses: Arc::new(std::sync::Mutex::new(responses.into())),
+                pulls: Arc::new(AtomicUsize::new(0)),
+            };
+            let pulls = handler.pulls.clone();
+            let latest_conn: Arc<std::sync::Mutex<Option<quinn::Connection>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let latest_conn_for_task = latest_conn.clone();
+            let handle = tokio::spawn(async move {
+                while let Some(conn) = server_endpoint.accept().await {
+                    let mut handler = handler.clone();
+                    let latest_conn = latest_conn_for_task.clone();
+                    tokio::spawn(async move {
+                        let Ok(connection) = conn.await else {
+                            return;
+                        };
+                        let addr = connection.remote_address();
+                        if review_protocol::server::handshake(
+                            &connection,
+                            addr,
+                            ">=0",
+                            REQUIRED_MANAGER_VERSION,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                        *latest_conn.lock().expect("latest_conn lock") = Some(connection.clone());
+                        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                            review_protocol::server::handle(
+                                &mut handler,
+                                &mut send,
+                                &mut recv,
+                                "test",
+                            )
+                            .await
+                            .ok();
+                        }
+                    });
+                }
+            });
+            Self {
+                addr,
+                pulls,
+                latest_conn,
+                handle,
+            }
+        }
+
+        fn connection(&self) -> quinn::Connection {
+            self.latest_conn
+                .lock()
+                .expect("latest_conn lock")
+                .clone()
+                .expect("manager has a connection")
+        }
+
+        async fn push(&self, policies: &[SamplingPolicy]) {
+            review_protocol::server::Connection::from_quinn(self.connection())
+                .send_sampling_policies(policies)
+                .await
+                .expect("push sampling policies");
+        }
+    }
+
+    /// Polls `condition` until it holds, failing the test after a deadline
+    /// that covers one reconnect retry interval.
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Duration::from_secs(SERVER_RETRY_INTERVAL + 10);
+        tokio::time::timeout(deadline, async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
+
+    fn sorted_policy_ids(handle: &PolicyHandle) -> Vec<u32> {
+        let mut ids = handle.get_all_policy_ids();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn spawn_incoming_handler(
+        addr: SocketAddr,
+        dir: &tempfile::TempDir,
+        initial: &[SamplingPolicy],
+    ) -> (
+        PolicyHandle,
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (cert_pem, key_pem, ca_certs_pem, _) = load_test_certs();
+        let coordinator = CancellationCoordinator::new();
+        let (policy_handle, actor) =
+            crate::policy::spawn_policy_actor(dir.path().join("time_data.json"), &coordinator)
+                .await
+                .unwrap();
+        policy_handle
+            .replace_policies(initial.to_vec())
+            .await
+            .unwrap();
+        let mut client = Client::new(
+            addr,
+            "localhost".to_string(),
+            SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem)),
+            Arc::new(Notify::new()),
+        );
+        client.set_policy_handle(policy_handle.clone());
+        let incoming = tokio::spawn(async move { client.handle_incoming().await });
+        (policy_handle, incoming, actor)
+    }
+
+    async fn stop_incoming_handler(
+        policy_handle: PolicyHandle,
+        incoming: tokio::task::JoinHandle<Result<()>>,
+        actor: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        incoming.abort();
+        let _ = incoming.await;
+        drop(policy_handle);
+        actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_reconnect_pulls_the_policy_list_again() {
+        let (_, _, _, certs) = load_test_certs();
+        let manager = ScriptedManager::spawn(
+            &certs,
+            vec![
+                Ok(vec![create_test_policy(10), create_test_policy(20)]),
+                Ok(vec![create_test_policy(30)]),
+            ],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (policy_handle, incoming, actor) =
+            spawn_incoming_handler(manager.addr, &dir, &[create_test_policy(1)]).await;
+
+        wait_until("the first connection is pulled", || {
+            sorted_policy_ids(&policy_handle) == [10, 20]
+        })
+        .await;
+
+        // A push on the synced connection is applied without another pull.
+        manager
+            .push(&[create_test_policy(10), create_test_policy(40)])
+            .await;
+        assert_eq!(sorted_policy_ids(&policy_handle), [10, 40]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(manager.pulls.load(Ordering::SeqCst), 1);
+
+        // A change made while disconnected reaches Crusher through the pull
+        // on the next connection.
+        manager.connection().close(0u32.into(), b"manager restart");
+        wait_until("the new connection is pulled", || {
+            sorted_policy_ids(&policy_handle) == [30]
+        })
+        .await;
+        assert_eq!(manager.pulls.load(Ordering::SeqCst), 2);
+
+        stop_incoming_handler(policy_handle, incoming, actor).await;
+        manager.handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_pull_keeps_policies_and_is_retried_before_the_next_push() {
+        let (_, _, _, certs) = load_test_certs();
+        let manager = ScriptedManager::spawn(
+            &certs,
+            vec![
+                Err("temporarily unavailable".to_string()),
+                Ok(vec![create_test_policy(5)]),
+            ],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("time_data.json");
+        fs::write(&checkpoint, r#"{"1":100,"2":200}"#).unwrap();
+        let (policy_handle, incoming, actor) = spawn_incoming_handler(
+            manager.addr,
+            &dir,
+            &[create_test_policy(1), create_test_policy(2)],
+        )
+        .await;
+
+        wait_until("the first pull fails", || {
+            manager.pulls.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // The handler is now waiting for a push; the failed pull changed nothing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(sorted_policy_ids(&policy_handle), [1, 2]);
+        assert!(policy_handle.get_policy_token(1).await.is_some());
+        let saved: std::collections::HashMap<String, i64> =
+            serde_json::from_slice(&fs::read(&checkpoint).unwrap()).unwrap();
+        assert_eq!(
+            saved,
+            std::collections::HashMap::from([("1".into(), 100), ("2".into(), 200)])
+        );
+
+        // The failed pull does not block pushes, and the pull is retried
+        // before the next push is accepted on the same connection.
+        manager.push(&[create_test_policy(7)]).await;
+        wait_until("the pull is retried", || {
+            manager.pulls.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        wait_until("the retried pull is applied", || {
+            sorted_policy_ids(&policy_handle) == [5]
+        })
+        .await;
+
+        stop_incoming_handler(policy_handle, incoming, actor).await;
+        manager.handle.abort();
     }
 
     // =========================================================================

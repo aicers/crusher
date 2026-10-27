@@ -1539,7 +1539,7 @@ async fn cancellation_drains_queued_time_series() {
             .await
             .unwrap();
     policy_handle
-        .add_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
         .await
         .unwrap();
     let policy_id = DEFAULT_POLICY_ID.to_string();
@@ -2408,11 +2408,12 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
 
     // The existing subscribe::Client (still running with the last-known-good
     // endpoint) must keep processing new policies, proving that a failed
-    // reload does not tear down ingest/publish. Adding a fresh policy
-    // forces a new publish stream request that must yield an ACK.
+    // reload does not tear down ingest/publish. Adding a fresh policy to
+    // the complete list forces a new publish stream request that must
+    // yield an ACK.
     let extra_policy = new_policy(DEFAULT_POLICY_ID + 1);
     request_client
-        .sampling_policy_list(std::slice::from_ref(&extra_policy))
+        .sampling_policy_list(&[policy, extra_policy.clone()])
         .await
         .unwrap();
     let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
@@ -2633,7 +2634,7 @@ mod policy_lifecycle {
             // Restart loads the actual file saved by the preceding run.
             let next_coordinator = CancellationCoordinator::new();
             let (next, next_actor) = spawn_policy_actor(path, &next_coordinator).await.unwrap();
-            next.add_policies(vec![new_policy(42)]).await.unwrap();
+            next.replace_policies(vec![new_policy(42)]).await.unwrap();
             assert_eq!(next.stream_policy(42).await.unwrap().unwrap().start, 0);
             drop(next);
             join_test_task("restarted policy actor", next_actor)
