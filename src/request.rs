@@ -122,7 +122,7 @@ impl Client {
 
     /// Pulls the complete policy list and applies it as a replacement.
     ///
-    /// Returns whether the list was applied. On failure nothing changes, so
+    /// Returns whether the list was applied. A failed pull changes nothing, so
     /// every policy and checkpoint is kept.
     async fn sync_sampling_policies(&mut self, connection: &Connection) -> bool {
         match connection.get_sampling_policy_list().await {
