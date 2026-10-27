@@ -1716,6 +1716,69 @@ async fn ingest_control_queues_consecutive_writes_on_one_sender() {
     INGEST_CHANNEL.write().await.clear();
 }
 
+/// Windows still queued in the ingest control at shutdown are handed to an
+/// ingest sender: the first starts one, and the next is queued behind it.
+#[serial]
+#[tokio::test]
+async fn shutdown_drain_writes_series_queued_in_the_ingest_control() {
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let connection = ingest_connect(&endpoint, ingest_addr, HOST, REQUIRED_GIGANTO_VERSION)
+        .await
+        .expect("ingest connection");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+
+    let (series_send, series_recv) = async_channel::unbounded();
+    for value in [1.0, 2.0] {
+        series_send
+            .try_send(TimeSeries {
+                sampling_policy_id: DEFAULT_POLICY_ID.to_string(),
+                start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
+                series: vec![value],
+            })
+            .unwrap();
+    }
+    drop(series_send);
+    drain_series_at_shutdown(
+        &series_recv,
+        &coordinator,
+        &Arc::new(connection),
+        &ConnectionLifecycle::new(),
+        &policy_handle,
+        &Arc::new(Notify::new()),
+    )
+    .await;
+
+    let mut values = Vec::new();
+    for _ in 0..2 {
+        let (_, series) = timeout(TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("both queued series are stored")
+            .unwrap();
+        values.extend(series.series);
+    }
+    assert_eq!(values, [1.0, 2.0]);
+
+    coordinator.request_cancellation("shutdown drain test");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
 /// A series accepted into an existing per-policy ingest queue before
 /// cancellation must still be transmitted before the sender exits.
 #[serial]
