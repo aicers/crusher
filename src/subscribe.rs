@@ -419,22 +419,15 @@ async fn ingest_connection_control(
                     tokio::select! {
                         biased;
                         () = coordinator.cancelled() => {
-                            // Producers observe the same cancellation and
-                            // drop their senders. Keep receiving until the
-                            // outer queue closes so a series already queued
-                            // at the shutdown boundary is still handed to an
-                            // ingest worker.
-                            while let Ok(series) = series_recv.recv().await {
-                                spawn_time_series_sender(
-                                    &coordinator,
-                                    arc_conn.clone(),
-                                    series,
-                                    CancellationToken::new(),
-                                    connection_lifecycle.clone(),
-                                    policy_handle.clone(),
-                                    connection_notify.clone(),
-                                );
-                            }
+                            drain_series_at_shutdown(
+                                &series_recv,
+                                &coordinator,
+                                &arc_conn,
+                                &connection_lifecycle,
+                                &policy_handle,
+                                &connection_notify,
+                            )
+                            .await;
                             return Ok(());
                         }
                         () = connection_notify.notified() => {
@@ -453,6 +446,10 @@ async fn ingest_connection_control(
                             continue 'connection;
                         }
                         Ok(series) = series_recv.recv() => {
+                            // Queue behind the policy's live sender to keep its writes in order.
+                            let Err(series) = queue_to_ingest_sender(series).await else {
+                                continue;
+                            };
                             // Bind the freshly received series to the currently active policy id by
                             // looking up its `CancellationToken` in a single actor call. If the
                             // policy is no longer active by the time we dequeue the series, drop it
@@ -473,7 +470,8 @@ async fn ingest_connection_control(
                                 connection_lifecycle.clone(),
                                 policy_handle.clone(),
                                 connection_notify.clone(),
-                            );
+                            )
+                            .await;
                         }
                     }
                 }
@@ -505,6 +503,34 @@ async fn ingest_connection_control(
                 bail!("Fail to connect to {server_addr}: {e:?}");
             }
         }
+    }
+}
+
+/// Producers observe the same cancellation as the ingest control and drop
+/// their senders. Keep receiving until the outer queue closes so a series
+/// already queued at the shutdown boundary is still handed to an ingest worker.
+async fn drain_series_at_shutdown(
+    series_recv: &Receiver<TimeSeries>,
+    coordinator: &CancellationCoordinator,
+    connection: &Arc<Connection>,
+    connection_lifecycle: &ConnectionLifecycle,
+    policy_handle: &PolicyHandle,
+    connection_notify: &Arc<Notify>,
+) {
+    while let Ok(series) = series_recv.recv().await {
+        let Err(series) = queue_to_ingest_sender(series).await else {
+            continue;
+        };
+        spawn_time_series_sender(
+            coordinator,
+            connection.clone(),
+            series,
+            CancellationToken::new(),
+            connection_lifecycle.clone(),
+            policy_handle.clone(),
+            connection_notify.clone(),
+        )
+        .await;
     }
 }
 
@@ -949,10 +975,23 @@ async fn run_stream_worker(
     Ok(())
 }
 
-/// Hands a window to the policy's ingest sender, or to the ingest control
-/// when the policy has none, or its sender closed with a replaced ingest
-/// connection.
+/// Hands a window to the ingest control, which queues it to the policy's
+/// ingest sender. Windows never bypass the control: one written directly to a
+/// cached sender could overtake an earlier one still queued there.
 async fn write_window(send_channel: &Sender<TimeSeries>, series: TimeSeries) -> Result<()> {
+    send_channel.send(series).await?;
+    Ok(())
+}
+
+/// Queues `series` to its policy's ingest sender. Returns the series back when
+/// the policy has no sender, or its sender closed with a deleted policy, a
+/// replaced ingest connection or shutdown, so that the caller starts one.
+///
+/// The ingest control takes every window in the order its stream worker wrote
+/// it, and queues it here before it takes the next. A corrected window thus
+/// follows the write it replaces on the same QUIC stream; a second sender
+/// would carry it on another stream, which Giganto could store first.
+async fn queue_to_ingest_sender(series: TimeSeries) -> Result<(), TimeSeries> {
     // Clone the sender out of the lock to avoid holding the RwLock read
     // guard across an await point.
     let cached_sender = INGEST_CHANNEL
@@ -960,15 +999,26 @@ async fn write_window(send_channel: &Sender<TimeSeries>, series: TimeSeries) -> 
         .await
         .get(&series.sampling_policy_id)
         .cloned();
-    let series = match cached_sender {
-        Some(sender) => match sender.send(series).await {
-            Ok(()) => return Ok(()),
-            Err(async_channel::SendError(series)) => series,
-        },
-        None => series,
+    let Some(sender) = cached_sender else {
+        return Err(series);
     };
-    send_channel.send(series).await?;
-    Ok(())
+    sender
+        .send(series)
+        .await
+        .map_err(|async_channel::SendError(series)| series)
+}
+
+/// Installs a new queue as the ingest sender of `sampling_policy_id`,
+/// replacing a closed one. The ingest control installs it before it takes the
+/// next window, so that window finds it.
+async fn register_ingest_queue(sampling_policy_id: &str) -> Receiver<TimeSeries> {
+    let (send_channel, recv_channel) =
+        async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
+    INGEST_CHANNEL
+        .write()
+        .await
+        .insert(sampling_policy_id.to_owned(), send_channel);
+    recv_channel
 }
 
 /// Clears all cached senders from the global ingest channel map.
@@ -993,8 +1043,10 @@ async fn policy_token_for_series(
         .map(|(_, token)| token)
 }
 
+/// Starts the ingest sender of the policy `series` belongs to, with `series`
+/// as its first write. Its queue is installed before this returns.
 #[allow(clippy::too_many_arguments)]
-fn spawn_time_series_sender(
+async fn spawn_time_series_sender(
     coordinator: &CancellationCoordinator,
     connection: Arc<Connection>,
     series: TimeSeries,
@@ -1004,6 +1056,7 @@ fn spawn_time_series_sender(
     connection_notify: Arc<Notify>,
 ) {
     let sampling_policy_id = series.sampling_policy_id.clone();
+    let recv_channel = register_ingest_queue(&sampling_policy_id).await;
     let error_notify = connection_notify.clone();
     let task_coordinator = coordinator.clone();
     let connection_tasks = connection_lifecycle.tasks.clone();
@@ -1011,6 +1064,7 @@ fn spawn_time_series_sender(
         if let Err(e) = send_time_series(
             connection,
             series,
+            recv_channel,
             policy_token,
             connection_lifecycle,
             policy_handle,
@@ -1026,25 +1080,20 @@ fn spawn_time_series_sender(
     coordinator.tracker().spawn(tracked);
 }
 
+/// Writes `series` and then every window queued to `recv_channel`, the queue
+/// [`register_ingest_queue`] installed for the policy, on one QUIC stream.
+#[allow(clippy::too_many_arguments)]
 async fn send_time_series(
     connection: Arc<Connection>,
     series: TimeSeries,
+    recv_channel: Receiver<TimeSeries>,
     policy_token: CancellationToken,
     connection_lifecycle: ConnectionLifecycle,
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
-    // Store sender channel (Channel for receiving the next time_series after the first transmission)
     let sampling_policy_id = series.sampling_policy_id.clone();
-    let (send_channel, recv_channel) =
-        async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
-    // Keep a clone so we can identify our channel instance during cleanup.
-    let send_channel_token = send_channel.clone();
-    INGEST_CHANNEL
-        .write()
-        .await
-        .insert(sampling_policy_id.clone(), send_channel);
 
     let result = async {
         let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else {
@@ -1078,7 +1127,7 @@ async fn send_time_series(
                 () = coordinator.cancelled() => {
                     // Stop accepting new work, then transmit everything
                     // that was already accepted into this policy's queue.
-                    send_channel_token.close();
+                    recv_channel.close();
                     while let Ok(series) = recv_channel.recv().await {
                         send_time_series_record(&mut series_sender, &series).await?;
                     }
@@ -1117,10 +1166,10 @@ async fn send_time_series(
     .await;
 
     // Always clean up on both success and error paths.
-    // Close our token to mark our channel instance, then only remove
-    // the entry if it is still our channel (not a newer sender
-    // registered by a reconnect).
-    send_channel_token.close();
+    // Close our channel to mark its instance, then only remove the entry
+    // if it is still our channel (not a newer sender registered by a
+    // reconnect).
+    recv_channel.close();
     let mut map = INGEST_CHANNEL.write().await;
     if let Some(existing) = map.get(&sampling_policy_id)
         && existing.is_closed()

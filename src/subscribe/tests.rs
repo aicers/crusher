@@ -110,6 +110,9 @@ enum IngestBehavior {
         client_finished: Arc<Notify>,
         release: Arc<Notify>,
     },
+    /// Reads the first stream of each connection only after this delay, so
+    /// that a write on a later stream would be stored before it.
+    DelayFirstStream(Duration),
 }
 
 struct FakeGigantoServer {
@@ -333,11 +336,20 @@ async fn handle_ingest_connection(
         return;
     }
 
+    let mut first_stream = true;
     while let Ok((send, recv)) = connection.accept_bi().await {
         let notify = notify.clone();
         let series_notify = series_notify.clone();
-        let behavior = behavior.clone();
+        let (delay, behavior) = match &behavior {
+            IngestBehavior::DelayFirstStream(delay) => (
+                if first_stream { *delay } else { Duration::ZERO },
+                IngestBehavior::Default,
+            ),
+            behavior => (Duration::ZERO, behavior.clone()),
+        };
+        first_stream = false;
         tokio::spawn(async move {
+            sleep(delay).await;
             handle_ingest_stream(send, recv, notify, series_notify, behavior).await;
         });
     }
@@ -1625,6 +1637,85 @@ async fn stalled_ack_stream_recovers_and_actor_flushes_before_return() {
     INGEST_CHANNEL.write().await.clear();
 }
 
+/// Consecutive writes of one policy that both reach the ingest control before
+/// its sender is installed go out on that one sender, in order. A second
+/// sender would carry the correction on its own stream, and Giganto would
+/// store it before the slower original, which would then replace it.
+#[serial]
+#[tokio::test]
+async fn ingest_control_queues_consecutive_writes_on_one_sender() {
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::DelayFirstStream(Duration::from_millis(500)))
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+    policy_handle
+        .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .await
+        .unwrap();
+
+    // Both writes are queued before the ingest control runs.
+    let (series_send, series_recv) = async_channel::unbounded();
+    for value in [1.0, 2.0] {
+        series_send
+            .try_send(TimeSeries {
+                sampling_policy_id: DEFAULT_POLICY_ID.to_string(),
+                start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
+                series: vec![value],
+            })
+            .unwrap();
+    }
+    let control = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                Arc::new(Notify::new()),
+                coordinator,
+            )
+            .await
+            .expect("ingest control exits cleanly");
+            endpoint
+        }
+    });
+
+    let mut values = Vec::new();
+    for _ in 0..2 {
+        let (_, series) = timeout(TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("both writes are stored")
+            .unwrap();
+        values.extend(series.series);
+    }
+    assert_eq!(values, [1.0, 2.0], "the correction is stored last");
+
+    coordinator.request_cancellation("ordered ingest test");
+    drop(series_send);
+    let endpoint = control.await.expect("ingest control joins");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
 /// A series accepted into an existing per-policy ingest queue before
 /// cancellation must still be transmitted before the sender exits.
 #[serial]
@@ -1663,9 +1754,11 @@ async fn cancellation_drains_queued_time_series() {
         series: vec![2.0],
     };
 
+    let recv_channel = register_ingest_queue(&policy_id).await;
     let sender_task = coordinator.tracker().spawn(send_time_series(
         Arc::new(connection),
         first,
+        recv_channel,
         CancellationToken::new(),
         ConnectionLifecycle::new(),
         policy_handle,
@@ -1887,11 +1980,19 @@ struct WindowServers {
 }
 
 fn start_window_servers(publish_timestamps: Vec<i64>) -> WindowServers {
+    start_window_servers_with(
+        FakeGigantoServer::new_ingest(),
+        FakeGigantoServer::new_publish().with_publish_timestamps(publish_timestamps),
+    )
+}
+
+fn start_window_servers_with(
+    ingest_server: FakeGigantoServer,
+    publish_server: FakeGigantoServer,
+) -> WindowServers {
     let (series_send, series) = async_channel::unbounded();
-    let ingest_server = FakeGigantoServer::new_ingest().with_series_notify(series_send);
-    let publish_server = FakeGigantoServer::new_publish()
-        .with_publish_timestamps(publish_timestamps)
-        .with_held_streams();
+    let ingest_server = ingest_server.with_series_notify(series_send);
+    let publish_server = publish_server.with_held_streams();
     let ingest_shutdown = Arc::new(Notify::new());
     let publish_shutdown = Arc::new(Notify::new());
     let (ingest_addr, ingest_handle) = ingest_server.start_ingest(ingest_shutdown.clone());
@@ -1971,6 +2072,69 @@ async fn silent_source_window_is_written_by_the_timer() {
         timeout(IDLE * 2, servers.series.recv()).await.is_err(),
         "a timer-closed window must not be written again without a new event"
     );
+
+    drop(review);
+    drop(policy_handle);
+    cleanup_test_resources(coordinator, client_handle, servers.handles).await;
+}
+
+/// A window and its correction reach Giganto in the order they were written,
+/// so the corrected value is the one stored, even when the original write is
+/// slow to arrive. The correction follows the close at once: the late event is
+/// sent with no delay after the event that closes the window.
+#[serial]
+#[tokio::test]
+async fn window_correction_is_stored_after_the_window_it_replaces() {
+    let mut publish_server = FakeGigantoServer::new_publish().with_publish_timestamps(vec![
+        BASE_TS_NANOS,
+        BASE_TS_NANOS + DAY_NANOS,
+        BASE_TS_NANOS + 1,
+    ]);
+    publish_server.publish_repeat_delay = Duration::ZERO;
+    let servers = start_window_servers_with(
+        FakeGigantoServer::new_ingest()
+            .with_ingest_behavior(IngestBehavior::DelayFirstStream(Duration::from_millis(500))),
+        publish_server,
+    );
+    let coordinator = CancellationCoordinator::new();
+    let (mut review, actor_task, path, _dir, policy_handle) =
+        setup_request_client(None, &coordinator).await;
+    let policy = new_policy(DEFAULT_POLICY_ID);
+    review
+        .sampling_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+    // Not past any window's end: only events close windows in this test.
+    let not_due = CloseTimer::new(
+        || BASE_TS_NANOS / 1_000_000_000,
+        Duration::from_millis(50),
+        Duration::ZERO,
+    );
+    let client_handle = spawn_subscribe_client_with_timer(
+        &cert_key(),
+        actor_task,
+        servers.ingest_addr,
+        servers.publish_addr,
+        policy_handle.clone(),
+        coordinator.clone(),
+        not_due,
+    );
+
+    let written = [
+        next_written_window(&servers.series).await,
+        next_written_window(&servers.series).await,
+    ];
+    assert_eq!(written[0].0, BASE_WINDOW_START_NANOS);
+    assert_eq!(written[1].0, BASE_WINDOW_START_NANOS);
+    assert_eq!(
+        written.map(|(_, series)| series.series.iter().sum::<f64>()),
+        [1.0, 2.0],
+        "the correction is stored last"
+    );
+    let map = timeout(TEST_TIMEOUT, wait_for_policy_ids(&path, &[policy.id], true))
+        .await
+        .expect("the window is acknowledged");
+    assert_eq!(map[&policy.id.to_string()], BASE_WINDOW_START_NANOS);
 
     drop(review);
     drop(policy_handle);
