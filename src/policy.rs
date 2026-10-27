@@ -17,7 +17,6 @@ use tracing::{info, warn};
 use crate::cancellation::CancellationCoordinator;
 
 const POLICY_COMMAND_CHANNEL_SIZE: usize = 32;
-const SECOND_TO_NANO: i64 = 1_000_000_000;
 
 enum PolicyCommand {
     ReplacePolicies {
@@ -214,26 +213,16 @@ async fn run_actor(
                 result?;
             }
             PolicyCommand::GetPolicy { id, reply } => {
-                let state = active
-                    .get(&id)
-                    .map(|entry| {
-                        Ok(StreamPolicy {
-                            start: start_timestamp(
-                                &entry.policy,
-                                timestamps.get(&id.to_string()).copied(),
-                            )?,
-                            policy: entry.policy.clone(),
-                            token: entry.token.clone(),
-                        })
-                    })
-                    .transpose()
-                    .map_err(|error: anyhow::Error| error.to_string());
-                let _ = reply.send(state);
+                let state = active.get(&id).map(|entry| StreamPolicy {
+                    start: start_timestamp(timestamps.get(&id.to_string()).copied()),
+                    policy: entry.policy.clone(),
+                    token: entry.token.clone(),
+                });
+                let _ = reply.send(Ok(state));
             }
             PolicyCommand::RecordAck { id, timestamp } => {
                 // A late ACK cannot recreate the checkpoint of an inactive policy.
-                if active.contains_key(&id) {
-                    timestamps.insert(id.to_string(), timestamp);
+                if active.contains_key(&id) && record_ack(&mut timestamps, id, timestamp) {
                     checkpoint::write_timestamp_file(&path, timestamps.clone()).await?;
                 }
             }
@@ -253,7 +242,7 @@ struct ReplaceOutcome {
 ///
 /// An absent ID is stopped but keeps its checkpoint: the Central Manager never
 /// gives a deleted policy's ID to another policy, so the entry is inert, and a
-/// policy that returns resumes after its last flushed window instead of
+/// policy that returns resumes from its last written window instead of
 /// rebuilding windows whose raw events may be gone. An ID whose content changed
 /// is restarted from the beginning, because the old checkpoint describes the
 /// old content's windows.
@@ -338,14 +327,30 @@ fn same_content(a: &SamplingPolicy, b: &SamplingPolicy) -> bool {
         && a.node == b.node
 }
 
-fn start_timestamp(policy: &SamplingPolicy, last: Option<i64>) -> Result<i64> {
-    let Some(last) = last else {
-        return Ok(0);
-    };
-    let period = i64::try_from(policy.period.as_secs())?
-        .checked_mul(SECOND_TO_NANO)
-        .context("Failed to convert period to nanoseconds")?;
-    Ok(last.checked_add(period).unwrap_or(0))
+/// Returns where a policy's stream resumes: the start of its last written
+/// window, which the replay writes again, or 0 for a policy without one, which
+/// is built over every stored event.
+fn start_timestamp(last: Option<i64>) -> i64 {
+    last.unwrap_or(0)
+}
+
+/// Keeps the later of the saved and the acknowledged window start, and returns
+/// whether the checkpoint changed. A window corrected by a late event is
+/// acknowledged after a newer one, and must not move the checkpoint back.
+fn record_ack(timestamps: &mut HashMap<String, i64>, id: u32, timestamp: i64) -> bool {
+    match timestamps.entry(id.to_string()) {
+        Entry::Vacant(entry) => {
+            entry.insert(timestamp);
+            true
+        }
+        Entry::Occupied(mut entry) => {
+            if *entry.get() >= timestamp {
+                return false;
+            }
+            entry.insert(timestamp);
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -487,7 +492,7 @@ mod tests {
                 .await
                 .unwrap();
             let state = h.handle.stream_policy(42).await.unwrap().unwrap();
-            assert_eq!(state.start, 3_600_000_000_100);
+            assert_eq!(state.start, 100);
             assert!(!state.token.is_cancelled());
             assert!(!kept.is_cancelled());
             h.finish().await;
@@ -584,7 +589,7 @@ mod tests {
             assert_eq!(h.saved(), HashMap::from([("42".into(), 100)]));
             assert_eq!(
                 h.handle.stream_policy(42).await.unwrap().unwrap().start,
-                3_600_000_000_100
+                100
             );
             h.finish().await;
         })
@@ -728,7 +733,7 @@ mod tests {
             h.handle.record_ack(42, 456).await.unwrap();
             assert_eq!(
                 h.handle.stream_policy(42).await.unwrap().unwrap().start,
-                3_600_000_000_456
+                456
             );
             assert_eq!(h.saved()["42"], 456);
             h.finish().await;
@@ -745,7 +750,7 @@ mod tests {
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             assert_eq!(
                 h.handle.stream_policy(42).await.unwrap().unwrap().start,
-                1_700_003_600_000_000_000
+                1_700_000_000_000_000_000
             );
             h.finish().await;
         })
@@ -771,10 +776,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(handle.stream_policy(42).await.unwrap().unwrap().start, 0);
-            assert_eq!(
-                handle.stream_policy(7).await.unwrap().unwrap().start,
-                3_600_000_000_200
-            );
+            assert_eq!(handle.stream_policy(7).await.unwrap().unwrap().start, 200);
             drop(handle);
             join_actor(task).await.unwrap();
         })
@@ -895,18 +897,35 @@ mod tests {
     }
 
     #[test]
-    fn resume_timestamp_uses_exact_nanoseconds_and_preserves_overflow_behavior() {
-        let mut p = policy(42);
-        assert_eq!(start_timestamp(&p, None).unwrap(), 0);
-        assert_eq!(
-            start_timestamp(&p, Some(1_700_000_000_000_000_001)).unwrap(),
-            1_700_003_600_000_000_001
-        );
-        assert_eq!(start_timestamp(&p, Some(i64::MAX)).unwrap(), 0);
-        p.period = Duration::from_secs(u64::MAX);
-        assert!(start_timestamp(&p, Some(1)).is_err());
-        p.period = Duration::from_secs(10_000_000_000);
-        assert!(start_timestamp(&p, Some(1)).is_err());
+    fn resume_timestamp_is_the_checkpoint_itself() {
+        assert_eq!(start_timestamp(None), 0);
+        for checkpoint in [0, 1, -1, 1_700_000_000_000_000_001, i64::MIN, i64::MAX] {
+            assert_eq!(start_timestamp(Some(checkpoint)), checkpoint);
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_older_than_the_checkpoint_does_not_lower_it() {
+        run_test(async {
+            let h = Harness::new(r#"{"42":200}"#).await;
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
+            // A window corrected by a late event is acknowledged after a newer one.
+            h.handle.record_ack(42, 100).await.unwrap();
+            assert_eq!(
+                h.handle.stream_policy(42).await.unwrap().unwrap().start,
+                200
+            );
+            assert_eq!(h.saved()["42"], 200);
+            h.handle.record_ack(42, 200).await.unwrap();
+            h.handle.record_ack(42, 300).await.unwrap();
+            assert_eq!(
+                h.handle.stream_policy(42).await.unwrap().unwrap().start,
+                300
+            );
+            assert_eq!(h.saved()["42"], 300);
+            h.finish().await;
+        })
+        .await;
     }
 
     #[tokio::test]

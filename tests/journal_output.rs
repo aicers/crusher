@@ -211,3 +211,158 @@ fn help_is_printed_as_clap_prints_it() {
     assert!(output.stdout.starts_with("Usage: "), "{}", output.stdout);
     assert!(output.stderr.is_empty(), "stderr: {}", output.stderr);
 }
+
+/// The reason a fake Manager gives for not supplying a configuration, as the
+/// Manager does before the instance is configured.
+const UNREGISTERED: &str = "001.crusher unregistered";
+
+struct UnregisteredManager;
+
+#[async_trait::async_trait]
+impl review_protocol::server::Handler for UnregisteredManager {
+    async fn get_config(&self, _peer: &str) -> Result<String, String> {
+        Err(UNREGISTERED.to_string())
+    }
+}
+
+/// Returns the QUIC configuration of a Manager that authenticates with the
+/// test certificates and requires them of its client.
+fn manager_server_config() -> quinn::ServerConfig {
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let read = |name: &str| std::fs::read(tests.join(name)).expect("read test certificate");
+    let certs = rustls_pemfile::certs(&mut read("cert.pem").as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse certificate");
+    let key = rustls_pemfile::private_key(&mut read("key.pem").as_slice())
+        .expect("parse key")
+        .expect("key is present");
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in rustls_pemfile::certs(&mut read("ca_cert.pem").as_slice()) {
+        roots
+            .add(ca.expect("parse CA certificate"))
+            .expect("add CA");
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        std::sync::Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .expect("build client verifier");
+    let crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .expect("build server TLS configuration");
+    quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+            .expect("build QUIC server configuration"),
+    ))
+}
+
+/// Serves every connection with [`UnregisteredManager`].
+async fn serve_unregistered_manager(endpoint: quinn::Endpoint) {
+    while let Some(connecting) = endpoint.accept().await {
+        tokio::spawn(async move {
+            let Ok(connection) = connecting.await else {
+                return;
+            };
+            let address = connection.remote_address();
+            if review_protocol::server::handshake(&connection, address, ">=0", "0.49.0")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut handler = UnregisteredManager;
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                let _ = review_protocol::server::handle(&mut handler, &mut send, &mut recv, "test")
+                    .await;
+            }
+        });
+    }
+}
+
+/// A Crusher whose Manager has no configuration for it yet logs the wait at
+/// WARN with the Manager's reason, logs no error, and enters idle mode.
+#[test]
+fn unregistered_wait_under_journal_is_one_warning() {
+    let runtime = tokio::runtime::Runtime::new().expect("build runtime");
+    let endpoint = runtime.block_on(async {
+        quinn::Endpoint::server(
+            manager_server_config(),
+            "[::1]:0".parse().expect("valid address"),
+        )
+        .expect("bind the fake Manager")
+    });
+    let manager_addr = endpoint.local_addr().expect("fake Manager address");
+    runtime.spawn(serve_unregistered_manager(endpoint));
+
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let path = |name: &str| tests.join(name).to_str().expect("UTF-8 path").to_string();
+    let mut stdout_file = tempfile::tempfile().expect("create stdout file");
+    let metadata = stdout_file.metadata().expect("stat stdout file");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crusher"))
+        .args([
+            "--cert",
+            &path("cert.pem"),
+            "--key",
+            &path("key.pem"),
+            "--ca-certs",
+            &path("ca_cert.pem"),
+            &format!("localhost@{manager_addr}"),
+        ])
+        .env_remove("RUST_LOG")
+        .env(
+            "JOURNAL_STREAM",
+            format!("{}:{}", metadata.dev(), metadata.ino()),
+        )
+        .stdin(Stdio::null())
+        .stdout(stdout_file.try_clone().expect("clone stdout file"))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start crusher");
+
+    let read_stdout = |file: &mut std::fs::File| {
+        file.seek(SeekFrom::Start(0)).expect("rewind stdout file");
+        let mut stdout = String::new();
+        file.read_to_string(&mut stdout).expect("read stdout file");
+        stdout
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !read_stdout(&mut stdout_file).contains("Entering idle mode") {
+        if std::time::Instant::now() > deadline || child.try_wait().expect("poll crusher").is_some()
+        {
+            let _ = child.kill();
+            panic!(
+                "crusher did not enter idle mode:\n{}",
+                read_stdout(&mut stdout_file)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // SIGTERM ends idle mode with a graceful shutdown.
+    let pid = libc::pid_t::try_from(child.id()).expect("pid fits in pid_t");
+    // SAFETY: `kill` only signals the child process this test started.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let status = child.wait().expect("wait for crusher");
+    let stdout = read_stdout(&mut stdout_file);
+
+    assert!(status.success(), "{stdout}");
+    assert!(journal_error_lines(&stdout).is_empty(), "{stdout}");
+    let warnings: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("<4>"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{stdout}");
+    assert!(
+        warnings[0].ends_with(&format!(
+            "Waiting for a configuration from the Manager: {UNREGISTERED}"
+        )),
+        "{}",
+        warnings[0]
+    );
+    drop(runtime);
+}
