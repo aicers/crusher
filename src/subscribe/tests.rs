@@ -848,7 +848,7 @@ fn read_time_data_map(last_time_series_path: &Path) -> HashMap<String, i64> {
 fn config_server() -> ServerConfig {
     let certs = cert_key();
 
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let client_auth = WebPkiClientVerifier::builder_with_provider(
         Arc::new(certs.ca_certs.clone()),
         Arc::clone(&provider),
@@ -858,7 +858,7 @@ fn config_server() -> ServerConfig {
 
     let server_crypto = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .expect("ring supports the default protocol versions")
+        .expect("aws-lc-rs supports the default protocol versions")
         .with_client_cert_verifier(client_auth)
         .with_single_cert(certs.certs.clone(), certs.key.clone_key())
         .unwrap();
@@ -1085,7 +1085,7 @@ fn server_config_from_material(
     server_key_pem: &[u8],
     client_ca_pem: &[u8],
 ) -> ServerConfig {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let client_auth = WebPkiClientVerifier::builder_with_provider(
         Arc::new(Certs::to_ca_certs(&[client_ca_pem]).expect("parse client CA")),
         Arc::clone(&provider),
@@ -1095,7 +1095,7 @@ fn server_config_from_material(
 
     let server_crypto = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .expect("ring supports the default protocol versions")
+        .expect("aws-lc-rs supports the default protocol versions")
         .with_client_cert_verifier(client_auth)
         .with_single_cert(
             Certs::to_cert_chain(server_cert_pem).expect("parse server cert chain"),

@@ -154,7 +154,7 @@ pub(crate) fn config(certs: &Certs) -> Result<Endpoint> {
 /// material (including cert/key match-up) outside of an async runtime.
 pub(crate) fn client_config(certs: &Certs) -> Result<ClientConfig> {
     let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
+        rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()?
     .with_root_certificates(certs.ca_certs.clone())
@@ -426,7 +426,7 @@ mod tests {
         let server_key =
             Certs::to_private_key(server_bundle.key()).context("Failed to parse server key")?;
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let client_cert_verifier = WebPkiClientVerifier::builder_with_provider(
             Arc::new(server_ca_certs.clone()),
             Arc::clone(&provider),
