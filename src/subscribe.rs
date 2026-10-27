@@ -2,7 +2,7 @@
 mod tests;
 mod time_series;
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
@@ -472,11 +472,12 @@ async fn publish_connection_control(
         match connected {
             Ok((conn, mut send)) => {
                 let lifecycle = ConnectionLifecycle::new();
+                let requests = PublishRequests::default();
                 let dispatcher = lifecycle.tasks.track_future(run_inbound_dispatcher(
                     conn.clone(),
                     series_send.clone(),
                     connection_notify.clone(),
-                    policy_handle.clone(),
+                    requests.clone(),
                     lifecycle.clone(),
                     coordinator.clone(),
                 ));
@@ -494,7 +495,7 @@ async fn publish_connection_control(
                         connection_notify.notify_waiters();
                         Ok(StreamRecoveryAction::Reconnect)
                     }
-                    result = send_policy_requests(&mut send, &policy_handle) => result,
+                    result = send_policy_requests(&mut send, &policy_handle, &requests) => result,
                 };
                 // A cancelled write may have sent part of a frame. Always close
                 // and drain this connection before reusing the latest snapshot.
@@ -533,20 +534,70 @@ async fn publish_connection_control(
     }
 }
 
+/// A stream request sent on one Publish connection, and whether Giganto's
+/// inbound stream for it has arrived.
+struct PublishRequest {
+    state: StreamPolicy,
+    answered: bool,
+}
+
+/// The stream requests of one Publish connection, keyed by policy ID. Giganto
+/// names an inbound stream only by policy ID, so the dispatcher binds it to the
+/// request recorded here, not to the policy's current content.
+#[derive(Clone, Default)]
+struct PublishRequests(Arc<Mutex<HashMap<u32, PublishRequest>>>);
+
+impl PublishRequests {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, PublishRequest>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Takes the request an inbound stream for `id` answers. `None` means no
+    /// request is waiting for one, or its policy was deleted or replaced since.
+    fn answer(&self, id: u32) -> Option<StreamPolicy> {
+        let mut requests = self.lock();
+        let request = requests.get_mut(&id).filter(|request| !request.answered)?;
+        request.answered = true;
+        (!request.state.token.is_cancelled()).then(|| request.state.clone())
+    }
+}
+
 /// Watches current state rather than replaying queued add events. Each connection
 /// sends a policy once, including requests still waiting for an inbound stream.
+///
+/// A policy whose token was cancelled after its request went out (deleted,
+/// absent from a list, or replaced with new content) is requested again only
+/// once that request's inbound stream has arrived. Until then a stream for its
+/// ID could answer either request, so the connection is replaced instead.
 async fn send_policy_requests(
     send: &mut SendStream,
     policy_handle: &PolicyHandle,
+    requests: &PublishRequests,
 ) -> Result<StreamRecoveryAction> {
     let mut policy_ids = policy_handle.subscribe();
-    let mut requested: HashMap<u32, CancellationToken> = HashMap::new();
     loop {
         let snapshot = policy_ids.borrow_and_update().clone();
-        requested.retain(|_, token| !token.is_cancelled());
+        requests
+            .lock()
+            .retain(|_, request| !request.answered || !request.state.token.is_cancelled());
         for id in snapshot {
-            if requested.contains_key(&id) {
-                continue;
+            {
+                let mut requests = requests.lock();
+                if let Some(request) = requests.get(&id) {
+                    if !request.state.token.is_cancelled() {
+                        continue;
+                    }
+                    if !request.answered {
+                        info!(
+                            "Reconnecting Publish: policy {id} changed before the stream \
+                             for its earlier request arrived"
+                        );
+                        return Ok(StreamRecoveryAction::Reconnect);
+                    }
+                    requests.remove(&id);
+                }
             }
             // Recheck after consuming the snapshot: deletion may have happened
             // while another policy's request was being written.
@@ -556,12 +607,20 @@ async fn send_policy_requests(
             if state.token.is_cancelled() {
                 continue;
             }
+            // Record the request before writing it so that its stream cannot
+            // arrive before the dispatcher can bind it.
+            requests.lock().insert(
+                id,
+                PublishRequest {
+                    state: state.clone(),
+                    answered: false,
+                },
+            );
             tokio::select! {
                 biased;
                 () = state.token.cancelled() => return Ok(StreamRecoveryAction::Reconnect),
                 result = process_network_stream(send, &state) => result?,
             }
-            requested.insert(id, state.token);
         }
         policy_ids
             .changed()
@@ -624,15 +683,16 @@ async fn process_network_stream(send: &mut SendStream, state: &StreamPolicy) -> 
 /// Owns `accept_uni()` for a single publish connection and centralises
 /// inbound stream dispatch. For each accepted unidirectional stream
 /// it reads the stream-start message to determine the policy id, then
-/// looks up the live policy state from the policy actor and spawns a
-/// per-stream worker. Streams whose policy was already deleted are
-/// silently skipped — they are a normal consequence of a delete that
-/// raced with an in-flight stream open.
+/// binds the stream to the request it answers on this connection and
+/// spawns a per-stream worker with the policy state that request was
+/// sent with. Streams whose policy was deleted or replaced since the
+/// request are silently skipped — they are a normal consequence of a
+/// change that raced with an in-flight stream open.
 async fn run_inbound_dispatcher(
     conn: Connection,
     sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
-    policy_handle: PolicyHandle,
+    requests: PublishRequests,
     connection_lifecycle: ConnectionLifecycle,
     coordinator: CancellationCoordinator,
 ) {
@@ -665,16 +725,9 @@ async fn run_inbound_dispatcher(
             }
         };
 
-        let state = match policy_handle.stream_policy(id).await {
-            Ok(state) => state,
-            Err(error) => {
-                warn!("Failed to query policy {id}: {error:#}");
-                return;
-            }
-        };
-        let Some(state) = state else {
+        let Some(state) = requests.answer(id) else {
             info!(
-                "Inbound stream for unknown/deleted policy {id}; \
+                "Inbound stream for unknown, deleted or replaced policy {id}; \
                  dropping stream"
             );
             let _ = recv.stop(VarInt::default());

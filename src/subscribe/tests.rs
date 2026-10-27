@@ -1957,8 +1957,9 @@ async fn run_with_publish_behavior(
 }
 
 /// Deleting and then re-adding a policy on a live connection must create a
-/// fresh stream. The existing cancellation token lets the request loop remove
-/// the deleted policy from its set of already requested IDs.
+/// fresh stream. The deleted policy's stream has already arrived, so its
+/// cancelled request can be dropped and the ID requested again on the same
+/// connection.
 #[serial]
 #[tokio::test]
 async fn delete_then_readd_same_id_starts_fresh_stream() {
@@ -2191,6 +2192,84 @@ async fn inbound_stream_arrival_after_delete_is_dropped() {
         received.contains(&policy_b.id),
         "live policy {} must still produce ACKs after sibling delete; got {received:?}",
         policy_b.id,
+    );
+
+    drop(request_client);
+    drop(policy_handle);
+    cleanup_test_resources(coordinator, client_handle, server_handles).await;
+}
+
+/// Test: When a policy's content is replaced after its stream request went
+/// out but before Giganto opened the inbound stream, that stream belongs to
+/// the old content's request. The dispatcher must not bind it to the new
+/// content, and the new content must be requested on a fresh Publish
+/// connection, where its stream produces data.
+#[serial]
+#[tokio::test]
+async fn delayed_stream_of_replaced_policy_is_not_bound_to_new_content() {
+    let original = new_policy(DEFAULT_POLICY_ID);
+    let replacement = SamplingPolicy {
+        column: Some(5),
+        ..original.clone()
+    };
+    let request_received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (
+        coordinator,
+        mut request_client,
+        policy_handle,
+        client_handle,
+        server_handles,
+        ingest_ack_recv,
+        _,
+        _temp,
+    ) = run_with_publish_behavior(
+        std::slice::from_ref(&original),
+        PublishBehavior::HoldUntilSignal {
+            expected: 1,
+            request_received: request_received.clone(),
+            release: release.clone(),
+        },
+    )
+    .await;
+
+    // Giganto holds the original request; replace the content before it
+    // opens the inbound stream for that request.
+    timeout(TEST_TIMEOUT, request_received.notified())
+        .await
+        .expect("server should receive the original stream request");
+    request_client
+        .sampling_policy_list(std::slice::from_ref(&replacement))
+        .await
+        .unwrap();
+    release.notify_one();
+
+    // The delayed stream carries the original request's data. Bound to the
+    // replacement it would produce windows, and so ACKs, for the new content.
+    let early = timeout(Duration::from_millis(1500), ingest_ack_recv.recv()).await;
+    assert!(
+        early.is_err(),
+        "the original request's stream must not produce data for the replacement: {early:?}"
+    );
+
+    // The replacement is requested on a new connection and its own stream
+    // is processed normally.
+    timeout(TEST_TIMEOUT, request_received.notified())
+        .await
+        .expect("the replacement should be requested on a new Publish connection");
+    release.notify_one();
+    let id = timeout(TEST_TIMEOUT, ingest_ack_recv.recv())
+        .await
+        .expect("ACK for the replacement should arrive")
+        .expect("ACK channel should remain open");
+    assert_eq!(id, replacement.id);
+    assert_eq!(
+        policy_handle
+            .get_policy(replacement.id)
+            .await
+            .unwrap()
+            .column,
+        replacement.column
     );
 
     drop(request_client);

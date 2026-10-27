@@ -44,6 +44,7 @@ struct PolicyEntry {
 }
 
 /// A consistent view of the policy, its cancellation signal and resume position.
+#[derive(Clone)]
 pub(crate) struct StreamPolicy {
     pub(crate) policy: SamplingPolicy,
     pub(crate) token: CancellationToken,
