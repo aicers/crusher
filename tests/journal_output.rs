@@ -242,7 +242,7 @@ fn manager_server_config() -> quinn::ServerConfig {
             .add(ca.expect("parse CA certificate"))
             .expect("add CA");
     }
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         std::sync::Arc::new(roots),
         provider.clone(),
@@ -251,7 +251,7 @@ fn manager_server_config() -> quinn::ServerConfig {
     .expect("build client verifier");
     let crypto = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .expect("ring supports the default protocol versions")
+        .expect("aws-lc-rs supports the default protocol versions")
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
         .expect("build server TLS configuration");
