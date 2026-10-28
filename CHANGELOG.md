@@ -4,6 +4,15 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Crusher offers the hybrid post-quantum key exchange X25519MLKEM768 first on
+  its connections to the Central Manager and Giganto, so they negotiate it
+  instead of X25519. A Central Manager or Giganto that does not support it still
+  accepts the connection over X25519, without an extra round trip.
+
 ## [0.12.0] - 2026-10-28
 
 ### Changed
@@ -365,6 +374,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.12.0...main
 [0.12.0]: https://github.com/aicers/crusher/compare/0.11.0...0.12.0
 [0.11.0]: https://github.com/aicers/crusher/compare/0.10.0...0.11.0
 [0.10.0]: https://github.com/aicers/crusher/compare/0.9.0...0.10.0
