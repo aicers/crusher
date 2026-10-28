@@ -1045,23 +1045,20 @@ mod tests {
     async fn idle_mode_sets_status_to_idle() {
         // Test: Entering idle mode should set status to Idle
         let (mut client, _dir, _policy_handle) = create_test_client().await;
-        let config_reload = client.config_reload.clone();
         let tls_reload = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
 
         assert!(matches!(client.status, Status::Ready));
 
-        // Notify immediately to exit idle mode quickly
-        config_reload.notify_one();
-
+        // Notify from the connection attempt rather than beforehand, so the
+        // attempt runs whichever branch `select!` polls first
         let reason = tokio::time::timeout(
             Duration::from_millis(100),
-            client.enter_idle_mode_with_try_connect(
-                false,
-                tls_reload,
-                shutdown,
-                |_client, _| async { Err(anyhow::anyhow!("forced failure")) },
-            ),
+            client.enter_idle_mode_with_try_connect(false, tls_reload, shutdown, |client, _| {
+                assert!(matches!(client.status, Status::Idle));
+                client.config_reload.notify_one();
+                async { Err(anyhow::anyhow!("forced failure")) }
+            }),
         )
         .await
         .expect("No Timeout");
