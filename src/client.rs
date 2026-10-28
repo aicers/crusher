@@ -1159,6 +1159,18 @@ mod tests {
         assert!(local_addr.port() > 0, "Endpoint should be bound to a port");
     }
 
+    /// `client_config` and review-protocol's client build their TLS
+    /// configurations from this provider, so its first group is the key
+    /// exchange Crusher offers first to Giganto and the Central Manager.
+    #[test]
+    fn client_provider_prefers_x25519mlkem768() {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        assert_eq!(
+            provider.kx_groups[0].name(),
+            rustls::NamedGroup::X25519MLKEM768
+        );
+    }
+
     // =========================================================================
     // Handshake Tests
     // =========================================================================
