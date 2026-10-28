@@ -12,15 +12,22 @@ async-trait = "0.1"
 bincode = "1"
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", features = ["toml"], default-features = false }
-giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.28.0" }
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", rev = "7c0baab56f8226e9cd43e110e028c12330be3d6d" }
 num_enum = "0.7"
 num-traits = "0.2"
-quinn = { version = "0.11", features = ["ring"] }
+# Preserve Quinn's non-crypto defaults while selecting aws-lc-rs.
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "platform-verifier",
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+    "bloom",
+] }
 review-protocol = { git = "https://github.com/aicers/review-protocol.git", features = [
     "client",
 ], tag = "0.23.0" }
 rustls = { version = "0.23", default-features = false, features = [
-    "ring",
+    "aws_lc_rs",
     "std",
 ] }
 rustls-pemfile = "2"
@@ -35,7 +42,11 @@ tempfile = "3"
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"
-rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.14", default-features = false, features = [
+    "aws_lc_rs",
+    "pem",
+    "x509-parser",
+] }
 time = "0.3"
 rstest = "0.26"
 review-protocol = { git = "https://github.com/aicers/review-protocol.git", features = [
