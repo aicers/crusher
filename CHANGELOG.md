@@ -13,6 +13,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   instead of X25519. A Central Manager or Giganto that does not support it still
   accepts the connection over X25519, without an extra round trip.
 
+### Security
+
+- Updated `quinn-proto` to 0.11.19, fixing RUSTSEC-2026-0338,
+  RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341 and
+  RUSTSEC-2026-0342, and `webpki-root-certs` to 1.0.11, fixing
+  RUSTSEC-2026-0383.
+
 ## [0.12.0] - 2026-10-28
 
 ### Changed
