@@ -589,19 +589,16 @@ Where the crate handles key material or secrets:
   compiles every item since there is no `cfg(not(test))` code, and that
   integration test. Code under `cfg(not(unix))` in `src/logging.rs` and
   `src/main.rs` is built on neither CI platform.
-- Before committing, ensure those pass for the changed files.
-- Before pushing or opening a PR, run what the `test` job does:
-  `cargo build --verbose` and `cargo test --verbose`. CI runs it on both
-  `ubuntu-latest` and `macos-latest`. The tests open real QUIC connections
-  over the IPv6 loopback address, so they need `::1` to be available.
+- The `test` job runs `cargo build --verbose` and `cargo test --verbose`
+  on both `ubuntu-latest` and `macos-latest`.
 - `check` and `test` are skipped when the `changes` job reports a
-  docs-only change: one that touches `docs/**`, `**/*.md`, `mkdocs.yml` or
-  `.markdownlint*` and none of `src/**`, `Cargo.toml`, `Cargo.lock`,
-  `tests/**`, `.github/workflows/**` or `scripts/**`. If `changes` fails,
-  they run. `Markdown` and `coverage` always run.
-- The `coverage` job runs
-  `cargo llvm-cov --workspace --lcov --output-path lcov.info` and uploads
-  to Codecov. It is not expected to be run locally.
+  docs-only change: every changed path matches its `docs` filter
+  (`docs/**`, `**/*.md`, `mkdocs.yml`, `.markdownlint*`,
+  `.agent-instructions.toml`) and none matches its `code` filter
+  (`src/**`, `Cargo.toml`, `Cargo.lock`, `tests/**`,
+  `.github/workflows/**`, `scripts/**`, `.clippy.toml`). A path on neither
+  list counts as code. If `changes` fails, they run. `Markdown` and
+  `coverage` always run.
 - The `Docs` workflow (`.github/workflows/docs.yml`, job `Build Docs`)
   builds the manual under `docs/` on every pull request to `main`. It sets
   up Python 3.11, installs `mkdocs-material` and `mkdocs-static-i18n`,
@@ -623,3 +620,46 @@ Where the crate handles key material or secrets:
   `docs/theme.toml` names into `docs/.theme/`, which is ignored by git and
   never edited here. To adopt a new theme release, edit `version` in
   `docs/theme.toml`.
+- Run local checks on the host's own operating system: macOS on a Mac,
+  Linux on a Linux host. Do not use a container, a virtual machine or
+  another operating system in its place. A CI job or matrix entry that
+  exists only to cover another operating system or platform is left to CI;
+  every other row applies on any host that can run its commands.
+- A change is documentation-only when every changed path matches the
+  `docs` filter of the `changes` job in `.github/workflows/ci.yml` and
+  none matches its `code` filter. For such a change run only the `Markdown`
+  row, and the `Build Docs` row as well when the change touches `docs/` or
+  `mkdocs.yml`, and build or test no code.
+- For any other change, run every row of the table below that applies to
+  the host before pushing. Run each test command as written, in full: do
+  not narrow it to the changed files or to selected test names.
+
+| CI job | Local command |
+| --- | --- |
+| `check` | `cargo fmt -- --check --config group_imports=StdExternalCrate` |
+| `check` | `cargo clippy --tests -- -D warnings` |
+| `check` | `git diff-index --quiet HEAD --` |
+| `test` | `cargo build --verbose` |
+| `test` | `cargo test --verbose` |
+| `Markdown` | `markdownlint-cli2 "**/*.md"` |
+| `Build Docs` | the `sh` block above |
+
+- `check` and `Build Docs` run only on `ubuntu-latest` in CI, but they do
+  not exist to cover Linux: their rows apply on a Mac as well. `test`
+  applies on both, as CI runs it on both.
+- `git diff-index --quiet HEAD --` runs after the commit, on a clean
+  tree: it fails when the commands above it left a tracked file changed,
+  such as a `Cargo.lock` that `cargo clippy` updated. Commit that change
+  and rerun it.
+- The tests open real QUIC connections over the IPv6 loopback address, so
+  `test` needs `::1` to be available.
+- Left to CI: `coverage`, which runs
+  `cargo llvm-cov --workspace --lcov --output-path lcov.info` and uploads
+  the report to Codecov with the repository's token, and `changes`, which
+  classifies the run rather than checking the code. The shared
+  instruction-block drift check runs in `Markdown`; the generated regions
+  of this file are never edited here.
+- When a CI job fails, rerun that job's command locally; for a test job,
+  rerun the failing tests by name rather than the whole suite.
+- Before requesting review, ensure every CI job passes on the pushed
+  branch.
