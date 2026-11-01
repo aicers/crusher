@@ -24,6 +24,10 @@ jobs:
       docs_only: ${{ steps.derive.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v5
+      # `docs` lists the inert files, the shared-instructions pin among them:
+      # it changes no build or test, and the ungated drift step checks it.
+      # `all` matches every path, so `derive` can tell whether every
+      # changed path is docs.
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -33,6 +37,7 @@ jobs:
               - '**/*.md'
               - 'mkdocs.yml'
               - '.markdownlint*'
+              - '.agent-instructions.toml'
             code:
               - 'src/**'
               - 'Cargo.toml'
@@ -40,9 +45,22 @@ jobs:
               - 'tests/**'
               - ".github/workflows/**"
               - "scripts/**"
+              - ".clippy.toml"
+            all:
+              - '**'
+      # Docs-only requires every changed path to be on `docs` (the counts
+      # match) and none on `code`, so a `.md` under `src/` is code. A path on
+      # neither list counts as code: without the count check, a
+      # `.clippy.toml` edit next to a README edit skipped `check` and `test`.
+      # A failed filter leaves the outputs empty, which lands on false.
       - id: derive
+        env:
+          DOCS: ${{ steps.filter.outputs.docs }}
+          CODE: ${{ steps.filter.outputs.code }}
+          DOCS_COUNT: ${{ steps.filter.outputs.docs_count }}
+          ALL_COUNT: ${{ steps.filter.outputs.all_count }}
         run: |
-          if [[ "${{ steps.filter.outputs.docs }}" == "true" && "${{ steps.filter.outputs.code }}" != "true" ]]; then
+          if [[ "${DOCS}" == "true" && "${CODE}" != "true" && -n "${ALL_COUNT}" && "${DOCS_COUNT}" == "${ALL_COUNT}" ]]; then
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
           else
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
