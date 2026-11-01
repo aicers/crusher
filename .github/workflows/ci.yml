@@ -77,12 +77,49 @@ jobs:
   markdown:
     name: Markdown
     runs-on: ubuntu-latest
+    # Read-only, as in the other consumers of aicers/agent-instructions.
+    # Nothing here writes: the lint reads the checkout, and the drift check
+    # reads the pin and the upstream release.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
+        id: checkout
       - name: markdownlint
         uses: DavidAnson/markdownlint-cli2-action@v24
         with:
           globs: '**/*.md'
+
+      # Fails when this repository's copy of the shared instruction blocks
+      # stops matching the release `.agent-instructions.toml` pins --
+      # because a generated region of AGENTS.md was edited here, or because
+      # an update pull request was never merged.
+      #
+      # It belongs in THIS job and not in `check`, because it must not
+      # inherit the docs-only gate. `changes` counts `**/*.md` as docs and
+      # AGENTS.md is a `.md` file, so a pull request that edits only a
+      # generated region -- an update pull request included -- is docs-only
+      # by that reckoning, and a gated step would skip the check on
+      # precisely the changes that cause drift. `markdown` is ungated for
+      # the reason above it, and is already the job that concerns itself
+      # with this class of file.
+      #
+      # `@main`: the scripts are mechanism and come from wherever this
+      # reference points, while the blocks are content and come from the
+      # pin. No `with:` block, because the release to compare against and
+      # the blocks to compare are both read from that one file.
+      #
+      # Guarded rather than left to the default `success()`, which would
+      # skip it whenever the lint above failed. The checks are independent --
+      # a drifted block is drift whether or not some other Markdown file also
+      # breaks a lint rule. `!cancelled()` rather than `always()`, because a
+      # cancelled run should stop. The `checkout` clause keeps a failed
+      # checkout from being reported as drift: the action fails outright when
+      # it cannot read the pin file, and in an empty workspace that message
+      # names the pin for a problem that is not the pin's.
+      - name: Check shared instruction-block drift
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        uses: aicers/agent-instructions/check-drift@main
 
   test:
     needs: changes
