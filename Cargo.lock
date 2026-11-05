@@ -2010,8 +2010,8 @@ checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
 
 [[package]]
 name = "review-protocol"
-version = "0.23.0"
-source = "git+https://github.com/aicers/review-protocol.git?tag=0.23.0#aae234fefe7e8bebaf24c34e1159395263828bfc"
+version = "0.24.0"
+source = "git+https://github.com/aicers/review-protocol.git?tag=0.24.0#ec0572e7a1f2f4bdea6d14b33107d1541a154171"
 dependencies = [
  "anyhow",
  "async-trait",
