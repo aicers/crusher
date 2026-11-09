@@ -93,3 +93,6 @@ jobs:
           path: site/
           retention-days: ${{ steps.artifact.outputs.days }}
           if-no-files-found: error
+          # The theme is copied into a dot directory (.theme/), which the
+          # action leaves out by default.
+          include-hidden-files: true
