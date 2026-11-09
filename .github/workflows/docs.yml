@@ -4,16 +4,39 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
   pull_request:
     branches:
       - main
+  # Rebuilds one release's manual: a release older than the upload below,
+  # or one whose artifact has expired.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag (X.Y.Z) to rebuild; empty builds the selected ref
+        required: false
+        type: string
 
 jobs:
   build:
     name: Build Docs
     runs-on: ubuntu-latest
     steps:
+      - name: Check the tag input
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag must be a version such as 1.2.3, got '$TAG'"
+            exit 1
+          fi
+
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || '' }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -36,3 +59,40 @@ jobs:
 
       - name: Build
         run: mkdocs build --strict
+
+      # Keep the built site for the internal manual site, which downloads it
+      # with an Actions-only token and never clones this repository. The
+      # names are shared by every repository that publishes a manual:
+      # `docs-site-main` for the head of main, kept 1 day because the site
+      # copies it within minutes, and `docs-site-<X.Y.Z>` for a release, kept
+      # 90 days. Pull requests and other refs upload nothing.
+      - name: Name the site artifact
+        id: artifact
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ -n "$TAG" ]]; then
+            name="docs-site-$TAG" days=90
+          elif [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            name="docs-site-$GITHUB_REF_NAME" days=90
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            name=docs-site-main days=1
+          else
+            exit 0
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "days=$days" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the site
+        if: steps.artifact.outputs.name != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: site/
+          retention-days: ${{ steps.artifact.outputs.days }}
+          if-no-files-found: error
+          # The theme is copied into a dot directory (.theme/), which the
+          # action leaves out by default.
+          include-hidden-files: true
