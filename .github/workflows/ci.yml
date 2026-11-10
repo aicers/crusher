@@ -163,6 +163,13 @@ jobs:
         run: cargo test --verbose
 
   coverage:
+    needs: changes
+    # Fail closed. A bare `docs_only != 'true'` lets a *failing* `changes` job
+    # skip its dependants, and GitHub counts a skipped required check as a
+    # pass -- so a broken filter would wave an untested change through.
+    # `!cancelled()` runs the job whenever the filter did not positively
+    # report docs-only, a failed filter included.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Install Rust

@@ -592,14 +592,14 @@ Where the crate handles key material or secrets:
   `src/main.rs` is built on neither CI platform.
 - The `test` job runs `cargo build --verbose` and `cargo test --verbose`
   on both `ubuntu-latest` and `macos-latest`.
-- `check` and `test` are skipped when the `changes` job reports a
-  docs-only change: every changed path matches its `docs` filter
+- `check`, `test` and `coverage` are skipped when the `changes` job
+  reports a docs-only change: every changed path matches its `docs` filter
   (`docs/**`, `**/*.md`, `mkdocs.yml`, `.markdownlint*`,
   `.agent-instructions.toml`) and none matches its `code` filter
   (`src/**`, `Cargo.toml`, `Cargo.lock`, `tests/**`,
   `.github/workflows/**`, `scripts/**`, `.clippy.toml`). A path on neither
-  list counts as code. If `changes` fails, they run. `Markdown` and
-  `coverage` always run.
+  list counts as code. If `changes` fails, they run. `Markdown` always
+  runs.
 - The `Docs` workflow (`.github/workflows/docs.yml`, job `Build Docs`)
   builds the manual under `docs/` on every pull request to `main`. It sets
   up Python 3.11, installs `mkdocs-material` and `mkdocs-static-i18n`,
