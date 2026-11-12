@@ -14,57 +14,60 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && '-dispatch' || (github.run_attempt != '1' && format('-rerun-{0}', github.run_id) || '') }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   changes:
+    name: Change Filter
     runs-on: ubuntu-latest
+    # The filter only reads the checked-out history, so `contents: read` is
+    # all it needs.
+    permissions:
+      contents: read
     outputs:
-      docs_only: ${{ steps.derive.outputs.docs_only }}
+      docs_only: ${{ steps.scope.outputs.docs-only }}
     steps:
+      # The full history, because the action diffs locally and does not
+      # fetch: a pull request against its merge-base with the base branch,
+      # a push to `main` against `github.event.before`, and a dispatched
+      # branch against its merge-base with `main`.
       - uses: actions/checkout@v5
-      # `docs` lists the inert files, the shared-instructions pin among them:
-      # it changes no build or test, and the ungated drift step checks it.
-      # `all` matches every path, so `derive` can tell whether every
-      # changed path is docs.
-      - uses: dorny/paths-filter@v4
-        id: filter
         with:
-          filters: |
-            docs:
-              - 'docs/**'
-              - '**/*.md'
-              - 'mkdocs.yml'
-              - '.markdownlint*'
-              - '.agent-instructions.toml'
-            code:
-              - 'src/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'tests/**'
-              - ".github/workflows/**"
-              - "scripts/**"
-              - ".clippy.toml"
-            all:
-              - '**'
-      # Docs-only requires every changed path to be on `docs` (the counts
-      # match) and none on `code`, so a `.md` under `src/` is code. A path on
-      # neither list counts as code: without the count check, a
-      # `.clippy.toml` edit next to a README edit skipped `check` and `test`.
-      # A failed filter leaves the outputs empty, which lands on false.
-      - id: derive
-        env:
-          DOCS: ${{ steps.filter.outputs.docs }}
-          CODE: ${{ steps.filter.outputs.code }}
-          DOCS_COUNT: ${{ steps.filter.outputs.docs_count }}
-          ALL_COUNT: ${{ steps.filter.outputs.all_count }}
-        run: |
-          if [[ "${DOCS}" == "true" && "${CODE}" != "true" && -n "${ALL_COUNT}" && "${DOCS_COUNT}" == "${ALL_COUNT}" ]]; then
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          fi
+          fetch-depth: 0
+      # `docs-paths` lists the inert files, on top of the action's built-in
+      # list (`*.md`, `LICENSE`, `.agent-instructions.toml`,
+      # `.markdownlint*`), the shared-instructions pin among them: it
+      # changes no build or test, and the ungated drift step checks it.
+      # `not-docs-paths` names every path a build or a test reads, and wins
+      # over `docs-paths`, so a `.md` under `src/` is code.
+      #
+      # Docs-only requires every changed path to be on the documentation
+      # list and none on `not-docs-paths`. A path on neither list counts as
+      # code: a `.clippy.toml` edit next to a README edit runs `check` and
+      # `test`. Anything the action cannot establish also lands on
+      # docs-only=false.
+      - id: scope
+        uses: aicers/agent-instructions/change-scope@main
+        with:
+          docs-paths: |
+            docs/**
+            **/*.md
+            mkdocs.yml
+            .markdownlint*
+            .agent-instructions.toml
+          not-docs-paths: |
+            src/**
+            Cargo.toml
+            Cargo.lock
+            tests/**
+            .github/workflows/**
+            scripts/**
+            .clippy.toml
 
   check:
     needs: changes
@@ -103,10 +106,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         id: checkout
+      # No `globs` input. The `globs` and `ignores` of the root
+      # `.markdownlint-cli2.yaml` are the one place that decides which files
+      # are linted, here and in a local bare `markdownlint-cli2` alike. The
+      # action's default `*.{md,markdown}` is only added to them and changes
+      # nothing.
       - name: markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@v24
-        with:
-          globs: '**/*.md'
+        uses: DavidAnson/markdownlint-cli2-action@v25
 
       # Fails when this repository's copy of the shared instruction blocks
       # stops matching the release `.agent-instructions.toml` pins --
@@ -188,3 +194,45 @@ jobs:
         with:
           files: lcov.info
           fail_ci_if_error: true
+
+  # `always()`, deliberately, and not `!cancelled()`: a cancelled run would
+  # otherwise skip this job, and GitHub counts a skipped required check as a
+  # pass. Running through cancellation lets the assertions below see the
+  # cancelled results and report red. Required checks go on `CI Gate`, not
+  # on the individual jobs: a matrix job skipped at the job level is never
+  # expanded, so a docs-only run reports `test` rather than
+  # `test (ubuntu-latest)`. `markdown` is among the needs although it is
+  # not gated, so that the gate covers it too.
+  gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    permissions: {}
+    needs: [changes, markdown, check, test, coverage]
+    if: ${{ always() }}
+    steps:
+      # A filter that errored is a defect, not a tolerable outcome. The gated
+      # jobs did still run (their `if:` fails closed), but the breakage has to
+      # be visible rather than absorbed.
+      - name: Assert the change filter succeeded
+        if: ${{ needs.changes.result != 'success' }}
+        run: |
+          echo "Change Filter: ${{ needs.changes.result }}" >&2
+          exit 1
+
+      # `skipped` is a pass here, and only here: it is what a gated job
+      # reports on a docs-only change. `cancelled` is not.
+      - name: Assert every job passed or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "${RESULTS}"
+          bad="$(printf '%s' "${RESULTS}" \
+            | jq -r 'to_entries[]
+                     | select(.value.result != "success" and .value.result != "skipped")
+                     | "  \(.key): \(.value.result)"')"
+          if [ -n "${bad}" ]; then
+            echo "Not green:" >&2
+            echo "${bad}" >&2
+            exit 1
+          fi
