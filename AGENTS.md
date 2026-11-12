@@ -578,11 +578,12 @@ Where the crate handles key material or secrets:
 
   It then fails if those commands changed a tracked file, `Cargo.lock`
   included (`git diff-index --quiet HEAD --`).
-- The `Markdown` job runs markdownlint over `**/*.md` (in CI through
-  `DavidAnson/markdownlint-cli2-action@v24`, locally
-  `markdownlint-cli2 "**/*.md"`), and then the shared instruction-block
-  drift check, which fails when the generated regions of this file stop
-  matching the release `.agent-instructions.toml` pins.
+- The `Markdown` job runs markdownlint over the files the `globs` and
+  `ignores` of the root `.markdownlint-cli2.yaml` select (in CI through
+  `DavidAnson/markdownlint-cli2-action@v25`, locally a bare
+  `markdownlint-cli2`), and then the shared instruction-block drift check,
+  which fails when the generated regions of this file stop matching the
+  release `.agent-instructions.toml` pins.
 - The crate is one binary with no library target, no Cargo features, no
   `benches/` or `examples/`, and one integration test,
   `tests/journal_output.rs`, which runs the built binary and is compiled
@@ -593,13 +594,17 @@ Where the crate handles key material or secrets:
 - The `test` job runs `cargo build --verbose` and `cargo test --verbose`
   on both `ubuntu-latest` and `macos-latest`.
 - `check`, `test` and `coverage` are skipped when the `changes` job
-  reports a docs-only change: every changed path matches its `docs` filter
-  (`docs/**`, `**/*.md`, `mkdocs.yml`, `.markdownlint*`,
-  `.agent-instructions.toml`) and none matches its `code` filter
+  (`Change Filter`) reports a docs-only change: it calls
+  `aicers/agent-instructions/change-scope`, and every changed path is on
+  that action's built-in list (`*.md`, `LICENSE`,
+  `.agent-instructions.toml`, `.markdownlint*`) or on its `docs-paths`
+  input (`docs/**`, `**/*.md`, `mkdocs.yml`, `.markdownlint*`,
+  `.agent-instructions.toml`), and none is on its `not-docs-paths` input
   (`src/**`, `Cargo.toml`, `Cargo.lock`, `tests/**`,
   `.github/workflows/**`, `scripts/**`, `.clippy.toml`). A path on neither
   list counts as code. If `changes` fails, they run. `Markdown` always
-  runs.
+  runs. `CI Gate` passes only when `changes` succeeded and every other job
+  passed or was skipped.
 - The `Docs` workflow (`.github/workflows/docs.yml`, job `Build Docs`)
   builds the manual under `docs/` on every pull request to `main`. It sets
   up Python 3.11, installs `mkdocs-material` and `mkdocs-static-i18n`,
@@ -626,11 +631,13 @@ Where the crate handles key material or secrets:
   another operating system in its place. A CI job or matrix entry that
   exists only to cover another operating system or platform is left to CI;
   every other row applies on any host that can run its commands.
-- A change is documentation-only when every changed path matches the
-  `docs` filter of the `changes` job in `.github/workflows/ci.yml` and
-  none matches its `code` filter. For such a change run only the `Markdown`
-  row, and the `Build Docs` row as well when the change touches `docs/` or
-  `mkdocs.yml`, and build or test no code.
+- A change is documentation-only when the `changes` job in
+  `.github/workflows/ci.yml` counts every changed path as documentation:
+  each is on the built-in list of `aicers/agent-instructions/change-scope`
+  or on its `docs-paths` input, and none is on its `not-docs-paths` input.
+  For such a change run only the `Markdown` row, and the `Build Docs` row
+  as well when the change touches `docs/` or `mkdocs.yml`, and build or
+  test no code.
 - For any other change, run every row of the table below that applies to
   the host before pushing. Run each test command as written, in full: do
   not narrow it to the changed files or to selected test names.
@@ -642,7 +649,7 @@ Where the crate handles key material or secrets:
 | `check` | `git diff-index --quiet HEAD --` |
 | `test` | `cargo build --verbose` |
 | `test` | `cargo test --verbose` |
-| `Markdown` | `markdownlint-cli2 "**/*.md"` |
+| `Markdown` | `markdownlint-cli2` |
 | `Build Docs` | the `sh` block above |
 
 - `check` and `Build Docs` run only on `ubuntu-latest` in CI, but they do
@@ -656,10 +663,11 @@ Where the crate handles key material or secrets:
   `test` needs `::1` to be available.
 - Left to CI: `coverage`, which runs
   `cargo llvm-cov --workspace --lcov --output-path lcov.info` and uploads
-  the report to Codecov with the repository's token, and `changes`, which
-  classifies the run rather than checking the code. The shared
-  instruction-block drift check runs in `Markdown`; the generated regions
-  of this file are never edited here.
+  the report to Codecov with the repository's token, `changes`, which
+  classifies the run rather than checking the code, and `CI Gate`, which
+  only collects the other jobs' results. The shared instruction-block
+  drift check runs in `Markdown`; the generated regions of this file are
+  never edited here.
 - When a CI job fails, rerun that job's command locally; for a test job,
   rerun the failing tests by name rather than the whole suite.
 - Before requesting review, ensure every CI job passes on the pushed
