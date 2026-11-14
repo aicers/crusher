@@ -606,7 +606,7 @@ Where the crate handles key material or secrets:
   runs. `CI Gate` passes only when `changes` succeeded and every other job
   passed or was skipped.
 - The `Docs` workflow (`.github/workflows/docs.yml`, job `Build Docs`)
-  builds the manual under `docs/` on every pull request to `main`. It sets
+  builds the manual under `docs/` on every pull request. It sets
   up Python 3.11, installs `mkdocs-material` and `mkdocs-static-i18n`,
   fetches the shared docs theme with `scripts/fetch-theme.sh`, and runs
   `mkdocs build --strict`. A change under `docs/` or to `mkdocs.yml` must
