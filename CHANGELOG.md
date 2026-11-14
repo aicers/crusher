@@ -4,6 +4,15 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Updated `arrow-data` to 57.3.2, through review-protocol 0.26.0 and
+  structured 0.17.0, fixing RUSTSEC-2026-0442, an out-of-bounds read on
+  RunEndEncoded arrays. structured 0.17.0 also replaces `statistical`, so the
+  unmaintained `rand_os` (RUSTSEC-2025-0124) is no longer built in.
+
 ## [0.12.3] - 2026-11-02
 
 ### Changed
@@ -391,6 +400,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Send the generated timeseries to Giganto's ingest.
 - Save the model's id and the last time the timeseries was sent to a file.
 
+[Unreleased]: https://github.com/aicers/crusher/compare/0.12.3...main
 [0.12.3]: https://github.com/aicers/crusher/compare/0.12.2...0.12.3
 [0.12.2]: https://github.com/aicers/crusher/compare/0.12.1...0.12.2
 [0.12.1]: https://github.com/aicers/crusher/compare/0.12.0...0.12.1
