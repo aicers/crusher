@@ -7,8 +7,6 @@ on:
     tags:
       - "[0-9]+.[0-9]+.[0-9]+"
   pull_request:
-    branches:
-      - main
   # Rebuilds one release's manual: a release older than the upload below,
   # or one whose artifact has expired.
   workflow_dispatch:
