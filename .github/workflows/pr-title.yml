@@ -37,8 +37,8 @@ jobs:
           if not version.startswith("0.") or os.environ["PR_TITLE"].split(":", 1)[0].endswith("!"):
               sys.exit(0)
 
-          # GitHub uses the PR body as the squash commit body. release-plz
-          # reads breaking footers there when deciding whether to bump the minor.
+          # GitHub can use the PR body as the squash commit body. release-plz
+          # reads breaking footers in that raw text, even inside Markdown fences.
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event:
               body = json.load(event)["pull_request"]["body"] or ""
           if re.search(r"^BREAKING[ -]CHANGE(?::| #)\s*\S", body, re.MULTILINE):

@@ -62,12 +62,26 @@ jobs:
           # Keep commit titles out of the runner's input and environment logs.
           # Load the shared checker once and use the rule from the consumer's pin.
           checker_dir = Path(".agent-instructions-checker")
-          checker = runpy.run_path(str(checker_dir / "conventional-title/check.py"))
+          # This uses helpers internal to agent-instructions' check.py on main.
+          # Report upstream interface changes before checking any commits.
           try:
-              ref = checker["read_pin"](Path.cwd(), checker_dir / "scripts")
-              pattern = checker["fetch_rule"](ref)
-          except checker["Refused"] as error:
-              checker["error"](str(error))
+              checker = runpy.run_path(str(checker_dir / "conventional-title/check.py"))
+              read_pin = checker["read_pin"]
+              fetch_rule = checker["fetch_rule"]
+              check = checker["check"]
+              refused = checker["Refused"]
+              report_error = checker["error"]
+          except (OSError, KeyError) as failure:
+              sys.exit(
+                  "::error::Cannot load the shared Conventional title checker "
+                  f"from aicers/agent-instructions main: {failure}."
+              )
+
+          try:
+              ref = read_pin(Path.cwd(), checker_dir / "scripts")
+              pattern = fetch_rule(ref)
+          except refused as error:
+              report_error(str(error))
               sys.exit(1)
 
           failed = False
@@ -77,9 +91,9 @@ jobs:
               title = message.split("\n\n", 1)[0].rstrip("\n")
               if len(parents) == 1:
                   try:
-                      checker["check"](title, True, pattern, ref)
-                  except checker["Refused"] as error:
-                      checker["error"](f"{sha}: {error}")
+                      check(title, True, pattern, ref)
+                  except refused as error:
+                      report_error(f"{sha}: {error}")
                       failed = True
                   else:
                       print(f"{sha}: accepted squash commit {json.dumps(title)}")
