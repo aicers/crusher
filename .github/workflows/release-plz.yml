@@ -51,9 +51,10 @@ jobs:
         run: |
           # release-plz identifies release PRs by branch prefix alone.
           prs=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$SHA/pulls?per_page=100")
-          merged=$(jq --arg sha "$SHA" 'add // [] | any(.[];
+          merged=$(jq --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" 'add // [] | any(.[];
             .merged_at != null and .merge_commit_sha == $sha and .base.ref == "main"
-            and .user.login == "github-actions[bot]" and (.head.ref | startswith("release-plz-"))
+            and .user.login == "github-actions[bot]" and .head.repo.full_name == $repo
+            and (.head.ref | startswith("release-plz-"))
           )' <<< "$prs")
           echo "release=$merged" >> "$GITHUB_OUTPUT"
           if [ "$merged" = false ]; then
@@ -159,6 +160,25 @@ jobs:
       - name: Install Rust
         if: steps.head.outputs.current == 'true'
         uses: dtolnay/rust-toolchain@stable
+      - name: Verify open release PR candidates
+        if: steps.head.outputs.current == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # release-plz 0.4.3 can close or update any open PR with this prefix,
+          # regardless of its author, source repository, or base branch.
+          # The action lists PRs again after this check.
+          prs=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100")
+          unexpected=$(jq -er --arg repo "$GITHUB_REPOSITORY" '[.[][]
+            | select(.head.ref | startswith("release-plz-"))
+            | select(.user.login != "github-actions[bot]" or .head.repo.full_name != $repo or .base.ref != "main")
+            | .number
+          ] | join(", ")' <<< "$prs")
+          if [ -n "$unexpected" ]; then
+            echo "::error::Skipping release-pr because these open PRs use the release-plz prefix without matching the release bot, source repository, and main base: $unexpected."
+            exit 1
+          fi
       - id: release-pr
         if: steps.head.outputs.current == 'true'
         uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
@@ -215,6 +235,13 @@ jobs:
           NUMBER: ${{ fromJSON(needs.release-pr.outputs.pr).number }}
         run: |
           pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER")
+          if ! jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .user.login == "github-actions[bot]" and .head.repo.full_name == $repo
+            and .base.ref == "main" and (.head.ref | startswith("release-plz-"))
+          ' <<< "$pr" > /dev/null; then
+            echo "::error::PR $NUMBER does not match the release bot, source repository, main base, and release-plz branch prefix."
+            exit 1
+          fi
           sha=$(jq -er '.head.sha | select(test("^[0-9a-f]{40}$"))' <<< "$pr")
           title=$(jq -ce '.title' <<< "$pr")
           printf 'sha=%s\ntitle=%s\n' "$sha" "$title" >> "$GITHUB_OUTPUT"
