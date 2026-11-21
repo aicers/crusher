@@ -1,0 +1,38 @@
+name: Changelog
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  changelog:
+    name: Protect CHANGELOG.md
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Check the changed files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          files=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$NUMBER/files?per_page=100")
+          read_count=$(jq 'add // [] | length' <<< "$files")
+          # GitHub caps the files API at 3,000 files. Refuse an incomplete list.
+          if [ "$read_count" != "$CHANGED_FILES" ]; then
+            echo "::error::Read $read_count files from the API, but PR $NUMBER reports $CHANGED_FILES."
+            exit 1
+          fi
+
+          changed=$(jq 'add // [] | any(.[]; .filename == "CHANGELOG.md" or .previous_filename == "CHANGELOG.md")' <<< "$files")
+          if [[ "$changed" == true && ( "$HEAD_REF" != release-plz-* || "$AUTHOR" != 'github-actions[bot]' ) ]]; then
+            echo "::error::Only the release-plz bot's release PR may change CHANGELOG.md."
+            exit 1
+          fi

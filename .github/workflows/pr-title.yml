@@ -1,0 +1,45 @@
+name: PR title
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  title:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: aicers/agent-instructions/conventional-title@main
+        with:
+          title: ${{ github.event.pull_request.title }}
+      - name: Check breaking change declarations before 1.0
+        shell: python3 {0}
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          import json
+          import os
+          import re
+          import sys
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+          if not version.startswith("0.") or os.environ["PR_TITLE"].split(":", 1)[0].endswith("!"):
+              sys.exit(0)
+
+          # GitHub can use the PR body as the squash commit body. release-plz
+          # reads breaking footers in that raw text, even inside Markdown fences.
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event:
+              body = json.load(event)["pull_request"]["body"] or ""
+          if re.search(r"^BREAKING[ -]CHANGE(?::| #)\s*\S", body, re.MULTILINE):
+              sys.exit("::error::Add ! before the colon in the PR title when declaring a breaking change in the body.")

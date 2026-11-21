@@ -1,0 +1,107 @@
+name: Commit titles
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  commits:
+    name: Check first-parent commit titles
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.after }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          repository: aicers/agent-instructions
+          ref: main
+          path: .agent-instructions-checker
+          persist-credentials: false
+      - name: Check the first-parent range
+        shell: python3 {0}
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import runpy
+          import subprocess
+          import sys
+
+
+          def git(*args):
+              # Preserve carriage returns so the shared checker can reject them.
+              return subprocess.check_output(["git", *args]).decode("utf-8", errors="replace")
+
+
+          def has_commit(sha):
+              return subprocess.run(
+                  ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              ).returncode == 0
+
+
+          before, after = os.environ["BEFORE"], os.environ["AFTER"]
+          if any(not re.fullmatch("[0-9a-f]{40}", sha) or sha == "0" * 40 for sha in (before, after)):
+              sys.exit("::error::Cannot determine the before and after commits of this push.")
+          if not has_commit(before):
+              # The old head can be missing from the full checkout after a force push.
+              subprocess.run(["git", "fetch", "--no-tags", "origin", before], check=True)
+
+          # Keep commit titles out of the runner's input and environment logs.
+          # Load the shared checker once and use the rule from the consumer's pin.
+          checker_dir = Path(".agent-instructions-checker")
+          # This uses helpers internal to agent-instructions' check.py on main.
+          # Report upstream interface changes before checking any commits.
+          try:
+              checker = runpy.run_path(str(checker_dir / "conventional-title/check.py"))
+              read_pin = checker["read_pin"]
+              fetch_rule = checker["fetch_rule"]
+              check = checker["check"]
+              refused = checker["Refused"]
+              report_error = checker["error"]
+          except (OSError, KeyError) as failure:
+              sys.exit(
+                  "::error::Cannot load the shared Conventional title checker "
+                  f"from aicers/agent-instructions main: {failure}."
+              )
+
+          try:
+              ref = read_pin(Path.cwd(), checker_dir / "scripts")
+              pattern = fetch_rule(ref)
+          except refused as error:
+              report_error(str(error))
+              sys.exit(1)
+
+          failed = False
+          for sha in git("rev-list", "--first-parent", "--reverse", f"{before}..{after}").split():
+              parents = git("show", "-s", "--format=%P", sha).split()
+              message = git("show", "-s", "--format=%B", sha)
+              title = message.split("\n\n", 1)[0].rstrip("\n")
+              if len(parents) == 1:
+                  try:
+                      check(title, True, pattern, ref)
+                  except refused as error:
+                      report_error(f"{sha}: {error}")
+                      failed = True
+                  else:
+                      print(f"{sha}: accepted squash commit {json.dumps(title)}")
+              elif len(parents) == 2 and re.match(r"Merge pull request #[0-9]+ from aicers/release-plz-", message):
+                  print(f"{sha}: accepted release PR merge {json.dumps(title)}")
+              else:
+                  print(f"{sha}: rejected {json.dumps(title)}")
+                  print(f"::error::{sha} has {len(parents)} parents. Only merges of aicers/release-plz- PRs may have two parents.")
+                  failed = True
+
+          sys.exit(int(failed))
