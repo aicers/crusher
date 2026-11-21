@@ -1,0 +1,99 @@
+name: Commit titles
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  commits:
+    name: Check merge commits and list squash commits
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      titles: ${{ steps.range.outputs.titles }}
+      count: ${{ steps.range.outputs.count }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.after }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: range
+        name: Check the first-parent range
+        shell: python3 {0}
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+
+          def git(*args):
+              # Preserve carriage returns so the title action can reject them.
+              return subprocess.check_output(["git", *args]).decode("utf-8", errors="replace")
+
+
+          def has_commit(sha):
+              return subprocess.run(
+                  ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              ).returncode == 0
+
+
+          before, after = os.environ["BEFORE"], os.environ["AFTER"]
+          if any(not re.fullmatch("[0-9a-f]{40}", sha) or sha == "0" * 40 for sha in (before, after)):
+              sys.exit("::error::Cannot determine the before and after commits of this push.")
+          if not has_commit(before):
+              # The old head can be missing from the full checkout after a force push.
+              subprocess.run(["git", "fetch", "--no-tags", "origin", before], check=True)
+
+          titles = []
+          failed = False
+          for sha in git("rev-list", "--first-parent", "--reverse", f"{before}..{after}").split():
+              parents = git("show", "-s", "--format=%P", sha).split()
+              message = git("show", "-s", "--format=%B", sha)
+              title = message.split("\n\n", 1)[0].rstrip("\n")
+              if len(parents) == 1:
+                  titles.append({"sha": sha, "title": title})
+              elif len(parents) == 2 and re.match(r"Merge pull request #[0-9]+ from aicers/release-plz-", message):
+                  print(f"{sha}: accepted release PR merge {json.dumps(title)}")
+              else:
+                  print(f"{sha}: rejected {json.dumps(title)}")
+                  print(f"::error::{sha} has {len(parents)} parents. Only merges of aicers/release-plz- PRs may have two parents.")
+                  failed = True
+
+          if len(titles) > 256:
+              sys.exit(f"::error::{len(titles)} squash commits exceed the 256-job matrix limit. Check these titles by hand.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"titles={json.dumps(titles)}", file=output)
+              print(f"count={len(titles)}", file=output)
+          sys.exit(int(failed))
+
+  title:
+    name: Title of ${{ matrix.commit.sha }}
+    needs: commits
+    # Still check the squash commits if the range also had a rejected merge.
+    if: ${{ !cancelled() && needs.commits.outputs.count != '' && needs.commits.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        commit: ${{ fromJSON(needs.commits.outputs.titles) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.after }}
+          persist-credentials: false
+      - uses: aicers/agent-instructions/conventional-title@main
+        with:
+          title: ${{ matrix.commit.title }}
+          pr-suffix: "true"

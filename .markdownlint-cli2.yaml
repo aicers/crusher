@@ -5,6 +5,7 @@ ignores:
   - "secrets/**"
   - ".github/**"
   - ".venv/**"
+  - "CHANGELOG.md"
 config:
   MD024:
     siblings_only: true

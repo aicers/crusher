@@ -1,0 +1,196 @@
+name: Release-plz
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    if: >-
+      ${{
+        (github.event_name == 'workflow_run'
+          && github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push')
+        || (github.event_name == 'workflow_dispatch'
+          && github.ref == 'refs/heads/main')
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || 'refs/heads/main' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: commit
+        name: Record the checked-out commit
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - id: merged
+        name: Check for a merged release PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          # release-plz identifies release PRs by branch prefix alone.
+          prs=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$SHA/pulls?per_page=100")
+          merged=$(jq --arg sha "$SHA" 'add // [] | any(.[];
+            .merged_at != null and .merge_commit_sha == $sha and .base.ref == "main"
+            and .user.login == "github-actions[bot]" and (.head.ref | startswith("release-plz-"))
+          )' <<< "$prs")
+          echo "release=$merged" >> "$GITHUB_OUTPUT"
+          if [ "$merged" = false ]; then
+            echo "Skipping release: $SHA is not a merged release PR."
+          fi
+      - name: Install Rust
+        if: steps.merged.outputs.release == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - id: release
+        if: steps.merged.outputs.release == 'true'
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release
+          version: "0.4.3"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - id: tag
+        name: Read the new release tag
+        if: steps.release.outputs.releases_created == 'true'
+        shell: bash
+        env:
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: |
+          tag=$(jq -er 'if length == 1 then .[0].tag else error("expected one release") end' <<< "$RELEASES")
+          if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'release-plz reported an invalid version tag %q\n' "$tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release-pr:
+    name: Release PR
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      created: ${{ steps.release-pr.outputs.prs_created }}
+      pr: ${{ steps.release-pr.outputs.pr }}
+    steps:
+      # release-pr needs an attached branch to choose the PR base.
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - id: head
+        name: Compare main with the release job's checkout
+        env:
+          EXPECTED_SHA: ${{ needs.release.outputs.sha }}
+        run: |
+          head=$(git rev-parse HEAD)
+          if [ "$head" = "$EXPECTED_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping release-pr: release ran on $EXPECTED_SHA, but main is now $head."
+          fi
+      - name: Install Rust
+        if: steps.head.outputs.current == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - id: release-pr
+        if: steps.head.outputs.current == 'true'
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release-pr
+          version: "0.4.3"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  upload-binary:
+    name: Upload release binary
+    needs: release
+    if: needs.release.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}
+
+  release-docs:
+    name: Dispatch the release manual build
+    needs: release
+    if: needs.release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch Docs for the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: gh workflow run docs.yml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$TAG"
+
+  title:
+    name: Check release PR title
+    needs: [release, release-pr]
+    if: needs.release-pr.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      # Use the pin from the base commit used to generate the release PR.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release.outputs.sha }}
+          persist-credentials: false
+      - id: pr
+        name: Read the release PR title and head
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ fromJSON(needs.release-pr.outputs.pr).number }}
+        run: |
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER")
+          sha=$(jq -er '.head.sha | select(test("^[0-9a-f]{40}$"))' <<< "$pr")
+          title=$(jq -ce '.title' <<< "$pr")
+          printf 'sha=%s\ntitle=%s\n' "$sha" "$title" >> "$GITHUB_OUTPUT"
+      - id: check
+        continue-on-error: true
+        uses: aicers/agent-instructions/conventional-title@main
+        with:
+          title: ${{ fromJSON(steps.pr.outputs.title) }}
+      - name: Post Validate PR title
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          OUTCOME: ${{ steps.check.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          state=failure
+          if [ "$OUTCOME" = success ]; then
+            state=success
+          fi
+          # The bot-created PR does not run pr-title.yml on its own.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state="$state" -f context="Validate PR title" -f target_url="$RUN_URL" --silent
+          [ "$state" = success ]
