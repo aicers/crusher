@@ -62,12 +62,56 @@ jobs:
       - name: Install Rust
         if: steps.merged.outputs.release == 'true'
         uses: dtolnay/rust-toolchain@stable
+      - id: recovery
+        name: Prepare to resume a release with an existing tag
+        if: steps.merged.outputs.release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          tag=$(jq -er '.packages[] | select(.name == "crusher") | .version' <<< "$metadata")
+          if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'Expected a plain X.Y.Z package version, got %q\n' "$tag" >&2
+            exit 1
+          fi
+          ref="refs/tags/$tag"
+          if ! tag_object=$(git rev-parse --verify --quiet "$ref"); then
+            exit 0
+          fi
+
+          if response=$(gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$tag"); then
+            exit 0
+          fi
+          status_line=${response%%$'\n'*}
+          if [[ ! "$status_line" =~ ^HTTP/[^[:space:]]+[[:space:]]404([[:space:]]|$) ]]; then
+            echo "::error::Could not verify whether the GitHub Release for $tag exists."
+            exit 1
+          fi
+
+          # release-plz tags the prepared commit (the second parent of the merge).
+          # For a squash merge, it falls back to the checked-out commit.
+          tag_commit=$(git rev-parse --verify "$tag_object^{commit}")
+          release_commit=$(git rev-parse --verify --quiet HEAD^2 || git rev-parse HEAD)
+          if [ "$tag_commit" != "$release_commit" ]; then
+            echo "::error::Tag $tag points to $tag_commit, expected $release_commit for this release."
+            exit 1
+          fi
+
+          # release-plz 0.4.3 skips versions with a local tag. Hide it in this
+          # checkout and disable tag creation so it only publishes the Release.
+          config=$(mktemp "$RUNNER_TEMP/release-plz.XXXXXX")
+          awk '1; /^\[workspace\]$/ { print "git_tag_enable = false" }' release-plz.toml > "$config"
+          git update-ref -d "$ref" "$tag_object"
+          echo "config=$config" >> "$GITHUB_OUTPUT"
+          echo "Resuming Release $tag using the existing remote tag."
       - id: release
         if: steps.merged.outputs.release == 'true'
         uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
         with:
           command: release
           version: "0.4.3"
+          config: ${{ steps.recovery.outputs.config }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - id: tag

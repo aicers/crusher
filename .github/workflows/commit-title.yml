@@ -8,35 +8,40 @@ permissions: {}
 
 jobs:
   commits:
-    name: Check merge commits and list squash commits
+    name: Check first-parent commit titles
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    outputs:
-      titles: ${{ steps.range.outputs.titles }}
-      count: ${{ steps.range.outputs.count }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.after }}
           fetch-depth: 0
           persist-credentials: false
-      - id: range
-        name: Check the first-parent range
+      - uses: actions/checkout@v5
+        with:
+          repository: aicers/agent-instructions
+          ref: main
+          path: .agent-instructions-checker
+          persist-credentials: false
+      - name: Check the first-parent range
         shell: python3 {0}
         env:
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.event.after }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           import json
           import os
+          from pathlib import Path
           import re
+          import runpy
           import subprocess
           import sys
 
 
           def git(*args):
-              # Preserve carriage returns so the title action can reject them.
+              # Preserve carriage returns so the shared checker can reject them.
               return subprocess.check_output(["git", *args]).decode("utf-8", errors="replace")
 
 
@@ -54,14 +59,30 @@ jobs:
               # The old head can be missing from the full checkout after a force push.
               subprocess.run(["git", "fetch", "--no-tags", "origin", before], check=True)
 
-          titles = []
+          # Keep commit titles out of the runner's input and environment logs.
+          # Load the shared checker once and use the rule from the consumer's pin.
+          checker_dir = Path(".agent-instructions-checker")
+          checker = runpy.run_path(str(checker_dir / "conventional-title/check.py"))
+          try:
+              ref = checker["read_pin"](Path.cwd(), checker_dir / "scripts")
+              pattern = checker["fetch_rule"](ref)
+          except checker["Refused"] as error:
+              checker["error"](str(error))
+              sys.exit(1)
+
           failed = False
           for sha in git("rev-list", "--first-parent", "--reverse", f"{before}..{after}").split():
               parents = git("show", "-s", "--format=%P", sha).split()
               message = git("show", "-s", "--format=%B", sha)
               title = message.split("\n\n", 1)[0].rstrip("\n")
               if len(parents) == 1:
-                  titles.append({"sha": sha, "title": title})
+                  try:
+                      checker["check"](title, True, pattern, ref)
+                  except checker["Refused"] as error:
+                      checker["error"](f"{sha}: {error}")
+                      failed = True
+                  else:
+                      print(f"{sha}: accepted squash commit {json.dumps(title)}")
               elif len(parents) == 2 and re.match(r"Merge pull request #[0-9]+ from aicers/release-plz-", message):
                   print(f"{sha}: accepted release PR merge {json.dumps(title)}")
               else:
@@ -69,31 +90,4 @@ jobs:
                   print(f"::error::{sha} has {len(parents)} parents. Only merges of aicers/release-plz- PRs may have two parents.")
                   failed = True
 
-          if len(titles) > 256:
-              sys.exit(f"::error::{len(titles)} squash commits exceed the 256-job matrix limit. Check these titles by hand.")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              print(f"titles={json.dumps(titles)}", file=output)
-              print(f"count={len(titles)}", file=output)
           sys.exit(int(failed))
-
-  title:
-    name: Title of ${{ matrix.commit.sha }}
-    needs: commits
-    # Still check the squash commits if the range also had a rejected merge.
-    if: ${{ !cancelled() && needs.commits.outputs.count != '' && needs.commits.outputs.count != '0' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        commit: ${{ fromJSON(needs.commits.outputs.titles) }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.after }}
-          persist-credentials: false
-      - uses: aicers/agent-instructions/conventional-title@main
-        with:
-          title: ${{ matrix.commit.title }}
-          pr-suffix: "true"
