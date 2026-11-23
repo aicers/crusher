@@ -1,3 +1,6 @@
+mod records;
+mod regression;
+
 use std::collections::HashMap;
 use std::time::Duration;
 use std::{
@@ -25,7 +28,10 @@ use rcgen::{
     SanType, string::Ia5String,
 };
 use review_protocol::request::Handler;
-use review_protocol::types::{SamplingKind, SamplingPolicy};
+use review_protocol::types::{
+    ConnField, CounterpartScope, GroupByUnit, HostNetworkGroup, Measure,
+    RawEventKind as PolicyRawEventKind, TimeSeriesGenerationPolicy,
+};
 use rustls::{pki_types::CertificateDer, server::WebPkiClientVerifier};
 use serial_test::serial;
 use tempfile::TempDir;
@@ -99,8 +105,15 @@ enum PublishBehavior {
     },
     /// Records stream-open requests without opening response streams.
     RecordRequests {
-        sender: async_channel::Sender<(Connection, RequestTimeSeriesGeneratorStream)>,
+        sender: async_channel::Sender<(
+            Connection,
+            RequestStreamRecord,
+            RequestTimeSeriesGeneratorStream,
+        )>,
     },
+    /// Answers each request with a stream carrying these events, each its
+    /// own timestamp and record, without a delay, and keeps it open.
+    Records(Arc<[(i64, Vec<u8>)]>),
 }
 
 #[derive(Clone)]
@@ -418,11 +431,34 @@ async fn handle_publish_connection(
         }
         PublishBehavior::RecordRequests { sender } => {
             while let Ok(payload) = receive_stream_request(&mut recv).await {
-                if let StreamRequestPayload::TimeSeriesGenerator { request, .. } = payload
-                    && sender.send((connection.clone(), request)).await.is_err()
+                if let StreamRequestPayload::TimeSeriesGenerator {
+                    record_type,
+                    request,
+                } = payload
+                    && sender
+                        .send((connection.clone(), record_type, request))
+                        .await
+                        .is_err()
                 {
                     return;
                 }
+            }
+        }
+        PublishBehavior::Records(records) => {
+            let mut streams = Vec::new();
+            while let Ok(payload) = receive_stream_request(&mut recv).await {
+                let StreamRequestPayload::TimeSeriesGenerator { request, .. } = payload else {
+                    continue;
+                };
+                let Ok(mut uni) = connection.open_uni().await else {
+                    return;
+                };
+                let _ = send_raw(&mut uni, request.id.as_bytes()).await;
+                for (timestamp, record) in records.iter() {
+                    let _ = send_bytes(&mut uni, &timestamp.to_le_bytes()).await;
+                    let _ = send_raw(&mut uni, record).await;
+                }
+                streams.push(uni);
             }
         }
     }
@@ -628,7 +664,7 @@ async fn handle_ingest_stream(
         let policy_id = batch
             .first()
             .and_then(|(_, payload)| bincode::deserialize::<TimeSeries>(payload).ok())
-            .and_then(|series| series.sampling_policy_id.parse::<u32>().ok())
+            .and_then(|series| series.time_series_id.parse::<u32>().ok())
             .unwrap_or(0);
         for (timestamp, payload) in batch {
             if let Some(series_notify) = &series_notify
@@ -740,7 +776,7 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    async fn new(policies: &[SamplingPolicy]) -> Self {
+    async fn new(policies: &[TimeSeriesGenerationPolicy]) -> Self {
         let (ingest_ack_recv, server_handles, ingest_addr, publish_addr) = start_servers();
         let certs = cert_key();
         let coordinator = CancellationCoordinator::new();
@@ -748,7 +784,9 @@ impl TestHarness {
             setup_request_client(None, &coordinator).await;
 
         let mut rc = request_client;
-        rc.sampling_policy_list(policies).await.unwrap();
+        rc.time_series_generation_policy_list(policies)
+            .await
+            .unwrap();
 
         let client_handle = spawn_subscribe_client(
             &certs,
@@ -841,17 +879,22 @@ async fn setup_request_client(
     )
 }
 
-fn new_policy(id: u32) -> SamplingPolicy {
-    SamplingPolicy {
+fn new_policy(id: u32) -> TimeSeriesGenerationPolicy {
+    TimeSeriesGenerationPolicy {
         id,
-        kind: SamplingKind::Conn,
-        interval: Duration::from_secs(15 * SECS_PER_MINUTE),
-        period: Duration::from_secs(SECS_PER_DAY),
-        offset: 0,
+        raw_event_kind: PolicyRawEventKind::Conn,
+        measure: Measure::Count,
+        group_by: None,
+        group_by_unit: GroupByUnit::Ip,
+        counterpart_scope: CounterpartScope::Any,
+        slot_size: Duration::from_secs(15 * SECS_PER_MINUTE),
+        window_size: Duration::from_secs(SECS_PER_DAY),
+        utc_offset: 0,
         src_ip: None,
         dst_ip: None,
-        node: Some("cluml".to_string()),
-        column: None,
+        sensors: vec!["cluml".to_string()],
+        time_series_type: None,
+        internal_networks: HostNetworkGroup::default(),
     }
 }
 
@@ -992,13 +1035,16 @@ fn config_server() -> ServerConfig {
 #[derive(Clone)]
 struct ReloadPolicyManager {
     calls: Arc<AtomicUsize>,
-    first_policy: SamplingPolicy,
+    first_policy: TimeSeriesGenerationPolicy,
     sync_events: async_channel::Sender<usize>,
 }
 
 #[async_trait::async_trait]
 impl review_protocol::server::Handler for ReloadPolicyManager {
-    async fn get_sampling_policy_list(&self, _peer: &str) -> Result<Vec<SamplingPolicy>, String> {
+    async fn get_time_series_generation_policy_list(
+        &self,
+        _peer: &str,
+    ) -> Result<Vec<TimeSeriesGenerationPolicy>, String> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.sync_events.send(call).await;
         if call == 1 {
@@ -1010,7 +1056,7 @@ impl review_protocol::server::Handler for ReloadPolicyManager {
 }
 
 fn start_reload_policy_manager(
-    policy: SamplingPolicy,
+    policy: TimeSeriesGenerationPolicy,
 ) -> (
     SocketAddr,
     async_channel::Receiver<usize>,
@@ -1328,7 +1374,7 @@ fn gen_conn() -> Conn {
 
 #[serial]
 #[tokio::test]
-async fn sampling_policy_flow_with_fake_giganto_server() {
+async fn time_series_generation_policy_flow_with_fake_giganto_server() {
     let policy = new_policy(DEFAULT_POLICY_ID);
     let harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
@@ -1352,7 +1398,7 @@ async fn sampling_policy_flow_with_fake_giganto_server() {
 /// should be stopped and timestamp cleaned up.
 #[serial]
 #[tokio::test]
-async fn sampling_policy_notify_flow_with_delete() {
+async fn time_series_generation_policy_notify_flow_with_delete() {
     let policy = new_policy(DEFAULT_POLICY_ID);
     let mut harness = TestHarness::new(std::slice::from_ref(&policy)).await;
 
@@ -1370,7 +1416,7 @@ async fn sampling_policy_notify_flow_with_delete() {
 
     harness
         .request_client
-        .delete_sampling_policy(&[policy.id])
+        .delete_time_series_generation_policy(&[policy.id])
         .await
         .unwrap();
 
@@ -1384,7 +1430,7 @@ async fn sampling_policy_notify_flow_with_delete() {
 /// Test: Adding multiple policies should create multiple concurrent streams.
 #[serial]
 #[tokio::test]
-async fn sampling_policy_multiple_streams() {
+async fn time_series_generation_policy_multiple_streams() {
     let policy_a = new_policy(1);
     let policy_b = new_policy(2);
     let harness = TestHarness::new(&[policy_a.clone(), policy_b.clone()]).await;
@@ -1584,7 +1630,7 @@ async fn stalled_ack_stream_recovers_and_actor_flushes_before_return() {
         setup_request_client(None, &coordinator).await;
     let policy = new_policy(DEFAULT_POLICY_ID);
     request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
         .await
         .expect("policy setup succeeds");
     let client = Client::new(ingest_addr, publish_addr, HOST.to_string(), &cert_key())
@@ -1668,7 +1714,7 @@ async fn ingest_control_queues_consecutive_writes_on_one_sender() {
     for value in [1.0, 2.0] {
         series_send
             .try_send(TimeSeries {
-                sampling_policy_id: DEFAULT_POLICY_ID.to_string(),
+                time_series_id: DEFAULT_POLICY_ID.to_string(),
                 start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
                 series: vec![value],
             })
@@ -1742,7 +1788,7 @@ async fn shutdown_drain_writes_series_queued_in_the_ingest_control() {
     for value in [1.0, 2.0] {
         series_send
             .try_send(TimeSeries {
-                sampling_policy_id: DEFAULT_POLICY_ID.to_string(),
+                time_series_id: DEFAULT_POLICY_ID.to_string(),
                 start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
                 series: vec![value],
             })
@@ -1809,7 +1855,7 @@ async fn shutdown_drain_keeps_corrections_behind_the_window_they_replace() {
     let window_start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
     let next_start_secs = (BASE_WINDOW_START_NANOS + DAY_NANOS) / 1_000_000_000;
     let window = |start_secs, value| TimeSeries {
-        sampling_policy_id: DEFAULT_POLICY_ID.to_string(),
+        time_series_id: DEFAULT_POLICY_ID.to_string(),
         start_secs,
         series: vec![value],
     };
@@ -1911,12 +1957,12 @@ async fn cancellation_drains_queued_time_series() {
         .unwrap();
     let policy_id = DEFAULT_POLICY_ID.to_string();
     let first = TimeSeries {
-        sampling_policy_id: policy_id.clone(),
+        time_series_id: policy_id.clone(),
         start_secs: 1,
         series: vec![1.0],
     };
     let second = TimeSeries {
-        sampling_policy_id: policy_id.clone(),
+        time_series_id: policy_id.clone(),
         start_secs: 2,
         series: vec![2.0],
     };
@@ -2100,7 +2146,7 @@ async fn restart_state_consistency() {
         setup_request_client(Some(&last_time_series_path), &coordinator2).await;
 
     request_client2
-        .sampling_policy_list(std::slice::from_ref(&policy))
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
         .await
         .unwrap();
 
@@ -2201,7 +2247,7 @@ async fn silent_source_window_is_written_by_the_timer() {
         setup_request_client(None, &coordinator).await;
     let policy = new_policy(DEFAULT_POLICY_ID);
     review
-        .sampling_policy_list(std::slice::from_ref(&policy))
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
         .await
         .unwrap();
 
@@ -2229,7 +2275,7 @@ async fn silent_source_window_is_written_by_the_timer() {
         started.elapsed()
     );
     assert_eq!(timestamp, BASE_WINDOW_START_NANOS);
-    assert_eq!(series.sampling_policy_id, policy.id.to_string());
+    assert_eq!(series.time_series_id, policy.id.to_string());
     assert_eq!(series.series.iter().sum::<f64>(), 3.0);
     let map = timeout(TEST_TIMEOUT, wait_for_policy_ids(&path, &[policy.id], true))
         .await
@@ -2270,7 +2316,7 @@ async fn window_correction_is_stored_after_the_window_it_replaces() {
         setup_request_client(None, &coordinator).await;
     let policy = new_policy(DEFAULT_POLICY_ID);
     review
-        .sampling_policy_list(std::slice::from_ref(&policy))
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
         .await
         .unwrap();
     // Not past any window's end: only events close windows in this test.
@@ -2337,7 +2383,7 @@ async fn restart_writes_the_window_open_at_shutdown_and_no_zero_row() {
     let (mut review, actor_task, path, dir, policy_handle) =
         setup_request_client(None, &coordinator).await;
     review
-        .sampling_policy_list(std::slice::from_ref(&policy))
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
         .await
         .unwrap();
     let client_handle = spawn_subscribe_client_with_timer(
@@ -2377,7 +2423,7 @@ async fn restart_writes_the_window_open_at_shutdown_and_no_zero_row() {
     let (mut review, actor_task, _, _keep_dir, policy_handle) =
         setup_request_client(Some(&path), &coordinator).await;
     review
-        .sampling_policy_list(std::slice::from_ref(&policy))
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
         .await
         .unwrap();
     assert_eq!(
@@ -2579,7 +2625,7 @@ async fn reload_does_not_open_policy_queued_by_previous_run() {
 /// given [`PublishBehavior`]. Returns the resources the test needs to
 /// observe ACKs and tear everything down.
 async fn run_with_publish_behavior(
-    policies: &[SamplingPolicy],
+    policies: &[TimeSeriesGenerationPolicy],
     behavior: PublishBehavior,
 ) -> (
     CancellationCoordinator,
@@ -2603,7 +2649,10 @@ async fn run_with_publish_behavior(
     let coordinator = CancellationCoordinator::new();
     let (mut request_client, actor_task, last_time_series_path, temp_dir, policy_handle) =
         setup_request_client(None, &coordinator).await;
-    request_client.sampling_policy_list(policies).await.unwrap();
+    request_client
+        .time_series_generation_policy_list(policies)
+        .await
+        .unwrap();
 
     let client_handle = spawn_subscribe_client(
         &certs,
@@ -2649,7 +2698,7 @@ async fn delete_then_readd_same_id_starts_fresh_stream() {
     // Successful deletion removes the checkpoint directly in the policy actor.
     harness
         .request_client
-        .delete_sampling_policy(&[policy.id])
+        .delete_time_series_generation_policy(&[policy.id])
         .await
         .unwrap();
     let map_after_delete = harness.wait_for_timestamp_removed(&[policy.id]).await;
@@ -2661,7 +2710,7 @@ async fn delete_then_readd_same_id_starts_fresh_stream() {
     // drives a fresh ACK back through the ingest path.
     harness
         .request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
         .await
         .unwrap();
 
@@ -2703,7 +2752,7 @@ async fn delete_policy_tears_down_ingest_channel_entry() {
 
     harness
         .request_client
-        .delete_sampling_policy(&[policy.id])
+        .delete_time_series_generation_policy(&[policy.id])
         .await
         .unwrap();
     let _ = harness.wait_for_timestamp_removed(&[policy.id]).await;
@@ -2846,7 +2895,7 @@ async fn inbound_stream_arrival_after_delete_is_dropped() {
         .await
         .expect("server should receive both stream requests within 5s");
     request_client
-        .delete_sampling_policy(&[policy_a.id])
+        .delete_time_series_generation_policy(&[policy_a.id])
         .await
         .unwrap();
 
@@ -2893,8 +2942,8 @@ async fn inbound_stream_arrival_after_delete_is_dropped() {
 #[tokio::test]
 async fn delayed_stream_of_replaced_policy_is_not_bound_to_new_content() {
     let original = new_policy(DEFAULT_POLICY_ID);
-    let replacement = SamplingPolicy {
-        column: Some(5),
+    let replacement = TimeSeriesGenerationPolicy {
+        measure: Measure::Sum(ConnField::Duration),
         ..original.clone()
     };
     let request_received = Arc::new(Notify::new());
@@ -2924,7 +2973,7 @@ async fn delayed_stream_of_replaced_policy_is_not_bound_to_new_content() {
         .await
         .expect("server should receive the original stream request");
     request_client
-        .sampling_policy_list(std::slice::from_ref(&replacement))
+        .time_series_generation_policy_list(std::slice::from_ref(&replacement))
         .await
         .unwrap();
     release.notify_one();
@@ -2953,8 +3002,8 @@ async fn delayed_stream_of_replaced_policy_is_not_bound_to_new_content() {
             .get_policy(replacement.id)
             .await
             .unwrap()
-            .column,
-        replacement.column
+            .measure,
+        replacement.measure
     );
 
     drop(request_client);
@@ -3031,7 +3080,7 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
     request_client.set_policy_handle(policy_handle.clone());
     let policy = new_policy(DEFAULT_POLICY_ID);
     request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
         .await
         .unwrap();
 
@@ -3116,7 +3165,7 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
     );
     request_client.set_policy_handle(policy_handle.clone());
     request_client
-        .sampling_policy_list(std::slice::from_ref(&policy))
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
         .await
         .unwrap();
     let client_handle_2 = spawn_subscribe_client(
@@ -3177,7 +3226,7 @@ async fn sighup_rerun_rebuilds_shared_endpoint_for_ingest_and_publish() {
     // yield an ACK.
     let extra_policy = new_policy(DEFAULT_POLICY_ID + 1);
     request_client
-        .sampling_policy_list(&[policy, extra_policy.clone()])
+        .time_series_generation_policy_list(&[policy, extra_policy.clone()])
         .await
         .unwrap();
     let id = timeout(Duration::from_secs(5), ingest_ack_recv.recv())
@@ -3207,7 +3256,11 @@ mod policy_lifecycle {
     /// without replying with data streams, to exercise pending-request deduplication
     /// and reconnection through the production watch loop.
     struct PublishProbe {
-        requests: async_channel::Receiver<(Connection, RequestTimeSeriesGeneratorStream)>,
+        requests: async_channel::Receiver<(
+            Connection,
+            RequestStreamRecord,
+            RequestTimeSeriesGeneratorStream,
+        )>,
         control: tokio::task::JoinHandle<Result<()>>,
         server: tokio::task::JoinHandle<()>,
         shutdown: Arc<Notify>,
@@ -3248,6 +3301,17 @@ mod policy_lifecycle {
         }
 
         async fn next(&self) -> (Connection, RequestTimeSeriesGeneratorStream) {
+            let (connection, _, request) = self.next_with_record().await;
+            (connection, request)
+        }
+
+        async fn next_with_record(
+            &self,
+        ) -> (
+            Connection,
+            RequestStreamRecord,
+            RequestTimeSeriesGeneratorStream,
+        ) {
             timeout(RECONNECT_TEST_TIMEOUT, self.requests.recv())
                 .await
                 .unwrap()
@@ -3260,7 +3324,9 @@ mod policy_lifecycle {
             // not an assertion that snapshot processing has finished.
             match timeout(Duration::from_secs(1), self.requests.recv()).await {
                 Err(_) => {}
-                Ok(Ok((_, request))) => panic!("unexpected additional request: {}", request.id),
+                Ok(Ok((_, _, request))) => {
+                    panic!("unexpected additional request: {}", request.id)
+                }
                 Ok(Err(error)) => panic!("Publish request channel closed unexpectedly: {error}"),
             }
         }
@@ -3283,12 +3349,18 @@ mod policy_lifecycle {
             let (mut review, actor, path, _dir, handle) =
                 setup_request_client(None, &coordinator).await;
             review
-                .sampling_policy_list(&[new_policy(42)])
+                .time_series_generation_policy_list(&[new_policy(42)])
                 .await
                 .unwrap();
             handle.record_ack(42, 123).await.unwrap();
-            review.delete_sampling_policy(&[42]).await.unwrap();
-            review.sampling_policy_list(&[new_policy(7)]).await.unwrap();
+            review
+                .delete_time_series_generation_policy(&[42])
+                .await
+                .unwrap();
+            review
+                .time_series_generation_policy_list(&[new_policy(7)])
+                .await
+                .unwrap();
 
             let probe = PublishProbe::start(handle.clone(), coordinator.clone());
             assert_eq!(probe.next().await.1.id, "7");
@@ -3311,17 +3383,61 @@ mod policy_lifecycle {
                 setup_request_client(None, &coordinator).await;
             let probe = PublishProbe::start(handle.clone(), coordinator.clone());
             review
-                .sampling_policy_list(&[new_policy(42)])
+                .time_series_generation_policy_list(&[new_policy(42)])
                 .await
                 .unwrap();
             assert_eq!(probe.next().await.1.id, "42");
             // The peer still has not opened the inbound stream for 42. Updating the
             // full snapshot with another policy must not send a second request for 42.
             review
-                .sampling_policy_list(&[new_policy(42), new_policy(7)])
+                .time_series_generation_policy_list(&[new_policy(42), new_policy(7)])
                 .await
                 .unwrap();
             assert_eq!(probe.next().await.1.id, "7");
+            probe.assert_no_additional_requests().await;
+            probe.finish(&coordinator).await;
+            drop(review);
+            drop(handle);
+            join_test_task("policy actor", actor).await.unwrap();
+        })
+        .await;
+    }
+
+    /// Only an ungrouped single-sensor policy of a network kind is requested,
+    /// once, for its kind and its one sensor; every other policy in the same
+    /// list is skipped and requests nothing.
+    #[tokio::test]
+    async fn only_runnable_policy_is_requested_for_its_kind_and_sensor() {
+        run_test(async {
+            let coordinator = CancellationCoordinator::new();
+            let (mut review, actor, _, _dir, handle) =
+                setup_request_client(None, &coordinator).await;
+            let mut runnable = new_policy(7);
+            runnable.raw_event_kind = PolicyRawEventKind::Dns;
+            let mut skipped: Vec<TimeSeriesGenerationPolicy> = (1..=7).map(new_policy).collect();
+            skipped[0].group_by = Some(review_protocol::types::EndpointRole::Source);
+            skipped[1].sensors.push("other".into());
+            skipped[2].counterpart_scope = CounterpartScope::Internal;
+            skipped[3].counterpart_scope = CounterpartScope::External;
+            skipped[4].sensors.clear();
+            skipped[5].raw_event_kind = PolicyRawEventKind::ProcessCreate;
+            skipped[6].raw_event_kind = PolicyRawEventKind::Dns;
+            skipped[6].measure = Measure::Sum(ConnField::OrigBytes);
+            skipped[6].id = 8;
+            let mut list = skipped;
+            list.push(runnable);
+            review
+                .time_series_generation_policy_list(&list)
+                .await
+                .unwrap();
+            assert_eq!(handle.get_all_policy_ids(), [7]);
+
+            let probe = PublishProbe::start(handle.clone(), coordinator.clone());
+            let (_, record_type, request) = probe.next_with_record().await;
+            assert_eq!(record_type, RequestStreamRecord::Dns);
+            assert_eq!(request.id, "7");
+            assert_eq!(request.sensor.as_deref(), Some("cluml"));
+            assert_eq!(request.start, 0);
             probe.assert_no_additional_requests().await;
             probe.finish(&coordinator).await;
             drop(review);
@@ -3341,7 +3457,7 @@ mod policy_lifecycle {
             policy.src_ip = Some("192.0.2.1".parse().unwrap());
             policy.dst_ip = Some("192.0.2.2".parse().unwrap());
             review
-                .sampling_policy_list(std::slice::from_ref(&policy))
+                .time_series_generation_policy_list(std::slice::from_ref(&policy))
                 .await
                 .unwrap();
             let probe = PublishProbe::start(handle.clone(), coordinator.clone());
@@ -3349,7 +3465,7 @@ mod policy_lifecycle {
             assert_eq!(first.start, 0);
             assert_eq!(first.src_ip, policy.src_ip);
             assert_eq!(first.dst_ip, policy.dst_ip);
-            assert_eq!(first.sensor, policy.node);
+            assert_eq!(first.sensor.as_deref(), Some("cluml"));
             handle.record_ack(42, 123).await.unwrap();
             let _ = handle.stream_policy(42).await.unwrap();
             connection.close(0u32.into(), b"simulate Giganto connection loss");
@@ -3360,7 +3476,7 @@ mod policy_lifecycle {
             assert_eq!(resumed.start, 123);
             assert_eq!(resumed.src_ip, policy.src_ip);
             assert_eq!(resumed.dst_ip, policy.dst_ip);
-            assert_eq!(resumed.sensor, policy.node);
+            assert_eq!(resumed.sensor.as_deref(), Some("cluml"));
             probe.finish(&coordinator).await;
             drop(review);
             drop(handle);
@@ -3376,7 +3492,7 @@ mod policy_lifecycle {
             let (mut review, actor, path, _dir, handle) =
                 setup_request_client(None, &coordinator).await;
             review
-                .sampling_policy_list(&[new_policy(42)])
+                .time_series_generation_policy_list(&[new_policy(42)])
                 .await
                 .unwrap();
             let probe = PublishProbe::start(handle.clone(), coordinator.clone());
@@ -3386,12 +3502,18 @@ mod policy_lifecycle {
             connection.close(0u32.into(), b"simulate Giganto connection loss");
 
             // Execute the same Review request handler while Publish is disconnected.
-            timeout(TEST_TIMEOUT, review.delete_sampling_policy(&[42]))
-                .await
-                .unwrap()
-                .unwrap();
+            timeout(
+                TEST_TIMEOUT,
+                review.delete_time_series_generation_policy(&[42]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(!read_time_data_map(&path).contains_key("42"));
-            review.sampling_policy_list(&[new_policy(7)]).await.unwrap();
+            review
+                .time_series_generation_policy_list(&[new_policy(7)])
+                .await
+                .unwrap();
             assert_eq!(probe.next().await.1.id, "7");
             probe.finish(&coordinator).await;
             drop(review);
@@ -3418,7 +3540,7 @@ mod policy_lifecycle {
             let (mut review, actor, path, _dir, handle) =
                 setup_request_client(None, &coordinator).await;
             review
-                .sampling_policy_list(&[new_policy(42)])
+                .time_series_generation_policy_list(&[new_policy(42)])
                 .await
                 .unwrap();
             let state = handle.stream_policy(42).await.unwrap().unwrap();
@@ -3431,7 +3553,9 @@ mod policy_lifecycle {
                 publish_connect(&endpoint, addr, HOST, REQUIRED_GIGANTO_VERSION)
                     .await
                     .unwrap();
-            process_network_stream(&mut send, &state).await.unwrap();
+            process_network_stream(&mut send, &state, RequestStreamRecord::Conn)
+                .await
+                .unwrap();
             let mut recv = connection.accept_uni().await.unwrap();
             assert_eq!(
                 receive_time_series_generator_stream_start_message(&mut recv)
@@ -3459,12 +3583,15 @@ mod policy_lifecycle {
             assert!(!connection_token.is_cancelled());
             assert!(!coordinator.is_cancelled());
             assert!(connection.close_reason().is_none());
-            assert_eq!(receiver.recv().await.unwrap().sampling_policy_id, "42");
+            assert_eq!(receiver.recv().await.unwrap().time_series_id, "42");
             // Seed an acknowledged checkpoint after natural worker completion.
             handle.record_ack(42, 123).await.unwrap();
             let _ = handle.stream_policy(42).await.unwrap();
             assert_eq!(read_time_data_map(&path)["42"], 123);
-            review.delete_sampling_policy(&[42]).await.unwrap();
+            review
+                .delete_time_series_generation_policy(&[42])
+                .await
+                .unwrap();
             assert!(!read_time_data_map(&path).contains_key("42"));
             assert!(handle.get_policy(42).await.is_none());
             coordinator.request_cancellation("EOF deletion test complete");
@@ -3507,8 +3634,11 @@ mod policy_lifecycle {
         let coordinator = CancellationCoordinator::new();
         let (mut review, actor, _, _dir, handle) = setup_request_client(None, &coordinator).await;
         let mut policy = new_policy(42);
-        policy.node = Some("x".repeat(4 * 1024 * 1024));
-        review.sampling_policy_list(&[policy]).await.unwrap();
+        policy.sensors = vec!["x".repeat(4 * 1024 * 1024)];
+        review
+            .time_series_generation_policy_list(&[policy])
+            .await
+            .unwrap();
         let endpoint = client::config(&cert_key()).unwrap();
         let control_endpoint = endpoint.clone();
         let control_handle = handle.clone();
@@ -3531,10 +3661,13 @@ mod policy_lifecycle {
         timeout(TEST_TIMEOUT, observed).await.unwrap().unwrap();
         assert!(!control.is_finished());
         if delete_policy {
-            timeout(TEST_TIMEOUT, review.delete_sampling_policy(&[42]))
-                .await
-                .unwrap()
-                .unwrap();
+            timeout(
+                TEST_TIMEOUT,
+                review.delete_time_series_generation_policy(&[42]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         } else {
             coordinator.request_cancellation("cancel blocked Publish request");
         }
@@ -3586,7 +3719,9 @@ mod policy_lifecycle {
             .await;
             timeout(
                 TEST_TIMEOUT,
-                harness.request_client.delete_sampling_policy(&[42]),
+                harness
+                    .request_client
+                    .delete_time_series_generation_policy(&[42]),
             )
             .await
             .unwrap()

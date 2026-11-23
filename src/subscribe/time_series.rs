@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use review_protocol::types::SamplingPolicy;
+use review_protocol::types::{Measure, TimeSeriesGenerationPolicy};
 use serde::Serialize;
 use tracing::warn;
 
@@ -27,7 +27,10 @@ pub(super) const CLOSE_GRACE_SECS: i64 = SENSOR_BATCH_SECS + CLOSE_SKEW_SECS;
 #[cfg_attr(test, derive(serde::Deserialize))]
 #[derive(Default, Clone, Debug, Serialize)]
 pub(super) struct TimeSeries {
-    pub(super) sampling_policy_id: String,
+    /// The id Giganto stores the series under. The id of a time series, not of
+    /// this struct, so the shared prefix is the name it has everywhere else.
+    #[allow(clippy::struct_field_names)]
+    pub(super) time_series_id: String,
     #[serde(skip)]
     pub(super) start_secs: i64,
     pub(super) series: Vec<f64>,
@@ -40,10 +43,10 @@ pub(super) struct TimeSeries {
 /// is kept so that an event arriving after its window closed can still be
 /// counted there, and the window written again under the same key.
 pub(super) struct WindowBuilder {
-    policy: SamplingPolicy,
+    policy: TimeSeriesGenerationPolicy,
     policy_id: String,
-    interval_secs: i64,
-    period_secs: i64,
+    slot_size_secs: i64,
+    window_size_secs: i64,
     slots: usize,
     /// The stream's request start, in nanoseconds. Giganto replays the events
     /// from here, so an older event is not part of this stream's history.
@@ -61,34 +64,34 @@ impl WindowBuilder {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The policy's interval is zero.
-    /// - The policy's period is zero.
-    /// - The policy's period is not a multiple of the interval (i.e.,
-    ///   `period % interval != 0`).
-    /// - The policy's period is not a divisor of 1 day (86400 seconds).
+    /// - The policy's slot size is zero.
+    /// - The policy's window size is zero.
+    /// - The policy's window size is not a multiple of the slot size (i.e.,
+    ///   `window_size % slot_size != 0`).
+    /// - The policy's window size is not a divisor of 1 day (86400 seconds).
     /// - The series length overflows `usize`.
-    pub(super) fn try_new(policy: &SamplingPolicy, request_start: i64) -> Result<Self> {
-        let interval_secs = policy.interval.as_secs();
-        let period_secs = policy.period.as_secs();
-        if interval_secs == 0 {
-            bail!("interval must be greater than 0");
+    pub(super) fn try_new(policy: &TimeSeriesGenerationPolicy, request_start: i64) -> Result<Self> {
+        let slot_size_secs = policy.slot_size.as_secs();
+        let window_size_secs = policy.window_size.as_secs();
+        if slot_size_secs == 0 {
+            bail!("slot size must be greater than 0");
         }
-        if period_secs == 0 {
-            bail!("period must be greater than 0");
+        if window_size_secs == 0 {
+            bail!("window size must be greater than 0");
         }
-        if !86400_u64.is_multiple_of(period_secs) {
-            bail!("period must be a divisor of 1 day (86400 seconds)");
+        if !86400_u64.is_multiple_of(window_size_secs) {
+            bail!("window size must be a divisor of 1 day (86400 seconds)");
         }
-        if !period_secs.is_multiple_of(interval_secs) {
-            bail!("period must be a multiple of interval");
+        if !window_size_secs.is_multiple_of(slot_size_secs) {
+            bail!("window size must be a multiple of slot size");
         }
 
         Ok(Self {
             policy: policy.clone(),
             policy_id: policy.id.to_string(),
-            interval_secs: i64::try_from(interval_secs)?,
-            period_secs: i64::try_from(period_secs)?,
-            slots: usize::try_from(period_secs / interval_secs)?,
+            slot_size_secs: i64::try_from(slot_size_secs)?,
+            window_size_secs: i64::try_from(window_size_secs)?,
+            slots: usize::try_from(window_size_secs / slot_size_secs)?,
             request_start,
             open: None,
             last_closed: None,
@@ -106,7 +109,8 @@ impl WindowBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the event's window start or slot overflows.
+    /// Returns an error if the event's window start or slot overflows, or if
+    /// the policy sums a Conn field over an event of another kind.
     pub(super) fn add(&mut self, timestamp: i64, event: &Event) -> Result<Option<TimeSeries>> {
         let counted = self.accepts(event);
         if timestamp < self.request_start {
@@ -115,13 +119,13 @@ impl WindowBuilder {
         }
         let time_secs = timestamp.div_euclid(SECOND_TO_NANO);
         let window_start = start_time(&self.policy, time_secs)?;
-        let value = event_value(self.policy.column, event);
+        let value = event_value(self.policy.measure, event)?;
 
-        let interval_secs = self.interval_secs;
+        let slot_size_secs = self.slot_size_secs;
         match self.open.as_mut() {
             Some(open) if window_start == open.start_secs => {
                 if counted {
-                    count(open, interval_secs, time_secs, value)?;
+                    count(open, slot_size_secs, time_secs, value)?;
                 }
                 return Ok(None);
             }
@@ -144,7 +148,7 @@ impl WindowBuilder {
             if !counted {
                 return Ok(None);
             }
-            count(last, interval_secs, time_secs, value)?;
+            count(last, slot_size_secs, time_secs, value)?;
             return Ok(Some(last.clone()));
         }
         let newer_than_last = self
@@ -168,7 +172,7 @@ impl WindowBuilder {
     pub(super) fn close_if_due(&mut self, now_secs: i64) -> Option<TimeSeries> {
         let open_start = self.open.as_ref()?.start_secs;
         let due = open_start
-            .saturating_add(self.period_secs)
+            .saturating_add(self.window_size_secs)
             .saturating_add(CLOSE_GRACE_SECS);
         if now_secs < due {
             return None;
@@ -195,11 +199,11 @@ impl WindowBuilder {
     /// Opens the window starting at `start_secs` with its first event.
     fn open_window(&mut self, start_secs: i64, time_secs: i64, value: f64) -> Result<()> {
         let mut window = TimeSeries {
-            sampling_policy_id: self.policy_id.clone(),
+            time_series_id: self.policy_id.clone(),
             start_secs,
             series: vec![0_f64; self.slots],
         };
-        count(&mut window, self.interval_secs, time_secs, value)?;
+        count(&mut window, self.slot_size_secs, time_secs, value)?;
         self.open = Some(window);
         Ok(())
     }
@@ -221,8 +225,8 @@ impl WindowBuilder {
 }
 
 /// Adds `value` to the slot of `time_secs` in `window`.
-fn count(window: &mut TimeSeries, interval_secs: i64, time_secs: i64, value: f64) -> Result<()> {
-    let slot = slot(interval_secs, window.start_secs, time_secs)?;
+fn count(window: &mut TimeSeries, slot_size_secs: i64, time_secs: i64, value: f64) -> Result<()> {
+    let slot = slot(slot_size_secs, window.start_secs, time_secs)?;
     let Some(slot_value) = window.series.get_mut(slot) else {
         bail!("cannot access the time slot");
     };
@@ -231,37 +235,40 @@ fn count(window: &mut TimeSeries, interval_secs: i64, time_secs: i64, value: f64
 }
 
 /// Returns the slot of `time_secs` in the window starting at `window_start`.
-fn slot(interval_secs: i64, window_start: i64, time_secs: i64) -> Result<usize> {
+fn slot(slot_size_secs: i64, window_start: i64, time_secs: i64) -> Result<usize> {
     let elapsed = time_secs
         .checked_sub(window_start)
         .context("failed to calculate elapsed time")?;
-    Ok(usize::try_from(elapsed / interval_secs)?)
+    Ok(usize::try_from(elapsed / slot_size_secs)?)
 }
 
-fn event_value(sum_column: Option<u32>, event: &Event) -> f64 {
-    let Some(column) = sum_column else {
-        return 1_f64; // in order to increase the number of events
-    };
-    event.column_value(column)
+/// Returns what `event` adds to its slot under `measure`.
+fn event_value(measure: Measure, event: &Event) -> Result<f64> {
+    match measure {
+        Measure::Count => Ok(1_f64),
+        Measure::Sum(field) => event
+            .conn_field(field)
+            .with_context(|| format!("Sum({field:?}) is defined only on Conn events")),
+    }
 }
 
-fn start_time(policy: &SamplingPolicy, time_secs: i64) -> Result<i64> {
-    let offset_secs = i64::from(policy.offset);
+fn start_time(policy: &TimeSeriesGenerationPolicy, time_secs: i64) -> Result<i64> {
+    let offset_secs = i64::from(policy.utc_offset);
     let offset_time = time_secs
         .checked_add(offset_secs)
-        .context("failed to apply policy offset to timestamp")?;
+        .context("failed to apply policy UTC offset to timestamp")?;
 
     let seconds_of_day = offset_time.rem_euclid(SECONDS_PER_DAY);
     let timestamp_of_midnight = offset_time - seconds_of_day;
 
-    let period = i64::try_from(policy.period.as_secs())?;
-    let start_of_period = seconds_of_day - seconds_of_day.rem_euclid(period);
+    let window_size = i64::try_from(policy.window_size.as_secs())?;
+    let start_of_window = seconds_of_day - seconds_of_day.rem_euclid(window_size);
     let start_offset_time = timestamp_of_midnight
-        .checked_add(start_of_period)
-        .context("failed to calculate period start timestamp")?;
+        .checked_add(start_of_window)
+        .context("failed to calculate window start timestamp")?;
     let start_time = start_offset_time
         .checked_sub(offset_secs)
-        .context("failed to convert period start timestamp to UTC")?;
+        .context("failed to convert window start timestamp to UTC")?;
 
     Ok(start_time)
 }
@@ -276,7 +283,9 @@ fn start_time(policy: &SamplingPolicy, time_secs: i64) -> Result<i64> {
 mod tests {
     use std::time::Duration;
 
-    use review_protocol::types::{SamplingKind, SamplingPolicy};
+    use review_protocol::types::{
+        ConnField, CounterpartScope, GroupByUnit, HostNetworkGroup, Measure, RawEventKind,
+    };
     use time::{Date, Month};
 
     use super::*;
@@ -285,33 +294,46 @@ mod tests {
     const SECS_PER_HOUR: u64 = 3600;
     const SECS_PER_DAY: u64 = 86_400;
 
-    /// Helper to create a `SamplingPolicy` with specified parameters
+    /// Helper to create a `TimeSeriesGenerationPolicy` with specified parameters
     fn create_policy(
         id: u32,
-        period_secs: u64,
-        interval_secs: u64,
-        offset: i32,
-        column: Option<u32>,
-    ) -> SamplingPolicy {
-        SamplingPolicy {
+        window_size_secs: u64,
+        slot_size_secs: u64,
+        utc_offset: i32,
+        measure: Measure,
+    ) -> TimeSeriesGenerationPolicy {
+        TimeSeriesGenerationPolicy {
             id,
-            kind: SamplingKind::Conn,
-            interval: Duration::from_secs(interval_secs),
-            period: Duration::from_secs(period_secs),
-            offset,
+            raw_event_kind: RawEventKind::Conn,
+            measure,
+            group_by: None,
+            group_by_unit: GroupByUnit::Ip,
+            counterpart_scope: CounterpartScope::Any,
+            slot_size: Duration::from_secs(slot_size_secs),
+            window_size: Duration::from_secs(window_size_secs),
+            utc_offset,
             src_ip: None,
             dst_ip: None,
-            node: Some("test_node".to_string()),
-            column,
+            sensors: vec!["test_node".to_string()],
+            time_series_type: None,
+            internal_networks: HostNetworkGroup::default(),
         }
     }
 
-    fn create_simple_policy(interval_secs: u64, period_secs: u64) -> SamplingPolicy {
+    fn create_simple_policy(
+        slot_size_secs: u64,
+        window_size_secs: u64,
+    ) -> TimeSeriesGenerationPolicy {
         let id = 1;
-        let offset = 0;
-        let column = None;
+        let utc_offset = 0;
 
-        create_policy(id, period_secs, interval_secs, offset, column)
+        create_policy(
+            id,
+            window_size_secs,
+            slot_size_secs,
+            utc_offset,
+            Measure::Count,
+        )
     }
 
     /// Helper to create a Unix timestamp (seconds) from a specific UTC
@@ -365,9 +387,9 @@ mod tests {
     }
 
     /// Returns the slot of `time_secs` in its own window.
-    fn time_slot(policy: &SamplingPolicy, time_secs: i64) -> Result<usize> {
-        let interval = i64::try_from(policy.interval.as_secs())?;
-        slot(interval, start_time(policy, time_secs)?, time_secs)
+    fn time_slot(policy: &TimeSeriesGenerationPolicy, time_secs: i64) -> Result<usize> {
+        let slot_size = i64::try_from(policy.slot_size.as_secs())?;
+        slot(slot_size, start_time(policy, time_secs)?, time_secs)
     }
 
     // =========================================================================
@@ -375,10 +397,10 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_time_slot_basic_1day_period_15min_interval() {
-        // Period: 1 day (86400s), Interval: 15 min (900s) => 96 slots
+    fn test_time_slot_basic_1day_window_15min_slot() {
+        // Window: 1 day (86400s), Slot: 15 min (900s) => 96 slots
         // Offset: 0
-        let policy = create_policy(1, SECS_PER_DAY, 15 * SECS_PER_MINUTE, 0, None);
+        let policy = create_policy(1, SECS_PER_DAY, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
         // Before midnight => last slot (95)
         let before_midnight = datetime_from_utc("2024/1/14 23:59:59");
@@ -415,9 +437,9 @@ mod tests {
 
     #[test]
     fn test_time_slot_with_positive_offset() {
-        // Period: 1 day (86400s), Interval: 1 hour (3600s) => 24 slots
+        // Window: 1 day (86400s), Slot: 1 hour (3600s) => 24 slots
         // Offset: +9 hours (32400s) - KST adjustment
-        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
+        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, Measure::Count);
         let kst_midnight_utc = datetime_from_utc("2024/1/14 15:00:00");
 
         // KST midnight (UTC 15:00) => slot 0
@@ -434,9 +456,9 @@ mod tests {
 
     #[test]
     fn test_time_slot_with_negative_offset() {
-        // Period: 1 day (86400s), Interval: 1 hour (3600s) => 24 slots
+        // Window: 1 day (86400s), Slot: 1 hour (3600s) => 24 slots
         // Offset: -5 hours (-18000s) - shifts time backward
-        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, -18_000, None);
+        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, -18_000, Measure::Count);
 
         // At midnight UTC, with -5h offset, offset_time = 19:00 (prev day) => slot 19
         let midnight = datetime_from_utc("2024/1/15 00:00:00");
@@ -448,10 +470,10 @@ mod tests {
     }
 
     #[test]
-    fn test_time_slot_interval_equals_period() {
-        // Period: 1 hour (3600s), Interval: 1 hour (3600s) => 1 slot
+    fn test_time_slot_slot_equals_window() {
+        // Window: 1 hour (3600s), Slot: 1 hour (3600s) => 1 slot
         // All times within the period should map to slot 0
-        let policy = create_policy(1, SECS_PER_HOUR, SECS_PER_HOUR, 0, None);
+        let policy = create_policy(1, SECS_PER_HOUR, SECS_PER_HOUR, 0, Measure::Count);
 
         let midnight = datetime_from_utc("2024/1/15 00:00:00");
 
@@ -468,10 +490,10 @@ mod tests {
     }
 
     #[test]
-    fn test_time_slot_interval_1second() {
-        // Period: 1 minute (60s), Interval: 1 second (1s) => 60 slots
+    fn test_time_slot_slot_1second() {
+        // Window: 1 minute (60s), Slot: 1 second (1s) => 60 slots
         // Tests minimum interval
-        let policy = create_policy(1, SECS_PER_MINUTE, 1, 0, None);
+        let policy = create_policy(1, SECS_PER_MINUTE, 1, 0, Measure::Count);
 
         let midnight = datetime_from_utc("2024/1/15 00:00:00");
 
@@ -488,10 +510,10 @@ mod tests {
     }
 
     #[test]
-    fn test_time_slot_offset_equals_period_minus_one() {
-        // Period: 1 hour (3600s), Interval: 15 min (900s) => 4 slots
+    fn test_time_slot_offset_equals_window_minus_one() {
+        // Window: 1 hour (3600s), Slot: 15 min (900s) => 4 slots
         // Offset: period - 1 = 3599s
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 3599, None);
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 3599, Measure::Count);
 
         let midnight = datetime_from_utc("2024/1/15 00:00:00");
         // At midnight UTC, offset_time = 00:59:59 => slot 3 (59*60+59 = 3599s) / 900 = 3
@@ -500,10 +522,16 @@ mod tests {
     }
 
     #[test]
-    fn test_time_slot_offset_in_middle_of_period() {
-        // Period: 2 hours (7200s), Interval: 30 min (1800s) => 4 slots
+    fn test_time_slot_offset_in_middle_of_window() {
+        // Window: 2 hours (7200s), Slot: 30 min (1800s) => 4 slots
         // Offset: 1 hour (3600s) - middle of period
-        let policy = create_policy(1, 2 * SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 3600, None);
+        let policy = create_policy(
+            1,
+            2 * SECS_PER_HOUR,
+            30 * SECS_PER_MINUTE,
+            3600,
+            Measure::Count,
+        );
 
         let midnight = datetime_from_utc("2024/1/15 00:00:00");
         // At midnight UTC, offset_time = 01:00:00 => seconds_of_day = 3600
@@ -521,10 +549,10 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_start_time_aligns_to_period_boundary() {
-        // Period: 1 hour (3600s), Interval: 15 min (900s)
+    fn test_start_time_aligns_to_window_boundary() {
+        // Window: 1 hour (3600s), Slot: 15 min (900s)
         // Offset: 0
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
         let expected_results = [
             ("2024/1/14 23:59:59", "2024/1/14 23:00:00"),
@@ -555,9 +583,9 @@ mod tests {
 
     #[test]
     fn test_start_time_with_offset() {
-        // Period: 1 day (86400s), Interval: 1 hour (3600s)
+        // Window: 1 day (86400s), Slot: 1 hour (3600s)
         // Offset: +9 hours (32400s) - KST adjustment
-        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
+        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, Measure::Count);
 
         let kst_midnight_utc = datetime_from_utc("2024/1/14 15:00:00");
 
@@ -573,17 +601,16 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_event_value_none_column_returns_1() {
+    fn test_event_value_count_returns_1() {
         let conn = create_test_conn();
         let event = Event::Conn(conn);
 
-        // When column is None, should return 1.0 (count events)
-        let value = event_value(None, &event);
+        let value = event_value(Measure::Count, &event).unwrap();
         assert_eq!(value, 1.0);
     }
 
     #[test]
-    fn test_event_value_conn_columns() {
+    fn test_event_value_conn_sum_fields() {
         let conn = giganto_client::ingest::network::Conn {
             orig_addr: "192.168.1.1".parse().unwrap(),
             resp_addr: "192.168.1.2".parse().unwrap(),
@@ -603,27 +630,16 @@ mod tests {
         };
         let event = Event::Conn(conn);
 
-        // Column 5: duration
-        assert_eq!(event_value(Some(5), &event), 1_500_000_000.0);
-
-        // Column 7: orig_bytes
-        assert_eq!(event_value(Some(7), &event), 1000.0);
-
-        // Column 8: resp_bytes
-        assert_eq!(event_value(Some(8), &event), 2000.0);
-
-        // Column 9: orig_pkts
-        assert_eq!(event_value(Some(9), &event), 10.0);
-
-        // Column 10: resp_pkts
-        assert_eq!(event_value(Some(10), &event), 20.0);
-
-        // Unknown column should return 1.0
-        assert_eq!(event_value(Some(99), &event), 1.0);
+        let sum = |field| event_value(Measure::Sum(field), &event).unwrap();
+        assert_eq!(sum(ConnField::Duration), 1_500_000_000.0);
+        assert_eq!(sum(ConnField::OrigBytes), 1000.0);
+        assert_eq!(sum(ConnField::RespBytes), 2000.0);
+        assert_eq!(sum(ConnField::OrigPkts), 10.0);
+        assert_eq!(sum(ConnField::RespPkts), 20.0);
     }
 
     #[test]
-    fn test_event_value_dns_returns_1() {
+    fn test_event_value_dns_counts_1_and_has_no_sum() {
         let dns = giganto_client::ingest::network::Dns {
             orig_addr: "192.168.1.1".parse().unwrap(),
             orig_port: 54321,
@@ -651,9 +667,9 @@ mod tests {
         };
         let event = Event::Dns(dns);
 
-        // DNS events always return 1.0 regardless of column
-        assert_eq!(event_value(Some(5), &event), 1.0);
-        assert_eq!(event_value(Some(7), &event), 1.0);
+        assert_eq!(event_value(Measure::Count, &event).unwrap(), 1.0);
+        assert!(event_value(Measure::Sum(ConnField::Duration), &event).is_err());
+        assert!(event_value(Measure::Sum(ConnField::OrigBytes), &event).is_err());
     }
 
     /// Helper to create a test Conn event
@@ -677,7 +693,7 @@ mod tests {
         }
     }
 
-    /// Helper to create a Conn event with specific values for column aggregation tests
+    /// Helper to create a Conn event with specific values for `Sum` aggregation tests
     fn create_conn_with_values(
         duration: i64,
         orig_bytes: u64,
@@ -705,14 +721,14 @@ mod tests {
     }
 
     // =========================================================================
-    // Tests for WindowBuilder::add and column aggregation
+    // Tests for WindowBuilder::add and measure aggregation
     // =========================================================================
 
     #[test]
     fn test_add_single_event_counts_as_one() {
-        // Period: 1 hour, Interval: 15 min => 4 slots
-        // column: None => count events (each event adds 1.0)
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        // Window: 1 hour, Slot: 15 min => 4 slots
+        // measure: Count => count events (each event adds 1.0)
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
@@ -732,9 +748,9 @@ mod tests {
 
     #[test]
     fn test_add_multiple_events_same_slot_aggregates() {
-        // Period: 1 hour, Interval: 15 min => 4 slots
-        // column: None => count events
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        // Window: 1 hour, Slot: 15 min => 4 slots
+        // measure: Count => count events
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
@@ -758,8 +774,8 @@ mod tests {
 
     #[test]
     fn test_add_events_in_different_slots() {
-        // Period: 1 hour, Interval: 15 min => 4 slots
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        // Window: 1 hour, Slot: 15 min => 4 slots
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
@@ -798,10 +814,16 @@ mod tests {
     }
 
     #[test]
-    fn test_add_with_column_aggregation_duration() {
-        // Period: 1 hour, Interval: 15 min => 4 slots
-        // column: Some(5) => sum duration values
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(5));
+    fn test_add_with_sum_duration() {
+        // Window: 1 hour, Slot: 15 min => 4 slots
+        // measure: Sum(Duration) => sum duration values
+        let policy = create_policy(
+            1,
+            SECS_PER_HOUR,
+            15 * SECS_PER_MINUTE,
+            0,
+            Measure::Sum(ConnField::Duration),
+        );
 
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
@@ -832,10 +854,16 @@ mod tests {
     }
 
     #[test]
-    fn test_add_with_column_aggregation_bytes() {
-        // Period: 1 hour, Interval: 15 min => 4 slots
-        // column: Some(7) => sum orig_bytes values
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Some(7));
+    fn test_add_with_sum_orig_bytes() {
+        // Window: 1 hour, Slot: 15 min => 4 slots
+        // measure: Sum(OrigBytes) => sum orig_bytes values
+        let policy = create_policy(
+            1,
+            SECS_PER_HOUR,
+            15 * SECS_PER_MINUTE,
+            0,
+            Measure::Sum(ConnField::OrigBytes),
+        );
 
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
@@ -870,10 +898,16 @@ mod tests {
     }
 
     #[test]
-    fn test_add_with_column_aggregation_packets() {
-        // Period: 1 hour, Interval: 30 min => 2 slots
-        // column: Some(9) => sum orig_pkts values
-        let policy = create_policy(1, SECS_PER_HOUR, 30 * SECS_PER_MINUTE, 0, Some(9));
+    fn test_add_with_sum_orig_pkts() {
+        // Window: 1 hour, Slot: 30 min => 2 slots
+        // measure: Sum(OrigPkts) => sum orig_pkts values
+        let policy = create_policy(
+            1,
+            SECS_PER_HOUR,
+            30 * SECS_PER_MINUTE,
+            0,
+            Measure::Sum(ConnField::OrigPkts),
+        );
 
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
@@ -921,9 +955,9 @@ mod tests {
     }
 
     #[test]
-    fn test_add_period_boundary_sends_and_resets() {
-        // Period: 1 hour, Interval: 15 min => 4 slots
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+    fn test_add_window_boundary_sends_and_resets() {
+        // Window: 1 hour, Slot: 15 min => 4 slots
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         // Add an event in the first period (slot 0)
@@ -951,9 +985,15 @@ mod tests {
 
     #[test]
     fn test_add_kst_offset_events_aggregate_same_slot() {
-        // Period: 1 day, Interval: 15 min => 96 slots
+        // Window: 1 day, Slot: 15 min => 96 slots
         // Offset: +9 hours (KST)
-        let policy = create_policy(1, SECS_PER_DAY, 15 * SECS_PER_MINUTE, 32_400, None);
+        let policy = create_policy(
+            1,
+            SECS_PER_DAY,
+            15 * SECS_PER_MINUTE,
+            32_400,
+            Measure::Count,
+        );
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
         for event_time in [
@@ -973,9 +1013,9 @@ mod tests {
 
     #[test]
     fn test_add_with_offset_affects_slot_calculation() {
-        // Period: 1 day, Interval: 1 hour => 24 slots
+        // Window: 1 day, Slot: 1 hour => 24 slots
         // Offset: +9 hours (32400s) - KST adjustment
-        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, None);
+        let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, Measure::Count);
 
         let kst_midnight_utc = datetime_from_utc("2024/1/14 15:00:00");
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
@@ -1001,8 +1041,8 @@ mod tests {
 
     #[test]
     fn test_add_missing_slots_remain_zero() {
-        // Period: 1 hour, Interval: 10 min => 6 slots
-        let policy = create_policy(1, SECS_PER_HOUR, 10 * SECS_PER_MINUTE, 0, None);
+        // Window: 1 hour, Slot: 10 min => 6 slots
+        let policy = create_policy(1, SECS_PER_HOUR, 10 * SECS_PER_MINUTE, 0, Measure::Count);
 
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
@@ -1031,8 +1071,8 @@ mod tests {
 
     #[test]
     fn test_add_duplicate_timestamps_aggregate() {
-        // Period: 1 hour, Interval: 15 min => 4 slots
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        // Window: 1 hour, Slot: 15 min => 4 slots
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
@@ -1064,8 +1104,8 @@ mod tests {
     }
 
     #[test]
-    fn try_new_valid_period_interval() {
-        // period (3600) is a multiple of interval (60)
+    fn try_new_valid_window_and_slot_sizes() {
+        // window size (3600) is a multiple of slot size (60)
         let policy = create_simple_policy(60, 3600);
         let result = WindowBuilder::try_new(&policy, 0);
         assert!(result.is_ok());
@@ -1074,49 +1114,49 @@ mod tests {
     }
 
     #[test]
-    fn try_new_invalid_period_not_divisor_of_1_day() {
-        // period (777) is not a divisor of 1 day (86400 seconds)
+    fn try_new_invalid_window_not_divisor_of_1_day() {
+        // window size (777) is not a divisor of 1 day (86400 seconds)
         let policy = create_simple_policy(7, 777);
         let result = WindowBuilder::try_new(&policy, 0);
         let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
-            err_msg.contains("period must be a divisor of 1 day (86400 seconds)"),
+            err_msg.contains("window size must be a divisor of 1 day (86400 seconds)"),
             "unexpected error message: {err_msg}"
         );
     }
 
     #[test]
-    fn try_new_invalid_period_not_multiple_of_interval() {
-        // period (100) is not a multiple of interval (30)
+    fn try_new_invalid_window_not_multiple_of_slot() {
+        // window size (100) is not a multiple of slot size (30)
         let policy = create_simple_policy(30, 100);
         let result = WindowBuilder::try_new(&policy, 0);
         let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
-            err_msg.contains("period must be a multiple of interval"),
+            err_msg.contains("window size must be a multiple of slot size"),
             "unexpected error message: {err_msg}"
         );
     }
 
     #[test]
-    fn try_new_interval_zero() {
-        // interval is 0, should error before division
+    fn try_new_slot_size_zero() {
+        // slot size is 0, should error before division
         let policy = create_simple_policy(0, 3600);
         let result = WindowBuilder::try_new(&policy, 0);
         let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
-            err_msg.contains("interval must be greater than 0"),
+            err_msg.contains("slot size must be greater than 0"),
             "unexpected error message: {err_msg}"
         );
     }
 
     #[test]
-    fn try_new_period_zero() {
-        // period is 0, should error
+    fn try_new_window_size_zero() {
+        // window size is 0, should error
         let policy = create_simple_policy(60, 0);
         let result = WindowBuilder::try_new(&policy, 0);
         let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
-            err_msg.contains("period must be greater than 0"),
+            err_msg.contains("window size must be greater than 0"),
             "unexpected error message: {err_msg}"
         );
     }
@@ -1153,13 +1193,19 @@ mod tests {
 
     #[test]
     fn first_event_opens_its_window_and_the_first_close_writes_it() {
-        // Period: 1 hour, Interval: 15 min. No checkpoint: the request starts at 0.
+        // Window: 1 hour, Slot: 15 min. No checkpoint: the request starts at 0.
         for (offset, window_start, next_event) in [
             (0, "2024/1/15 05:00:00", "2024/1/15 06:10:00"),
             // With offset 13200 (3h40m) an hourly window starts at hh:20.
             (13_200, "2024/1/15 05:20:00", "2024/1/15 06:25:00"),
         ] {
-            let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, offset, None);
+            let policy = create_policy(
+                1,
+                SECS_PER_HOUR,
+                15 * SECS_PER_MINUTE,
+                offset,
+                Measure::Count,
+            );
             let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
             assert!(add_at(&mut builder, "2024/1/15 05:40:00").is_none());
@@ -1176,7 +1222,7 @@ mod tests {
     fn resume_rewrites_the_last_window_and_writes_no_zero_row() {
         // The checkpoint is the start of the last written window, 05:00. The
         // window after it, 06:00, had no events.
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         let checkpoint = datetime_from_utc("2024/1/15 05:00:00");
         let mut builder = WindowBuilder::try_new(&policy, nanos(checkpoint)).unwrap();
 
@@ -1201,7 +1247,7 @@ mod tests {
 
     #[test]
     fn late_event_for_the_last_closed_window_rewrites_it() {
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
         add_at(&mut builder, "2024/1/15 00:05:00");
         let first = add_at(&mut builder, "2024/1/15 01:05:00").expect("00:00 is written");
@@ -1222,7 +1268,7 @@ mod tests {
 
     #[test]
     fn event_older_than_the_last_closed_window_is_dropped_and_counted() {
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
         add_at(&mut builder, "2024/1/15 00:05:00");
         add_at(&mut builder, "2024/1/15 01:05:00").expect("00:00 is written");
@@ -1245,7 +1291,7 @@ mod tests {
 
     #[test]
     fn event_before_the_request_start_is_dropped_and_opens_no_window() {
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         let request_start = nanos(datetime_from_utc("2024/1/15 05:00:00"));
         let mut builder = WindowBuilder::try_new(&policy, request_start).unwrap();
 
@@ -1264,7 +1310,7 @@ mod tests {
 
     #[test]
     fn timer_closes_the_open_window_after_its_grace() {
-        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
         add_at(&mut builder, "2024/1/15 00:05:00");
         let end = datetime_from_utc("2024/1/15 01:00:00");
@@ -1286,7 +1332,7 @@ mod tests {
 
     #[test]
     fn filter_rejected_event_closes_but_neither_opens_nor_counts() {
-        let mut policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, None);
+        let mut policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         policy.src_ip = Some("10.0.0.1".parse().unwrap());
         let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
         let accepted = conn_between("10.0.0.1", "10.0.0.9");
@@ -1391,9 +1437,14 @@ mod tests {
 
         #[test]
         fn time_slot_at_unix_epoch_is_zero() {
-            // Period: 1 day, Interval: 1 hour => 24 slots, offset 0.
-            let policy =
-                create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
+            // Window: 1 day, Slot: 1 hour => 24 slots, offset 0.
+            let policy = create_policy(
+                TEST_POLICY_ID,
+                SECS_PER_DAY,
+                SECS_PER_HOUR,
+                NO_OFFSET,
+                Measure::Count,
+            );
             assert_eq!(time_slot(&policy, TS_EPOCH).unwrap(), 0,);
             // 1 second past epoch is still slot 0.
             assert_eq!(time_slot(&policy, TS_EPOCH_PLUS_ONE).unwrap(), 0,);
@@ -1402,11 +1453,16 @@ mod tests {
         #[test]
         fn time_slot_for_known_rfc3339_midrange() {
             // 2023-11-14T22:13:20Z is 1_700_000_000s after the epoch.
-            // With period=86400 (1 day), interval=3600 (1 hour), the expected slot is computed
+            // With window_size=86400 (1 day), slot_size=3600 (1 hour), the expected slot is computed
             // as a literal: 1_700_000_000 % 86400 = 80_000s of day, and
             // 80_000 / 3600 = 22 (integer division).
-            let policy =
-                create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
+            let policy = create_policy(
+                TEST_POLICY_ID,
+                SECS_PER_DAY,
+                SECS_PER_HOUR,
+                NO_OFFSET,
+                Measure::Count,
+            );
             assert_eq!(time_slot(&policy, TS_2023_11_14_221320Z).unwrap(), 22,);
         }
 
@@ -1415,23 +1471,39 @@ mod tests {
             // 9999-12-31T23:59:59Z = 253_402_300_799 seconds.
             // 253_402_300_799 % 86400 = 86_399 (last second of the day),
             // 86_399 / 3600 = 23 => last hour-slot.
-            let policy =
-                create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
+            let policy = create_policy(
+                TEST_POLICY_ID,
+                SECS_PER_DAY,
+                SECS_PER_HOUR,
+                NO_OFFSET,
+                Measure::Count,
+            );
             assert_eq!(time_slot(&policy, TS_9999_12_31_235959Z).unwrap(), 23,);
         }
 
         #[test]
         fn time_slot_negative_timestamp_aligns_to_last_hour_slot() {
-            // -1s is 1969-12-31T23:59:59Z. With period=86400 (1 day) and interval=3600 (1 hour),
+            // -1s is 1969-12-31T23:59:59Z. With window_size=86400 (1 day) and slot_size=3600 (1 hour),
             // that lands in slot 23 (last hour of the day).
-            let policy =
-                create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
+            let policy = create_policy(
+                TEST_POLICY_ID,
+                SECS_PER_DAY,
+                SECS_PER_HOUR,
+                NO_OFFSET,
+                Measure::Count,
+            );
             assert_eq!(time_slot(&policy, TS_EPOCH_MINUS_ONE).unwrap(), 23,);
         }
 
         #[test]
         fn pre_epoch_offsets_result_in_negative_unix_timestamp() {
-            let policy = create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, -2, None);
+            let policy = create_policy(
+                TEST_POLICY_ID,
+                SECS_PER_DAY,
+                SECS_PER_HOUR,
+                -2,
+                Measure::Count,
+            );
 
             let aligned =
                 start_time(&policy, TS_EPOCH_PLUS_ONE).expect("start_time should succeed");
@@ -1447,14 +1519,14 @@ mod tests {
 
         #[test]
         fn start_time_negative_timestamp_aligns_to_negative_3600() {
-            // -1s sits in the period [-3600, 0). With period=1h and offset=0
+            // -1s sits in the period [-3600, 0). With window_size=1h and offset=0
             // start_time must align to -3600
             let policy = create_policy(
                 TEST_POLICY_ID,
                 SECS_PER_HOUR,
                 SECS_PER_MINUTE,
                 NO_OFFSET,
-                None,
+                Measure::Count,
             );
             let aligned =
                 start_time(&policy, TS_EPOCH_MINUS_ONE).expect("start_time should succeed");
@@ -1465,8 +1537,13 @@ mod tests {
         fn midnight_rollover_kst_consistency() {
             // `time_slot` uses `period` as the modulo window. Use a day-sized period
             // to expose hour-of-day slots: 0..=23.
-            let slot_policy =
-                create_policy(TEST_POLICY_ID, SECS_PER_DAY, SECS_PER_HOUR, NO_OFFSET, None);
+            let slot_policy = create_policy(
+                TEST_POLICY_ID,
+                SECS_PER_DAY,
+                SECS_PER_HOUR,
+                NO_OFFSET,
+                Measure::Count,
+            );
 
             // `start_time` aligns to `period` boundaries. Use an hour-sized period
             // to pin the start of the current hour.
@@ -1475,7 +1552,7 @@ mod tests {
                 SECS_PER_HOUR,
                 SECS_PER_HOUR,
                 NO_OFFSET,
-                None,
+                Measure::Count,
             );
 
             // Choose an instant near the UTC day boundary: 23:30:00 UTC.
@@ -1523,7 +1600,7 @@ mod tests {
         }
 
         #[test]
-        fn event_at_exact_period_end_opens_the_next_window() {
+        fn event_at_exact_window_end_opens_the_next_window() {
             // Windows are [start, start + period). An event at exactly
             // start + period belongs to the next window, so it writes the
             // current one and opens the next.
@@ -1532,7 +1609,7 @@ mod tests {
                 SECS_PER_HOUR,
                 15 * SECS_PER_MINUTE,
                 NO_OFFSET,
-                None,
+                Measure::Count,
             );
             let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
 
@@ -1556,12 +1633,12 @@ mod tests {
             // must be byte-identical for two TimeSeries that differ only in
             // their start time.
             let series_a = TimeSeries {
-                sampling_policy_id: "42".to_string(),
+                time_series_id: "42".to_string(),
                 start_secs: TS_EPOCH,
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
             let series_b = TimeSeries {
-                sampling_policy_id: "42".to_string(),
+                time_series_id: "42".to_string(),
                 start_secs: TS_9999_12_31_235959Z,
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
@@ -1581,13 +1658,13 @@ mod tests {
             // `start_secs` field is skipped on the wire and is not part of the
             // external contract.
             let original = TimeSeries {
-                sampling_policy_id: "policy-1".to_string(),
+                time_series_id: "policy-1".to_string(),
                 start_secs: TS_2023_11_14_221320Z,
                 series: vec![0.0, 1.5, -2.25, 3.125],
             };
             let bytes = bincode::serialize(&original).expect("bincode serialize");
             let decoded: TimeSeries = bincode::deserialize(&bytes).expect("bincode deserialize");
-            assert_eq!(decoded.sampling_policy_id, "policy-1");
+            assert_eq!(decoded.time_series_id, "policy-1");
             assert_eq!(decoded.series, vec![0.0, 1.5, -2.25, 3.125]);
             assert_eq!(decoded.start_secs, i64::default());
         }

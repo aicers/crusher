@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use review_protocol::types::SamplingPolicy;
+use review_protocol::types::{CounterpartScope, TimeSeriesGenerationPolicy};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
@@ -20,7 +20,7 @@ const POLICY_COMMAND_CHANNEL_SIZE: usize = 32;
 
 enum PolicyCommand {
     ReplacePolicies {
-        policies: Vec<SamplingPolicy>,
+        policies: Vec<TimeSeriesGenerationPolicy>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     DeletePolicies {
@@ -38,14 +38,14 @@ enum PolicyCommand {
 }
 
 struct PolicyEntry {
-    policy: SamplingPolicy,
+    policy: TimeSeriesGenerationPolicy,
     token: CancellationToken,
 }
 
 /// A consistent view of the policy, its cancellation signal and resume position.
 #[derive(Clone)]
 pub(crate) struct StreamPolicy {
-    pub(crate) policy: SamplingPolicy,
+    pub(crate) policy: TimeSeriesGenerationPolicy,
     pub(crate) token: CancellationToken,
     pub(crate) start: i64,
 }
@@ -63,7 +63,7 @@ impl PolicyHandle {
     /// removed for changed content was persisted.
     pub(crate) async fn replace_policies(
         &self,
-        policies: Vec<SamplingPolicy>,
+        policies: Vec<TimeSeriesGenerationPolicy>,
     ) -> Result<(), String> {
         let (reply, received) = oneshot::channel();
         self.tx
@@ -108,7 +108,7 @@ impl PolicyHandle {
     pub(crate) async fn get_policy_with_token(
         &self,
         id: u32,
-    ) -> Option<(SamplingPolicy, CancellationToken)> {
+    ) -> Option<(TimeSeriesGenerationPolicy, CancellationToken)> {
         self.stream_policy(id)
             .await
             .ok()
@@ -124,7 +124,7 @@ impl PolicyHandle {
     }
 
     #[cfg(test)]
-    pub(crate) async fn get_policy(&self, id: u32) -> Option<SamplingPolicy> {
+    pub(crate) async fn get_policy(&self, id: u32) -> Option<TimeSeriesGenerationPolicy> {
         self.get_policy_with_token(id)
             .await
             .map(|(policy, _)| policy)
@@ -249,12 +249,16 @@ struct ReplaceOutcome {
 fn replace_policies(
     active: &mut HashMap<u32, PolicyEntry>,
     timestamps: &mut HashMap<String, i64>,
-    policies: Vec<SamplingPolicy>,
+    policies: Vec<TimeSeriesGenerationPolicy>,
 ) -> ReplaceOutcome {
-    let mut received: HashMap<u32, SamplingPolicy> = HashMap::with_capacity(policies.len());
+    let mut received: HashMap<u32, TimeSeriesGenerationPolicy> =
+        HashMap::with_capacity(policies.len());
     for policy in policies {
-        if policy.node.is_none() {
-            warn!("Skipping sampling policy {} without a sensor", policy.id);
+        if let Some(reason) = skip_reason(&policy) {
+            warn!(
+                "Skipping time-series generation policy {}: {reason}",
+                policy.id
+            );
             continue;
         }
         match received.entry(policy.id) {
@@ -264,7 +268,8 @@ fn replace_policies(
             Entry::Occupied(entry) => {
                 if !same_content(entry.get(), &policy) {
                     warn!(
-                        "Ignoring a second, different sampling policy {} in one list",
+                        "Ignoring a second, different time-series generation policy {} in \
+                         one list",
                         policy.id
                     );
                 }
@@ -280,7 +285,7 @@ fn replace_policies(
         if received.contains_key(id) {
             return true;
         }
-        info!("Stopping sampling policy {id}, which is no longer assigned");
+        info!("Stopping time-series generation policy {id}, which is no longer assigned");
         entry.token.cancel();
         outcome.changed = true;
         false
@@ -298,7 +303,10 @@ fn replace_policies(
                 if same_content(&entry.get().policy, &policy) {
                     continue;
                 }
-                warn!("Sampling policy {id} changed; restarting it without its checkpoint");
+                warn!(
+                    "Time-series generation policy {id} changed; restarting it without its \
+                     checkpoint"
+                );
                 entry.get().token.cancel();
                 entry.insert(PolicyEntry {
                     policy,
@@ -314,17 +322,52 @@ fn replace_policies(
     outcome
 }
 
-/// Compares every field that shapes a policy's series. `SamplingPolicy` has no
-/// `PartialEq`, and the comparison is Crusher's to define.
-fn same_content(a: &SamplingPolicy, b: &SamplingPolicy) -> bool {
-    a.kind == b.kind
-        && a.interval == b.interval
-        && a.period == b.period
-        && a.offset == b.offset
-        && a.column == b.column
+/// Returns why the policy cannot be run, or `None` if it can.
+///
+/// Only an ungrouped policy over one sensor and every counterpart is generated
+/// yet, and only of a network kind with a measure defined on it. Any other
+/// policy is treated as absent from the list: it is not started, a running one
+/// is stopped, and its checkpoint is kept.
+fn skip_reason(policy: &TimeSeriesGenerationPolicy) -> Option<String> {
+    if let Some(role) = policy.group_by {
+        return Some(format!("grouping by {role:?} is not supported yet"));
+    }
+    match policy.sensors.len() {
+        0 => return Some("no sensor is assigned".to_string()),
+        1 => {}
+        n => {
+            return Some(format!(
+                "{n} sensors are assigned; only one is supported yet"
+            ));
+        }
+    }
+    if policy.counterpart_scope != CounterpartScope::Any {
+        return Some(format!(
+            "counterpart scope {:?} is not supported yet",
+            policy.counterpart_scope
+        ));
+    }
+    crate::subscribe::check_generation_spec(policy)
+        .err()
+        .map(|e| format!("{e:#}"))
+}
+
+/// Compares every field of the generation spec, which shapes a policy's
+/// series. `internal_networks` is not part of the spec, so a change to it alone
+/// keeps the running policy and its checkpoint.
+fn same_content(a: &TimeSeriesGenerationPolicy, b: &TimeSeriesGenerationPolicy) -> bool {
+    a.raw_event_kind == b.raw_event_kind
+        && a.measure == b.measure
+        && a.group_by == b.group_by
+        && a.group_by_unit == b.group_by_unit
+        && a.counterpart_scope == b.counterpart_scope
+        && a.slot_size == b.slot_size
+        && a.window_size == b.window_size
+        && a.utc_offset == b.utc_offset
         && a.src_ip == b.src_ip
         && a.dst_ip == b.dst_ip
-        && a.node == b.node
+        && a.sensors == b.sensors
+        && a.time_series_type == b.time_series_type
 }
 
 /// Returns where a policy's stream resumes: the start of its last written
@@ -355,9 +398,13 @@ fn record_ack(timestamps: &mut HashMap<String, i64>, id: u32, timestamp: i64) ->
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use review_protocol::types::SamplingKind;
+    use review_protocol::types::{
+        ConnField, EndpointRole, GroupByUnit, HostNetworkGroup, Measure, RawEventKind,
+        TimeSeriesTypeRef,
+    };
     use tempfile::TempDir;
     use tokio::time::timeout;
 
@@ -382,17 +429,80 @@ mod tests {
         }
     }
 
-    fn policy(id: u32) -> SamplingPolicy {
-        SamplingPolicy {
+    fn policy(id: u32) -> TimeSeriesGenerationPolicy {
+        TimeSeriesGenerationPolicy {
             id,
-            kind: SamplingKind::Conn,
-            interval: Duration::from_secs(60),
-            period: Duration::from_secs(3600),
-            offset: 0,
+            raw_event_kind: RawEventKind::Conn,
+            measure: Measure::Count,
+            group_by: None,
+            group_by_unit: GroupByUnit::Ip,
+            counterpart_scope: CounterpartScope::Any,
+            slot_size: Duration::from_secs(60),
+            window_size: Duration::from_secs(3600),
+            utc_offset: 0,
             src_ip: None,
             dst_ip: None,
-            node: Some("test".into()),
-            column: None,
+            sensors: vec!["test".into()],
+            time_series_type: None,
+            internal_networks: HostNetworkGroup::default(),
+        }
+    }
+
+    type Change = (&'static str, fn(&mut TimeSeriesGenerationPolicy));
+
+    /// Changes that make a policy one this generator does not run.
+    const UNSUPPORTED: [Change; 8] = [
+        ("group_by", |p| p.group_by = Some(EndpointRole::Source)),
+        ("two sensors", |p| p.sensors.push("other".into())),
+        ("internal scope", |p| {
+            p.counterpart_scope = CounterpartScope::Internal;
+        }),
+        ("external scope", |p| {
+            p.counterpart_scope = CounterpartScope::External;
+        }),
+        ("no sensor", |p| p.sensors.clear()),
+        ("process create", |p| {
+            p.raw_event_kind = RawEventKind::ProcessCreate;
+        }),
+        ("netflow5", |p| p.raw_event_kind = RawEventKind::Netflow5),
+        ("sum on dns", |p| {
+            p.raw_event_kind = RawEventKind::Dns;
+            p.measure = Measure::Sum(ConnField::OrigBytes);
+        }),
+    ];
+
+    /// Collects formatted log lines for a test that runs synchronously under
+    /// [`tracing::subscriber::with_default`].
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, f)
+        }
+
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect()
         }
     }
 
@@ -529,16 +639,29 @@ mod tests {
 
     #[tokio::test]
     async fn changed_content_restarts_policy_without_its_checkpoint() {
-        type Change = (&'static str, fn(&mut SamplingPolicy));
-        let changes: [Change; 8] = [
-            ("kind", |p| p.kind = SamplingKind::Dns),
-            ("interval", |p| p.interval = Duration::from_secs(30)),
-            ("period", |p| p.period = Duration::from_hours(24)),
-            ("offset", |p| p.offset = 32_400),
-            ("column", |p| p.column = Some(3)),
+        // Every spec field whose change leaves the policy runnable. `group_by`
+        // and `counterpart_scope` have no other runnable value; changing them
+        // skips the policy, as `change_to_unsupported_policy_*` tests.
+        let changes: [Change; 10] = [
+            ("raw_event_kind", |p| p.raw_event_kind = RawEventKind::Dns),
+            ("measure", |p| {
+                p.measure = Measure::Sum(ConnField::OrigBytes);
+            }),
+            ("group_by_unit", |p| {
+                p.group_by_unit = GroupByUnit::OwnedNetwork;
+            }),
+            ("slot_size", |p| p.slot_size = Duration::from_secs(30)),
+            ("window_size", |p| p.window_size = Duration::from_hours(24)),
+            ("utc_offset", |p| p.utc_offset = 32_400),
             ("src_ip", |p| p.src_ip = Some("10.0.0.1".parse().unwrap())),
             ("dst_ip", |p| p.dst_ip = Some("10.0.0.2".parse().unwrap())),
-            ("node", |p| p.node = Some("other".into())),
+            ("sensors", |p| p.sensors = vec!["other".into()]),
+            ("time_series_type", |p| {
+                p.time_series_type = Some(TimeSeriesTypeRef {
+                    id: "conn_count".into(),
+                    version: 1,
+                });
+            }),
         ];
         run_test(async {
             for (field, change) in changes {
@@ -597,25 +720,151 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_less_policy_is_skipped() {
+    async fn internal_networks_change_keeps_policy_and_checkpoint() {
         run_test(async {
             let h = Harness::new(r#"{"42":100}"#).await;
-            let mut node_less = policy(42);
-            node_less.node = None;
-            h.handle
-                .replace_policies(vec![node_less.clone(), policy(7)])
-                .await
-                .unwrap();
-            assert_eq!(h.handle.get_all_policy_ids(), [7]);
-            // A running policy that arrives without a node is absent from the
-            // list, so it stops and keeps its checkpoint.
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             let token = h.handle.get_policy_token(42).await.unwrap();
-            h.handle.replace_policies(vec![node_less]).await.unwrap();
-            assert!(token.is_cancelled());
-            assert_eq!(h.handle.get_all_policy_ids(), [] as [u32; 0]);
+            let mut snapshot = h.handle.subscribe();
+            snapshot.borrow_and_update();
+            let mut changed = policy(42);
+            changed.internal_networks = HostNetworkGroup {
+                hosts: vec!["10.0.0.1".parse().unwrap()],
+                networks: vec!["192.168.0.0/16".parse().unwrap()],
+                ip_ranges: Vec::new(),
+            };
+            h.handle.replace_policies(vec![changed]).await.unwrap();
+            assert!(!snapshot.has_changed().unwrap());
+            assert!(!token.is_cancelled());
             assert_eq!(h.saved(), HashMap::from([("42".into(), 100)]));
+            assert_eq!(
+                h.handle.stream_policy(42).await.unwrap().unwrap().start,
+                100
+            );
             h.finish().await;
+        })
+        .await;
+    }
+
+    #[test]
+    fn unsupported_policy_is_skipped_with_a_warning_naming_it() {
+        for (what, change) in UNSUPPORTED {
+            let mut unsupported = policy(42);
+            change(&mut unsupported);
+            let mut active = HashMap::new();
+            let mut timestamps = HashMap::new();
+            let logs = LogCapture::default();
+            let outcome = logs.run(|| {
+                replace_policies(
+                    &mut active,
+                    &mut timestamps,
+                    vec![unsupported.clone(), policy(7)],
+                )
+            });
+            assert!(outcome.changed, "{what}: the runnable policy starts");
+            let mut ids: Vec<u32> = active.keys().copied().collect();
+            ids.sort_unstable();
+            assert_eq!(ids, [7], "{what}: only the runnable policy runs");
+            let warnings: Vec<String> = logs
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains("WARN"))
+                .collect();
+            assert_eq!(warnings.len(), 1, "{what}: {warnings:?}");
+            assert!(
+                warnings[0].contains("Skipping time-series generation policy 42:"),
+                "{what}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_reasons_name_the_unsupported_setting() {
+        let reasons: Vec<String> = UNSUPPORTED
+            .iter()
+            .map(|(_, change)| {
+                let mut p = policy(42);
+                change(&mut p);
+                skip_reason(&p).expect("unsupported policy has a reason")
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "grouping by Source is not supported yet",
+                "2 sensors are assigned; only one is supported yet",
+                "counterpart scope Internal is not supported yet",
+                "counterpart scope External is not supported yet",
+                "no sensor is assigned",
+                "ProcessCreate is not a network raw event kind",
+                "Netflow5 is not a network raw event kind",
+                "Sum(OrigBytes) is defined only on Conn, not on Dns",
+            ]
+        );
+        assert_eq!(skip_reason(&policy(42)), None);
+    }
+
+    #[tokio::test]
+    async fn unsupported_policy_writes_nothing_and_is_skipped() {
+        run_test(async {
+            for (what, change) in UNSUPPORTED {
+                let h = Harness::new(r#"{"42":100}"#).await;
+                let mut unsupported = policy(42);
+                change(&mut unsupported);
+                h.handle
+                    .replace_policies(vec![unsupported, policy(7)])
+                    .await
+                    .unwrap();
+                assert_eq!(h.handle.get_all_policy_ids(), [7], "{what}");
+                assert!(
+                    h.handle.stream_policy(42).await.unwrap().is_none(),
+                    "{what}"
+                );
+                assert!(h.handle.stream_policy(7).await.unwrap().is_some(), "{what}");
+                assert_eq!(h.saved(), HashMap::from([("42".into(), 100)]), "{what}");
+                h.finish().await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn change_to_unsupported_policy_stops_it_and_keeps_its_checkpoint() {
+        run_test(async {
+            for (what, change) in UNSUPPORTED {
+                let h = Harness::new(r#"{"42":100,"7":200}"#).await;
+                h.handle
+                    .replace_policies(vec![policy(42), policy(7)])
+                    .await
+                    .unwrap();
+                let token = h.handle.get_policy_token(42).await.unwrap();
+                let kept = h.handle.get_policy_token(7).await.unwrap();
+                let mut unsupported = policy(42);
+                change(&mut unsupported);
+                h.handle
+                    .replace_policies(vec![unsupported, policy(7)])
+                    .await
+                    .unwrap();
+                assert!(token.is_cancelled(), "{what}: stopped");
+                assert!(!kept.is_cancelled(), "{what}: other policy runs on");
+                assert_eq!(h.handle.get_all_policy_ids(), [7], "{what}");
+                assert_eq!(
+                    h.saved(),
+                    HashMap::from([("42".into(), 100), ("7".into(), 200)]),
+                    "{what}: checkpoint kept"
+                );
+                // Changed back, the policy resumes from its kept checkpoint.
+                h.handle
+                    .replace_policies(vec![policy(42), policy(7)])
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    h.handle.stream_policy(42).await.unwrap().unwrap().start,
+                    100,
+                    "{what}: resumes"
+                );
+                h.finish().await;
+            }
         })
         .await;
     }
@@ -625,16 +874,13 @@ mod tests {
         run_test(async {
             let h = Harness::new("{}").await;
             let mut second = policy(42);
-            second.node = Some("second".into());
+            second.sensors = vec!["second".into()];
             h.handle
                 .replace_policies(vec![policy(42), second])
                 .await
                 .unwrap();
             assert_eq!(h.handle.get_all_policy_ids(), [42]);
-            assert_eq!(
-                h.handle.get_policy(42).await.unwrap().node.as_deref(),
-                Some("test")
-            );
+            assert_eq!(h.handle.get_policy(42).await.unwrap().sensors, ["test"]);
             h.finish().await;
         })
         .await;
@@ -719,7 +965,7 @@ mod tests {
             let old = h.handle.get_policy_token(42).await.unwrap();
             h.handle.delete_policies(vec![42]).await.unwrap();
             let mut replacement = policy(42);
-            replacement.node = Some("replacement".into());
+            replacement.sensors = vec!["replacement".into()];
             h.handle.replace_policies(vec![replacement]).await.unwrap();
             // The final ID list is unchanged, but Publish must still observe the update
             // and use the actor's new policy and token after the completed deletion.
@@ -727,7 +973,7 @@ mod tests {
             assert_eq!(*snapshot.borrow_and_update(), [42]);
             let state = h.handle.stream_policy(42).await.unwrap().unwrap();
             assert_eq!(state.start, 0);
-            assert_eq!(state.policy.node.as_deref(), Some("replacement"));
+            assert_eq!(state.policy.sensors, ["replacement"]);
             assert!(old.is_cancelled());
             assert!(!state.token.is_cancelled());
             h.handle.record_ack(42, 456).await.unwrap();
@@ -876,7 +1122,7 @@ mod tests {
             std::fs::remove_file(&h.path).unwrap();
             std::fs::create_dir(&h.path).unwrap();
             let mut changed = policy(42);
-            changed.interval = Duration::from_secs(30);
+            changed.slot_size = Duration::from_secs(30);
             assert!(h.handle.replace_policies(vec![changed]).await.is_err());
             assert!(join_actor(h.task).await.is_err());
         })
