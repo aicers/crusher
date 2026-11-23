@@ -1,0 +1,63 @@
+{
+  "kind": "Conn",
+  "measure": "SumOrigBytes",
+  "slot_size_secs": 900,
+  "window_size_secs": 3600,
+  "utc_offset": 0,
+  "events": [
+    {
+      "timestamp": 1705277100000000000,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 100
+    },
+    {
+      "timestamp": 1705278000000000000,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 200
+    },
+    {
+      "timestamp": 1705279650000000000,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 300
+    },
+    {
+      "timestamp": 1705280520000000000,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 1000
+    },
+    {
+      "timestamp": 1705281360000000000,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 2000
+    },
+    {
+      "timestamp": 1705280280000000000,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 7
+    },
+    {
+      "timestamp": 1705282260000000000,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 3000
+    },
+    {
+      "timestamp": 1705283999000000000,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 4000
+    },
+    {
+      "timestamp": 1705284600000000000,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 50000
+    }
+  ]
+}

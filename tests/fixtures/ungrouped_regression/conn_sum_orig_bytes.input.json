@@ -1,0 +1,219 @@
+{
+  "kind": "Conn",
+  "measure": "SumOrigBytes",
+  "slot_size_secs": 1800,
+  "window_size_secs": 7200,
+  "utc_offset": 3600,
+  "events": [
+    {
+      "timestamp": 1705277643863821068,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 31530
+    },
+    {
+      "timestamp": 1705277768477562339,
+      "orig_addr": "192.168.10.6",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 16083
+    },
+    {
+      "timestamp": 1705278772911180971,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 5005
+    },
+    {
+      "timestamp": 1705279521534594594,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 12183
+    },
+    {
+      "timestamp": 1705279578432319603,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 26998
+    },
+    {
+      "timestamp": 1705279639821326117,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 79360
+    },
+    {
+      "timestamp": 1705280266580666325,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 56992
+    },
+    {
+      "timestamp": 1705280478480248064,
+      "orig_addr": "172.16.1.20",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 135535
+    },
+    {
+      "timestamp": 1705280753560130124,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 80797
+    },
+    {
+      "timestamp": 1705283428078442039,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 148073
+    },
+    {
+      "timestamp": 1705283924188512560,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 50096
+    },
+    {
+      "timestamp": 1705284167333598726,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 633
+    },
+    {
+      "timestamp": 1705284268424093413,
+      "orig_addr": "192.168.10.6",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 43423
+    },
+    {
+      "timestamp": 1705284590482020419,
+      "orig_addr": "192.168.10.6",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 2389
+    },
+    {
+      "timestamp": 1705284675561210037,
+      "orig_addr": "192.168.10.6",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 22341
+    },
+    {
+      "timestamp": 1705284911434967650,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 147556
+    },
+    {
+      "timestamp": 1705285165048841636,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 98285
+    },
+    {
+      "timestamp": 1705286216611947205,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 91449
+    },
+    {
+      "timestamp": 1705286661739984135,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 69474
+    },
+    {
+      "timestamp": 1705286795885511514,
+      "orig_addr": "192.168.10.6",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 135891
+    },
+    {
+      "timestamp": 1705287934396616698,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 138716
+    },
+    {
+      "timestamp": 1705291406768223300,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 89851
+    },
+    {
+      "timestamp": 1705291578450109915,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 91171
+    },
+    {
+      "timestamp": 1705292443971004343,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 35573
+    },
+    {
+      "timestamp": 1705292746571891454,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 111229
+    },
+    {
+      "timestamp": 1705292980267566837,
+      "orig_addr": "172.16.1.20",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 32074
+    },
+    {
+      "timestamp": 1705293575958493398,
+      "orig_addr": "192.168.10.6",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 115127
+    },
+    {
+      "timestamp": 1705294106763532489,
+      "orig_addr": "172.16.1.20",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 12176
+    },
+    {
+      "timestamp": 1705295096611962572,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "203.0.113.9",
+      "orig_bytes": 22734
+    },
+    {
+      "timestamp": 1705295576996042717,
+      "orig_addr": "10.0.0.7",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 148435
+    },
+    {
+      "timestamp": 1705296882347561552,
+      "orig_addr": "172.16.1.20",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 103772
+    },
+    {
+      "timestamp": 1705298223525165844,
+      "orig_addr": "172.16.1.20",
+      "resp_addr": "198.51.100.4",
+      "orig_bytes": 43514
+    },
+    {
+      "timestamp": 1705298988009449845,
+      "orig_addr": "172.16.1.20",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 36465
+    },
+    {
+      "timestamp": 1705300947039387107,
+      "orig_addr": "192.168.10.5",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 133845
+    },
+    {
+      "timestamp": 1705301508694881228,
+      "orig_addr": "192.168.10.6",
+      "resp_addr": "192.168.10.1",
+      "orig_bytes": 93918
+    }
+  ]
+}

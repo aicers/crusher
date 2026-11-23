@@ -17,7 +17,10 @@ use giganto_client::{
     connection::client_handshake,
     frame::{RecvError, send_raw},
     ingest::{
-        network::{Conn, Dns, Http, Rdp},
+        network::{
+            Bootp, Conn, DceRpc, Dhcp, Dns, Ftp, Http, Icmp, Kerberos, Ldap, MalformedDns, Mqtt,
+            Nfs, Ntlm, Radius, Rdp, Smb, Smtp, Ssh, Tls,
+        },
         receive_ack_timestamp, send_record_header,
     },
     publish::{
@@ -28,7 +31,9 @@ use giganto_client::{
 };
 use num_traits::ToPrimitive;
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt, WriteError};
-use review_protocol::types::SamplingKind;
+use review_protocol::types::{
+    ConnField, Measure, RawEventKind as PolicyRawEventKind, TimeSeriesGenerationPolicy,
+};
 use time_series::{TimeSeries, WindowBuilder};
 use tokio::{
     sync::{Notify, RwLock, mpsc},
@@ -132,91 +137,206 @@ async fn drain_connection_generation(
 static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-trait FromExt<T> {
-    fn from_ext(t: T) -> Self;
-}
-
-impl FromExt<SamplingKind> for RequestStreamRecord {
-    fn from_ext(k: SamplingKind) -> Self {
-        match k {
-            SamplingKind::Conn => Self::Conn,
-            SamplingKind::Dns => Self::Dns,
-            SamplingKind::Http => Self::Http,
-            SamplingKind::Rdp => Self::Rdp,
+/// Returns the Giganto stream kind that carries the raw events of `kind`.
+///
+/// Every network kind maps to the stream kind of the same name. The match
+/// names every kind so that a kind added to review-protocol fails to compile
+/// until it is classified here.
+///
+/// # Errors
+///
+/// Returns an error if `kind` is not a network kind.
+pub(crate) fn stream_record(kind: PolicyRawEventKind) -> Result<RequestStreamRecord> {
+    Ok(match kind {
+        PolicyRawEventKind::Bootp => RequestStreamRecord::Bootp,
+        PolicyRawEventKind::Conn => RequestStreamRecord::Conn,
+        PolicyRawEventKind::DceRpc => RequestStreamRecord::DceRpc,
+        PolicyRawEventKind::Dhcp => RequestStreamRecord::Dhcp,
+        PolicyRawEventKind::Dns => RequestStreamRecord::Dns,
+        PolicyRawEventKind::Ftp => RequestStreamRecord::Ftp,
+        PolicyRawEventKind::Http => RequestStreamRecord::Http,
+        PolicyRawEventKind::Icmp => RequestStreamRecord::Icmp,
+        PolicyRawEventKind::Kerberos => RequestStreamRecord::Kerberos,
+        PolicyRawEventKind::Ldap => RequestStreamRecord::Ldap,
+        PolicyRawEventKind::MalformedDns => RequestStreamRecord::MalformedDns,
+        PolicyRawEventKind::Mqtt => RequestStreamRecord::Mqtt,
+        PolicyRawEventKind::Nfs => RequestStreamRecord::Nfs,
+        PolicyRawEventKind::Ntlm => RequestStreamRecord::Ntlm,
+        PolicyRawEventKind::Radius => RequestStreamRecord::Radius,
+        PolicyRawEventKind::Rdp => RequestStreamRecord::Rdp,
+        PolicyRawEventKind::Smb => RequestStreamRecord::Smb,
+        PolicyRawEventKind::Smtp => RequestStreamRecord::Smtp,
+        PolicyRawEventKind::Ssh => RequestStreamRecord::Ssh,
+        PolicyRawEventKind::Tls => RequestStreamRecord::Tls,
+        PolicyRawEventKind::ProcessCreate
+        | PolicyRawEventKind::FileCreateTime
+        | PolicyRawEventKind::NetworkConnect
+        | PolicyRawEventKind::ProcessTerminate
+        | PolicyRawEventKind::ImageLoad
+        | PolicyRawEventKind::FileCreate
+        | PolicyRawEventKind::RegistryValueSet
+        | PolicyRawEventKind::RegistryKeyRename
+        | PolicyRawEventKind::FileCreateStreamHash
+        | PolicyRawEventKind::PipeEvent
+        | PolicyRawEventKind::DnsQuery
+        | PolicyRawEventKind::FileDelete
+        | PolicyRawEventKind::ProcessTamper
+        | PolicyRawEventKind::FileDeleteDetected
+        | PolicyRawEventKind::Netflow5
+        | PolicyRawEventKind::Netflow9 => {
+            bail!("{kind:?} is not a network raw event kind")
         }
-    }
+    })
 }
 
+/// Checks that the raw event kind and the measure of `policy` describe a
+/// series this generator can build.
+///
+/// # Errors
+///
+/// Returns an error if the kind is not a network kind, or if the measure sums
+/// a Conn field over another kind.
+pub(crate) fn check_generation_spec(policy: &TimeSeriesGenerationPolicy) -> Result<()> {
+    stream_record(policy.raw_event_kind)?;
+    if let Measure::Sum(field) = policy.measure
+        && policy.raw_event_kind != PolicyRawEventKind::Conn
+    {
+        bail!(
+            "Sum({field:?}) is defined only on Conn, not on {:?}",
+            policy.raw_event_kind
+        );
+    }
+    Ok(())
+}
+
+// An event is decoded, counted and dropped at once, so boxing the large
+// variants would only add an allocation per event.
 #[allow(clippy::large_enum_variant)]
 enum Event {
+    Bootp(Bootp),
     Conn(Conn),
+    DceRpc(DceRpc),
+    Dhcp(Dhcp),
     Dns(Dns),
+    Ftp(Ftp),
     Http(Http),
+    Icmp(Icmp),
+    Kerberos(Kerberos),
+    Ldap(Ldap),
+    MalformedDns(MalformedDns),
+    Mqtt(Mqtt),
+    Nfs(Nfs),
+    Ntlm(Ntlm),
+    Radius(Radius),
     Rdp(Rdp),
+    Smb(Smb),
+    Smtp(Smtp),
+    Ssh(Ssh),
+    Tls(Tls),
 }
 
 impl Event {
     fn orig_addr(&self) -> IpAddr {
         match self {
+            Self::Bootp(evt) => evt.orig_addr,
             Self::Conn(evt) => evt.orig_addr,
+            Self::DceRpc(evt) => evt.orig_addr,
+            Self::Dhcp(evt) => evt.orig_addr,
             Self::Dns(evt) => evt.orig_addr,
+            Self::Ftp(evt) => evt.orig_addr,
             Self::Http(evt) => evt.orig_addr,
+            Self::Icmp(evt) => evt.orig_addr,
+            Self::Kerberos(evt) => evt.orig_addr,
+            Self::Ldap(evt) => evt.orig_addr,
+            Self::MalformedDns(evt) => evt.orig_addr,
+            Self::Mqtt(evt) => evt.orig_addr,
+            Self::Nfs(evt) => evt.orig_addr,
+            Self::Ntlm(evt) => evt.orig_addr,
+            Self::Radius(evt) => evt.orig_addr,
             Self::Rdp(evt) => evt.orig_addr,
+            Self::Smb(evt) => evt.orig_addr,
+            Self::Smtp(evt) => evt.orig_addr,
+            Self::Ssh(evt) => evt.orig_addr,
+            Self::Tls(evt) => evt.orig_addr,
         }
     }
 
     fn resp_addr(&self) -> IpAddr {
         match self {
+            Self::Bootp(evt) => evt.resp_addr,
             Self::Conn(evt) => evt.resp_addr,
+            Self::DceRpc(evt) => evt.resp_addr,
+            Self::Dhcp(evt) => evt.resp_addr,
             Self::Dns(evt) => evt.resp_addr,
+            Self::Ftp(evt) => evt.resp_addr,
             Self::Http(evt) => evt.resp_addr,
+            Self::Icmp(evt) => evt.resp_addr,
+            Self::Kerberos(evt) => evt.resp_addr,
+            Self::Ldap(evt) => evt.resp_addr,
+            Self::MalformedDns(evt) => evt.resp_addr,
+            Self::Mqtt(evt) => evt.resp_addr,
+            Self::Nfs(evt) => evt.resp_addr,
+            Self::Ntlm(evt) => evt.resp_addr,
+            Self::Radius(evt) => evt.resp_addr,
             Self::Rdp(evt) => evt.resp_addr,
+            Self::Smb(evt) => evt.resp_addr,
+            Self::Smtp(evt) => evt.resp_addr,
+            Self::Ssh(evt) => evt.resp_addr,
+            Self::Tls(evt) => evt.resp_addr,
         }
     }
 
-    fn column_value(&self, column: u32) -> f64 {
-        match self {
-            Self::Conn(evt) => evt.column_value(column),
-            Self::Dns(evt) => evt.column_value(column),
-            Self::Http(evt) => evt.column_value(column),
-            Self::Rdp(evt) => evt.column_value(column),
-        }
+    /// Returns the value of `field` of a Conn event, or `None` for an event of
+    /// another kind.
+    fn conn_field(&self, field: ConnField) -> Option<f64> {
+        let Self::Conn(evt) = self else {
+            return None;
+        };
+        Some(match field {
+            ConnField::Duration => evt.duration.to_f64().unwrap_or_default(),
+            ConnField::OrigBytes => evt.orig_bytes.to_f64().unwrap_or_default(),
+            ConnField::RespBytes => evt.resp_bytes.to_f64().unwrap_or_default(),
+            ConnField::OrigPkts => evt.orig_pkts.to_f64().unwrap_or_default(),
+            ConnField::RespPkts => evt.resp_pkts.to_f64().unwrap_or_default(),
+        })
     }
 
-    fn try_new(k: SamplingKind, raw_event: &[u8]) -> Result<Self> {
-        Ok(match k {
-            SamplingKind::Conn => Self::Conn(bincode::deserialize::<Conn>(raw_event)?),
-            SamplingKind::Dns => Self::Dns(bincode::deserialize::<Dns>(raw_event)?),
-            SamplingKind::Http => Self::Http(bincode::deserialize::<Http>(raw_event)?),
-            SamplingKind::Rdp => Self::Rdp(bincode::deserialize::<Rdp>(raw_event)?),
+    /// Decodes a raw event of the stream kind `record`.
+    fn try_new(record: RequestStreamRecord, raw_event: &[u8]) -> Result<Self> {
+        Ok(match record {
+            RequestStreamRecord::Bootp => Self::Bootp(bincode::deserialize::<Bootp>(raw_event)?),
+            RequestStreamRecord::Conn => Self::Conn(bincode::deserialize::<Conn>(raw_event)?),
+            RequestStreamRecord::DceRpc => Self::DceRpc(bincode::deserialize::<DceRpc>(raw_event)?),
+            RequestStreamRecord::Dhcp => Self::Dhcp(bincode::deserialize::<Dhcp>(raw_event)?),
+            RequestStreamRecord::Dns => Self::Dns(bincode::deserialize::<Dns>(raw_event)?),
+            RequestStreamRecord::Ftp => Self::Ftp(bincode::deserialize::<Ftp>(raw_event)?),
+            RequestStreamRecord::Http => Self::Http(bincode::deserialize::<Http>(raw_event)?),
+            RequestStreamRecord::Icmp => Self::Icmp(bincode::deserialize::<Icmp>(raw_event)?),
+            RequestStreamRecord::Kerberos => {
+                Self::Kerberos(bincode::deserialize::<Kerberos>(raw_event)?)
+            }
+            RequestStreamRecord::Ldap => Self::Ldap(bincode::deserialize::<Ldap>(raw_event)?),
+            RequestStreamRecord::MalformedDns => {
+                Self::MalformedDns(bincode::deserialize::<MalformedDns>(raw_event)?)
+            }
+            RequestStreamRecord::Mqtt => Self::Mqtt(bincode::deserialize::<Mqtt>(raw_event)?),
+            RequestStreamRecord::Nfs => Self::Nfs(bincode::deserialize::<Nfs>(raw_event)?),
+            RequestStreamRecord::Ntlm => Self::Ntlm(bincode::deserialize::<Ntlm>(raw_event)?),
+            RequestStreamRecord::Radius => Self::Radius(bincode::deserialize::<Radius>(raw_event)?),
+            RequestStreamRecord::Rdp => Self::Rdp(bincode::deserialize::<Rdp>(raw_event)?),
+            RequestStreamRecord::Smb => Self::Smb(bincode::deserialize::<Smb>(raw_event)?),
+            RequestStreamRecord::Smtp => Self::Smtp(bincode::deserialize::<Smtp>(raw_event)?),
+            RequestStreamRecord::Ssh => Self::Ssh(bincode::deserialize::<Ssh>(raw_event)?),
+            RequestStreamRecord::Tls => Self::Tls(bincode::deserialize::<Tls>(raw_event)?),
+            RequestStreamRecord::Log
+            | RequestStreamRecord::Pcap
+            | RequestStreamRecord::FileCreate
+            | RequestStreamRecord::FileDelete => {
+                bail!("{record:?} is not a network raw event kind")
+            }
         })
     }
 }
-
-trait ColumnValue {
-    fn column_value(&self, _: u32) -> f64 {
-        1_f64
-    }
-}
-
-impl ColumnValue for Conn {
-    fn column_value(&self, column: u32) -> f64 {
-        match column {
-            5 => self.duration.to_f64().unwrap_or_default(),
-            7 => self.orig_bytes.to_f64().unwrap_or_default(),
-            8 => self.resp_bytes.to_f64().unwrap_or_default(),
-            9 => self.orig_pkts.to_f64().unwrap_or_default(),
-            10 => self.resp_pkts.to_f64().unwrap_or_default(),
-            _ => 1_f64,
-        }
-    }
-}
-
-impl ColumnValue for Dns {}
-
-impl ColumnValue for Rdp {}
-
-impl ColumnValue for Http {}
 
 pub(crate) struct Client {
     ingest_addr: SocketAddr,
@@ -456,7 +576,7 @@ async fn ingest_connection_control(
                             // instead of spawning another sender task.
                             let Some(policy_token) = policy_token_for_series(
                                 &policy_handle,
-                                &series.sampling_policy_id,
+                                &series.time_series_id,
                             )
                             .await else {
                                 continue;
@@ -722,6 +842,15 @@ async fn send_policy_requests(
             if state.token.is_cancelled() {
                 continue;
             }
+            // The actor starts only policies of a network kind, so this
+            // conversion does not fail for a policy it handed out.
+            let record_type = match stream_record(state.policy.raw_event_kind) {
+                Ok(record_type) => record_type,
+                Err(e) => {
+                    warn!("Not requesting a stream for policy {id}: {e:#}");
+                    continue;
+                }
+            };
             // Record the request before writing it so that its stream cannot
             // arrive before the dispatcher can bind it.
             requests.lock().insert(
@@ -734,7 +863,7 @@ async fn send_policy_requests(
             tokio::select! {
                 biased;
                 () = state.token.cancelled() => return Ok(StreamRecoveryAction::Reconnect),
-                result = process_network_stream(send, &state) => result?,
+                result = process_network_stream(send, &state, record_type) => result?,
             }
         }
         policy_ids
@@ -775,19 +904,25 @@ async fn publish_connect(
 }
 
 /// The Publish control task owns the request stream and writes requests in order.
-async fn process_network_stream(send: &mut SendStream, state: &StreamPolicy) -> Result<()> {
+///
+/// A policy the actor accepted has exactly one sensor, which the request names.
+async fn process_network_stream(
+    send: &mut SendStream,
+    state: &StreamPolicy,
+    record_type: RequestStreamRecord,
+) -> Result<()> {
     let policy = &state.policy;
     let request = RequestTimeSeriesGeneratorStream {
         start: state.start,
         id: policy.id.to_string(),
         src_ip: policy.src_ip,
         dst_ip: policy.dst_ip,
-        sensor: policy.node.clone(),
+        sensor: policy.sensors.first().cloned(),
     };
     send_stream_request(
         send,
         StreamRequestPayload::TimeSeriesGenerator {
-            record_type: RequestStreamRecord::from_ext(policy.kind),
+            record_type,
             request,
         },
     )
@@ -903,8 +1038,9 @@ async fn run_stream_worker(
         token: policy_token,
         start,
     } = state;
-    info!("Raw event {:?} has been connected", policy.kind);
+    info!("Raw event {:?} has been connected", policy.raw_event_kind);
     let id = policy.id;
+    let record_type = stream_record(policy.raw_event_kind)?;
     let mut windows = WindowBuilder::try_new(&policy, start)?;
 
     // The timer must not interrupt a partly read event, so the stream is read
@@ -946,10 +1082,10 @@ async fn run_stream_worker(
                         return Ok(false);
                     };
                     last_received = Instant::now();
-                    let Ok(event) = Event::try_new(policy.kind, &raw_event) else {
+                    let Ok(event) = Event::try_new(record_type, &raw_event) else {
                         warn!(
-                            "Failed to deserialize raw_event for sampling kind: {:?}",
-                            policy.kind
+                            "Failed to deserialize raw_event for raw event kind: {:?}",
+                            policy.raw_event_kind
                         );
                         continue;
                     };
@@ -1002,7 +1138,7 @@ async fn queue_to_ingest_sender(series: TimeSeries) -> Result<(), TimeSeries> {
     let cached_sender = INGEST_CHANNEL
         .read()
         .await
-        .get(&series.sampling_policy_id)
+        .get(&series.time_series_id)
         .cloned();
     let Some(sender) = cached_sender else {
         return Err(series);
@@ -1013,16 +1149,16 @@ async fn queue_to_ingest_sender(series: TimeSeries) -> Result<(), TimeSeries> {
         .map_err(|async_channel::SendError(series)| series)
 }
 
-/// Installs a new queue as the ingest sender of `sampling_policy_id`,
+/// Installs a new queue as the ingest sender of `time_series_id`,
 /// replacing a closed one. The ingest control installs it before it takes the
 /// next window, so that window finds it.
-async fn register_ingest_queue(sampling_policy_id: &str) -> Receiver<TimeSeries> {
+async fn register_ingest_queue(time_series_id: &str) -> Receiver<TimeSeries> {
     let (send_channel, recv_channel) =
         async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
     INGEST_CHANNEL
         .write()
         .await
-        .insert(sampling_policy_id.to_owned(), send_channel);
+        .insert(time_series_id.to_owned(), send_channel);
     recv_channel
 }
 
@@ -1047,9 +1183,9 @@ pub(crate) async fn clear_ingest_channel() {
 /// of spawning a sender task for an inactive policy.
 async fn policy_token_for_series(
     policy_handle: &PolicyHandle,
-    sampling_policy_id: &str,
+    time_series_id: &str,
 ) -> Option<CancellationToken> {
-    let id = sampling_policy_id.parse::<u32>().ok()?;
+    let id = time_series_id.parse::<u32>().ok()?;
     policy_handle
         .get_policy_with_token(id)
         .await
@@ -1068,8 +1204,8 @@ async fn spawn_time_series_sender(
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
 ) {
-    let sampling_policy_id = series.sampling_policy_id.clone();
-    let recv_channel = register_ingest_queue(&sampling_policy_id).await;
+    let time_series_id = series.time_series_id.clone();
+    let recv_channel = register_ingest_queue(&time_series_id).await;
     let error_notify = connection_notify.clone();
     let task_coordinator = coordinator.clone();
     let connection_tasks = connection_lifecycle.tasks.clone();
@@ -1086,7 +1222,7 @@ async fn spawn_time_series_sender(
         )
         .await
         {
-            warn!(%sampling_policy_id, "Time-series sender failed: {e:#}");
+            warn!(%time_series_id, "Time-series sender failed: {e:#}");
             error_notify.notify_waiters();
         }
     });
@@ -1106,7 +1242,7 @@ async fn send_time_series(
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
-    let sampling_policy_id = series.sampling_policy_id.clone();
+    let time_series_id = series.time_series_id.clone();
 
     let result = async {
         let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else {
@@ -1123,7 +1259,7 @@ async fn send_time_series(
             .tasks
             .track_future(receive_time_series_timestamp(
                 series_receiver,
-                sampling_policy_id.clone(),
+                time_series_id.clone(),
                 policy_token.clone(),
                 connection_lifecycle.token.clone(),
                 policy_handle,
@@ -1158,14 +1294,14 @@ async fn send_time_series(
                 }
                 () = policy_token.cancelled() => {
                     info!(
-                        %sampling_policy_id,
+                        %time_series_id,
                         "send_time_series stopping; policy deleted"
                     );
                     break;
                 }
                 () = connection_lifecycle.token.cancelled() => {
                     info!(
-                        %sampling_policy_id,
+                        %time_series_id,
                         "send_time_series stopping; ingest connection replaced"
                     );
                     break;
@@ -1193,10 +1329,10 @@ async fn send_time_series(
     // reconnect).
     recv_channel.close();
     let mut map = INGEST_CHANNEL.write().await;
-    if let Some(existing) = map.get(&sampling_policy_id)
+    if let Some(existing) = map.get(&time_series_id)
         && existing.is_closed()
     {
-        map.remove(&sampling_policy_id);
+        map.remove(&time_series_id);
     }
     drop(map);
 
@@ -1223,14 +1359,14 @@ async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -
 
 async fn receive_time_series_timestamp(
     mut series_receiver: RecvStream,
-    sampling_policy_id: String,
+    time_series_id: String,
     policy_token: CancellationToken,
     connection_token: CancellationToken,
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
 ) {
-    let Ok(policy_id) = sampling_policy_id.parse() else {
-        warn!(%sampling_policy_id, "Invalid policy id in ACK receiver");
+    let Ok(policy_id) = time_series_id.parse() else {
+        warn!(%time_series_id, "Invalid policy id in ACK receiver");
         return;
     };
     loop {
@@ -1240,14 +1376,14 @@ async fn receive_time_series_timestamp(
                 // Policy deletion: exit immediately without draining.
                 // The policy actor ignores ACKs for inactive policies.
                 info!(
-                    %sampling_policy_id,
+                    %time_series_id,
                     "receive_time_series_timestamp stopping; policy deleted"
                 );
                 return;
             }
             () = connection_token.cancelled() => {
                 info!(
-                    %sampling_policy_id,
+                    %time_series_id,
                     "receive_time_series_timestamp stopping; ingest connection replaced"
                 );
                 return;
@@ -1262,7 +1398,7 @@ async fn receive_time_series_timestamp(
                     .is_err()
                 {
                     warn!(
-                        %sampling_policy_id,
+                        %time_series_id,
                         "Policy actor closed while recording an ACK"
                     );
                     return;
@@ -1273,7 +1409,7 @@ async fn receive_time_series_timestamp(
             }
             Err(e) => {
                 warn!(
-                    %sampling_policy_id,
+                    %time_series_id,
                     "receive_time_series_timestamp error: {e}"
                 );
                 connection_notify.notify_waiters();

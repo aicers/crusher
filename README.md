@@ -75,12 +75,12 @@ In the configuration file, you can specify the following options:
 
 <!-- markdownlint-disable MD013 -->
 
-| Field                      | Description                                                                     | Required | Default    |
-| -------------------------- | ------------------------------------------------------------------------------- | -------- | ---------- |
-| `giganto_name`             | Name of the Giganto server                                                      | Yes      | -          |
-| `giganto_ingest_srv_addr`  | Giganto's ingest IP address and port number                                     | Yes      | -          |
-| `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                    | Yes      | -          |
-| `last_timestamp_data`      | JSON file that stores the timestamp of the last time series per sampling policy | Yes      | -          |
+| Field                      | Description                                                                                   | Required | Default |
+| -------------------------- | --------------------------------------------------------------------------------------------- | -------- | ------- |
+| `giganto_name`             | Name of the Giganto server                                                                    | Yes      | -       |
+| `giganto_ingest_srv_addr`  | Giganto's ingest IP address and port number                                                   | Yes      | -       |
+| `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                                  | Yes      | -       |
+| `last_timestamp_data`      | JSON file that stores the timestamp of the last time series per time-series generation policy | Yes      | -       |
 
 <!-- markdownlint-enable MD013 -->
 

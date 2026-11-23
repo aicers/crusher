@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use review_protocol::{
     client::{Connection, ConnectionBuilder},
     request::Handler as _,
-    types::{SamplingPolicy, Status},
+    types::{Status, TimeSeriesGenerationPolicy},
 };
 use tokio::{
     sync::{Mutex, Notify},
@@ -162,21 +162,21 @@ impl Client {
     ///
     /// Returns whether the list was applied. A failed pull changes nothing, so
     /// every policy and checkpoint is kept.
-    async fn sync_sampling_policies(&mut self, connection: &Connection) -> bool {
-        match connection.get_sampling_policy_list().await {
+    async fn sync_time_series_generation_policies(&mut self, connection: &Connection) -> bool {
+        match connection.get_time_series_generation_policy_list().await {
             Ok(policies) => {
                 info!(
-                    "Applying {} sampling policies from the Manager",
+                    "Applying {} time-series generation policies from the Manager",
                     policies.len()
                 );
-                if let Err(e) = self.sampling_policy_list(&policies).await {
-                    warn!("Failed to apply sampling policies from the Manager: {e}");
+                if let Err(e) = self.time_series_generation_policy_list(&policies).await {
+                    warn!("Failed to apply time-series generation policies from the Manager: {e}");
                     return false;
                 }
                 true
             }
             Err(e) => {
-                warn!("Failed to retrieve sampling policy list: {e}");
+                warn!("Failed to retrieve time-series generation policy list: {e}");
                 false
             }
         }
@@ -191,7 +191,9 @@ impl Client {
         loop {
             match self.connect_with_id().await {
                 Ok((connection, id)) => {
-                    if synced != Some(id) && self.sync_sampling_policies(&connection).await {
+                    if synced != Some(id)
+                        && self.sync_time_series_generation_policies(&connection).await
+                    {
                         synced = Some(id);
                     }
                     match connection.accept_bi().await {
@@ -407,7 +409,10 @@ where
 
 #[async_trait]
 impl review_protocol::request::Handler for Client {
-    async fn sampling_policy_list(&mut self, policies: &[SamplingPolicy]) -> Result<(), String> {
+    async fn time_series_generation_policy_list(
+        &mut self,
+        policies: &[TimeSeriesGenerationPolicy],
+    ) -> Result<(), String> {
         let handle = self
             .policy_handle
             .as_ref()
@@ -415,7 +420,10 @@ impl review_protocol::request::Handler for Client {
         handle.replace_policies(policies.to_vec()).await
     }
 
-    async fn delete_sampling_policy(&mut self, policy_ids: &[u32]) -> Result<(), String> {
+    async fn delete_time_series_generation_policy(
+        &mut self,
+        policy_ids: &[u32],
+    ) -> Result<(), String> {
         let handle = self
             .policy_handle
             .as_ref()
@@ -456,7 +464,10 @@ mod tests {
 
     use quinn::{Endpoint, ServerConfig, crypto::rustls::QuicServerConfig};
     use review_protocol::request::Handler;
-    use review_protocol::types::{SamplingKind, SamplingPolicy};
+    use review_protocol::types::{
+        CounterpartScope, GroupByUnit, HostNetworkGroup, Measure, RawEventKind,
+        TimeSeriesGenerationPolicy,
+    };
     use rustls::server::WebPkiClientVerifier;
 
     use super::*;
@@ -492,18 +503,23 @@ mod tests {
         (client, dir, policy_handle)
     }
 
-    /// Creates a test sampling policy with the given ID.
-    fn create_test_policy(id: u32) -> SamplingPolicy {
-        SamplingPolicy {
+    /// Creates a test time-series generation policy with the given ID.
+    fn create_test_policy(id: u32) -> TimeSeriesGenerationPolicy {
+        TimeSeriesGenerationPolicy {
             id,
-            kind: SamplingKind::Conn,
-            interval: Duration::from_mins(1),
-            period: Duration::from_hours(1),
-            offset: 0,
+            raw_event_kind: RawEventKind::Conn,
+            measure: Measure::Count,
+            group_by: None,
+            group_by_unit: GroupByUnit::Ip,
+            counterpart_scope: CounterpartScope::Any,
+            slot_size: Duration::from_mins(1),
+            window_size: Duration::from_hours(1),
+            utc_offset: 0,
             src_ip: None,
             dst_ip: None,
-            node: Some("test_node".to_string()),
-            column: None,
+            sensors: vec!["test_node".to_string()],
+            time_series_type: None,
+            internal_networks: HostNetworkGroup::default(),
         }
     }
 
@@ -575,7 +591,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Policy Replacement Tests: `sampling_policy_list()`
+    // Policy Replacement Tests: `time_series_generation_policy_list()`
     // =========================================================================
 
     #[tokio::test(flavor = "current_thread")]
@@ -586,7 +602,7 @@ mod tests {
 
         // Add the policy first time
         let result = client
-            .sampling_policy_list(std::slice::from_ref(&policy))
+            .time_series_generation_policy_list(std::slice::from_ref(&policy))
             .await;
         assert!(result.is_ok());
 
@@ -595,7 +611,7 @@ mod tests {
         assert!(policy_handle.get_policy(1).await.is_some());
 
         // Add the same policy again (duplicate)
-        let result = client.sampling_policy_list(&[policy]).await;
+        let result = client.time_series_generation_policy_list(&[policy]).await;
         assert!(result.is_ok());
 
         // Verify still only one policy in active list
@@ -610,7 +626,7 @@ mod tests {
         let policy2 = create_test_policy(2);
 
         let result = client
-            .sampling_policy_list(&[policy1.clone(), policy2.clone()])
+            .time_series_generation_policy_list(&[policy1.clone(), policy2.clone()])
             .await;
         assert!(result.is_ok());
         assert_eq!(policy_handle.get_all_policy_ids().len(), 2);
@@ -618,7 +634,9 @@ mod tests {
 
         // policy1 is kept, policy2 is absent, and policy3 is new.
         let policy3 = create_test_policy(3);
-        let result = client.sampling_policy_list(&[policy1, policy3]).await;
+        let result = client
+            .time_series_generation_policy_list(&[policy1, policy3])
+            .await;
         assert!(result.is_ok());
 
         let mut ids = policy_handle.get_all_policy_ids();
@@ -636,7 +654,7 @@ mod tests {
         assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
 
         let policy = create_test_policy(1);
-        let result = client.sampling_policy_list(&[policy]).await;
+        let result = client.time_series_generation_policy_list(&[policy]).await;
         assert!(result.is_ok());
 
         assert_eq!(policy_handle.get_all_policy_ids().len(), 1);
@@ -650,21 +668,21 @@ mod tests {
 
         // Add policy
         client
-            .sampling_policy_list(std::slice::from_ref(&policy))
+            .time_series_generation_policy_list(std::slice::from_ref(&policy))
             .await
             .expect("Success to add policy");
         assert_eq!(policy_handle.get_all_policy_ids().len(), 1);
 
         // Remove policy
         client
-            .delete_sampling_policy(&[1])
+            .delete_time_series_generation_policy(&[1])
             .await
             .expect("Success to remove policy");
         assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
 
         // Add policy again (should succeed since it was deleted)
         client
-            .sampling_policy_list(&[policy])
+            .time_series_generation_policy_list(&[policy])
             .await
             .expect("Success to add policy");
         assert_eq!(policy_handle.get_all_policy_ids().len(), 1);
@@ -674,15 +692,15 @@ mod tests {
     async fn empty_policy_list_stops_every_policy() {
         let (mut client, _dir, policy_handle) = create_test_client().await;
 
-        let result = client.sampling_policy_list(&[]).await;
+        let result = client.time_series_generation_policy_list(&[]).await;
         assert!(result.is_ok());
         assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
 
         client
-            .sampling_policy_list(&[create_test_policy(1), create_test_policy(2)])
+            .time_series_generation_policy_list(&[create_test_policy(1), create_test_policy(2)])
             .await
             .expect("Success to add policies");
-        let result = client.sampling_policy_list(&[]).await;
+        let result = client.time_series_generation_policy_list(&[]).await;
         assert!(result.is_ok());
         assert_eq!(policy_handle.get_all_policy_ids(), [] as [u32; 0]);
     }
@@ -693,28 +711,28 @@ mod tests {
         let original_policy = create_test_policy(1);
 
         client
-            .sampling_policy_list(std::slice::from_ref(&original_policy))
+            .time_series_generation_policy_list(std::slice::from_ref(&original_policy))
             .await
             .expect("Success to add policy");
         let old = policy_handle.get_policy_token(1).await.unwrap();
 
         let mut changed_policy = create_test_policy(1);
-        changed_policy.interval = Duration::from_secs(30);
-        changed_policy.node = Some("updated_node".to_string());
+        changed_policy.slot_size = Duration::from_secs(30);
+        changed_policy.sensors = vec!["updated_node".to_string()];
 
         client
-            .sampling_policy_list(&[changed_policy])
+            .time_series_generation_policy_list(&[changed_policy])
             .await
             .expect("No error or failure");
 
         assert!(old.is_cancelled());
         let stored = policy_handle.get_policy(1).await.unwrap();
-        assert_eq!(stored.interval, Duration::from_secs(30));
-        assert_eq!(stored.node.as_deref(), Some("updated_node"));
+        assert_eq!(stored.slot_size, Duration::from_secs(30));
+        assert_eq!(stored.sensors, ["updated_node"]);
     }
 
     // =========================================================================
-    // Policy Deletion Tests: `delete_sampling_policy()`
+    // Policy Deletion Tests: `delete_time_series_generation_policy()`
     // =========================================================================
     #[tokio::test(flavor = "current_thread")]
     async fn delete_policy_multiple_times() {
@@ -722,23 +740,23 @@ mod tests {
         let (mut client, _dir, policy_handle) = create_test_client().await;
 
         // Add multiple policies first
-        let policies: Vec<SamplingPolicy> = (1..=5).map(create_test_policy).collect();
+        let policies: Vec<TimeSeriesGenerationPolicy> = (1..=5).map(create_test_policy).collect();
         client
-            .sampling_policy_list(&policies)
+            .time_series_generation_policy_list(&policies)
             .await
             .expect("Success to add policies");
 
         // Delete policies one by one
         client
-            .delete_sampling_policy(&[1])
+            .delete_time_series_generation_policy(&[1])
             .await
             .expect("Success to delete policy");
         client
-            .delete_sampling_policy(&[2])
+            .delete_time_series_generation_policy(&[2])
             .await
             .expect("Success to delete policy");
         client
-            .delete_sampling_policy(&[3])
+            .delete_time_series_generation_policy(&[3])
             .await
             .expect("Success to delete policy");
 
@@ -759,15 +777,15 @@ mod tests {
         let (mut client, _dir, policy_handle) = create_test_client().await;
 
         // Add policies
-        let policies: Vec<SamplingPolicy> = (1..=5).map(create_test_policy).collect();
+        let policies: Vec<TimeSeriesGenerationPolicy> = (1..=5).map(create_test_policy).collect();
         client
-            .sampling_policy_list(&policies)
+            .time_series_generation_policy_list(&policies)
             .await
             .expect("Success to add policies");
 
         // Delete multiple in one call
         client
-            .delete_sampling_policy(&[1, 3, 5])
+            .delete_time_series_generation_policy(&[1, 3, 5])
             .await
             .expect("Success to delete policies");
 
@@ -787,12 +805,12 @@ mod tests {
         // Add a policy
         let policy = create_test_policy(1);
         client
-            .sampling_policy_list(&[policy])
+            .time_series_generation_policy_list(&[policy])
             .await
             .expect("Success to add policy");
 
         // Try to delete a non-existent policy
-        let result = client.delete_sampling_policy(&[999]).await;
+        let result = client.delete_time_series_generation_policy(&[999]).await;
         assert!(result.is_ok());
 
         // Non-existent policy should not appear
@@ -807,14 +825,16 @@ mod tests {
         // Test: Deleting a non-existent policy should be silently ignored
         let (mut client, _dir, policy_handle) = create_test_client().await;
 
-        let policies: Vec<SamplingPolicy> = (1..=7).map(create_test_policy).collect();
+        let policies: Vec<TimeSeriesGenerationPolicy> = (1..=7).map(create_test_policy).collect();
         client
-            .sampling_policy_list(&policies)
+            .time_series_generation_policy_list(&policies)
             .await
             .expect("Success to add policies");
 
         // Try to delete a batch including non-existent policy and some existent policies
-        let result = client.delete_sampling_policy(&[1, 2, 3, 999, 4, 5]).await;
+        let result = client
+            .delete_time_series_generation_policy(&[1, 2, 3, 999, 4, 5])
+            .await;
         assert!(result.is_ok());
 
         for id in [1, 2, 3, 4, 5] {
@@ -832,7 +852,9 @@ mod tests {
         // Test: Delete on empty active list should be no-op
         let (mut client, _dir, _policy_handle) = create_test_client().await;
 
-        let result = client.delete_sampling_policy(&[1, 2, 3]).await;
+        let result = client
+            .delete_time_series_generation_policy(&[1, 2, 3])
+            .await;
         assert!(result.is_ok());
     }
 
@@ -844,19 +866,19 @@ mod tests {
         // Add a policy
         let policy = create_test_policy(1);
         client
-            .sampling_policy_list(&[policy])
+            .time_series_generation_policy_list(&[policy])
             .await
             .expect("Success to add policy");
 
         // Delete it once
         client
-            .delete_sampling_policy(&[1])
+            .delete_time_series_generation_policy(&[1])
             .await
             .expect("Success to delete policy");
 
         // Try to delete it again (already removed from active, so no-op)
         client
-            .delete_sampling_policy(&[1])
+            .delete_time_series_generation_policy(&[1])
             .await
             .expect("No error or failure");
 
@@ -874,7 +896,7 @@ mod tests {
         for _ in 0..3 {
             let policy = create_test_policy(1);
             client
-                .sampling_policy_list(&[policy])
+                .time_series_generation_policy_list(&[policy])
                 .await
                 .expect("Success to add policy");
 
@@ -882,7 +904,7 @@ mod tests {
             assert!(!token.is_cancelled());
 
             client
-                .delete_sampling_policy(&[1])
+                .delete_time_series_generation_policy(&[1])
                 .await
                 .expect("Success to delete policy");
 
@@ -1205,10 +1227,10 @@ log_path = "/tmp/crusher.log"
             Ok(LOG_PATH_CONFIG.to_string())
         }
 
-        async fn get_sampling_policy_list(
+        async fn get_time_series_generation_policy_list(
             &self,
             _peer: &str,
-        ) -> Result<Vec<SamplingPolicy>, String> {
+        ) -> Result<Vec<TimeSeriesGenerationPolicy>, String> {
             Ok(vec![create_test_policy(10), create_test_policy(20)])
         }
     }
@@ -1249,7 +1271,7 @@ log_path = "/tmp/crusher.log"
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn syncs_sampling_policies_on_startup() {
+    async fn syncs_time_series_generation_policies_on_startup() {
         let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
         let (server_addr, server_task) = spawn_test_manager_server(&certs);
 
@@ -1269,7 +1291,11 @@ log_path = "/tmp/crusher.log"
         client.set_policy_handle(policy_handle.clone());
 
         let connection = client.connect().await.expect("connect to manager");
-        assert!(client.sync_sampling_policies(&connection).await);
+        assert!(
+            client
+                .sync_time_series_generation_policies(&connection)
+                .await
+        );
 
         // Verify policies were restored into the active list
         let mut ids = policy_handle.get_all_policy_ids();
@@ -1335,7 +1361,8 @@ log_path = "/tmp/crusher.log"
     // Reconnect pull tests
     // =========================================================================
 
-    type PullResponses = Arc<std::sync::Mutex<VecDeque<Result<Vec<SamplingPolicy>, String>>>>;
+    type PullResponses =
+        Arc<std::sync::Mutex<VecDeque<Result<Vec<TimeSeriesGenerationPolicy>, String>>>>;
 
     /// Answers each policy pull with the next scripted response.
     #[derive(Clone)]
@@ -1346,10 +1373,10 @@ log_path = "/tmp/crusher.log"
 
     #[async_trait::async_trait]
     impl review_protocol::server::Handler for ScriptedPullHandler {
-        async fn get_sampling_policy_list(
+        async fn get_time_series_generation_policy_list(
             &self,
             _peer: &str,
-        ) -> Result<Vec<SamplingPolicy>, String> {
+        ) -> Result<Vec<TimeSeriesGenerationPolicy>, String> {
             self.pulls.fetch_add(1, Ordering::SeqCst);
             self.responses
                 .lock()
@@ -1369,7 +1396,10 @@ log_path = "/tmp/crusher.log"
     }
 
     impl ScriptedManager {
-        fn spawn(certs: &Certs, responses: Vec<Result<Vec<SamplingPolicy>, String>>) -> Self {
+        fn spawn(
+            certs: &Certs,
+            responses: Vec<Result<Vec<TimeSeriesGenerationPolicy>, String>>,
+        ) -> Self {
             let server_endpoint = Endpoint::server(
                 create_test_server_config(certs),
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
@@ -1434,11 +1464,11 @@ log_path = "/tmp/crusher.log"
                 .expect("manager has a connection")
         }
 
-        async fn push(&self, policies: &[SamplingPolicy]) {
+        async fn push(&self, policies: &[TimeSeriesGenerationPolicy]) {
             review_protocol::server::Connection::from_quinn(self.connection())
-                .send_sampling_policies(policies)
+                .send_time_series_generation_policies(policies)
                 .await
-                .expect("push sampling policies");
+                .expect("push time-series generation policies");
         }
     }
 
@@ -1464,7 +1494,7 @@ log_path = "/tmp/crusher.log"
     async fn spawn_incoming_handler(
         addr: SocketAddr,
         dir: &tempfile::TempDir,
-        initial: &[SamplingPolicy],
+        initial: &[TimeSeriesGenerationPolicy],
     ) -> (
         PolicyHandle,
         tokio::task::JoinHandle<Result<()>>,
