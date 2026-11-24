@@ -694,12 +694,18 @@ impl WindowBuilder {
     /// before `due` is due: up to the first window from [`Self::marked_from`]
     /// on that has no IP rows and that no stream has passed by event time, or
     /// `due` if there is none. An ungrouped policy closes up to `due`.
+    ///
+    /// A grouped policy closes nothing before [`Self::marked_from`] is known:
+    /// no window has IP rows yet and no stream has passed one by event time,
+    /// and the first event may still belong to any window from
+    /// [`Self::current`] on, which must then be open to count it and get its
+    /// marker.
     fn closable_until(&self, due: i64) -> i64 {
         if self.generation.is_none() {
             return due;
         }
         let Some(marked_from) = self.marked_from else {
-            return due;
+            return self.current;
         };
         let passed_by_events = self
             .streams
@@ -3745,6 +3751,42 @@ mod tests {
         assert_eq!(written.len(), 0, "{written:?}");
         let written = from_ip(&mut builder, "2024/1/15 06:20:00", EXTERNAL);
         assert_eq!(rows(&written), [marker("2024/1/15 05:00:00", 0)]);
+    }
+
+    /// Without a checkpoint, an empty replay followed by idle time closes no
+    /// window: the first event, even one older than the wall clock minus the
+    /// grace, is counted in its window, which gets its marker.
+    #[test]
+    fn unresumed_request_closes_nothing_by_idle_before_the_first_event() {
+        let mut builder = single(&by_source(&["10.0.0.1"]), 0).unwrap();
+        let origin = Instant::now();
+        let wall = datetime_from_utc("2024/1/15 01:20:00");
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), wall);
+        assert!(builder.replay_end(0, origin));
+        assert!(
+            builder.close_rows(&at(60)).is_empty(),
+            "nothing is closed before the first event"
+        );
+        assert_eq!(
+            builder.current, 0,
+            "no window is passed before the first event"
+        );
+
+        let written = deliver(&mut builder, 0, "2024/1/15 00:30:00", "10.0.0.1", &at(120));
+        assert_eq!(written.len(), 0, "{written:?}");
+        assert_eq!(builder.dropped, 0, "the first event is counted");
+        assert_eq!(
+            builder.open.keys().copied().collect::<Vec<_>>(),
+            [datetime_from_utc("2024/1/15 00:00:00")]
+        );
+        let written = deliver(&mut builder, 0, "2024/1/15 01:20:00", EXTERNAL, &at(180));
+        assert_eq!(
+            written,
+            [
+                row("42/10.0.0.1", "2024/1/15 00:00:00", [0.0, 0.0, 1.0, 0.0]),
+                marker("2024/1/15 00:00:00", 1),
+            ]
+        );
     }
 
     /// Each run writes its rows with its own generation. A run resumed from
