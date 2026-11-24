@@ -154,6 +154,11 @@ pub(super) fn network_record(
             realm: "R".into(),
             sname_type: 2,
             sname: vec!["s".into()],
+            msg_type: 0,
+            preauth: 0,
+            req_etypes: Vec::new(),
+            enc_part_etype: None,
+            ticket_etype: None,
         }),
         PolicyRawEventKind::Ssh => record!(Ssh, orig, resp, {
             client: "c".into(),
@@ -269,6 +274,9 @@ pub(super) fn network_record(
             client_id_type: 0,
             client_id: Vec::new(),
             options: Vec::new(),
+            xid: 0,
+            chaddr: Vec::new(),
+            src_mac: None,
         }),
         PolicyRawEventKind::Radius => record!(Radius, orig, resp, {
             id: 1,

@@ -975,12 +975,12 @@ dependencies = [
 
 [[package]]
 name = "giganto-client"
-version = "0.29.1"
-source = "git+https://github.com/aicers/giganto-client.git?tag=0.29.1#8c3a09c65b5ad23aeacd793fe5389d70529f28ef"
+version = "0.30.0"
+source = "git+https://github.com/aicers/giganto-client.git?tag=0.30.0#e7667b71c2a4a920ac0606ad693ffc6edf41cd3c"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
- "jiff 0.2.43",
+ "jiff 1.0.2",
  "num_enum",
  "quinn",
  "semver",

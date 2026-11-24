@@ -10,9 +10,9 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CloseTimer, ConnField, CounterpartScope, Duration, GroupByUnit, HostNetworkGroup, Measure,
-    PolicyRawEventKind, PublishBehavior, TimeSeriesGenerationPolicy, cert_key,
-    cleanup_test_resources, setup_request_client, spawn_subscribe_client_with_timer,
+    CloseTimer, ConnField, CounterpartScope, Duration, GeneratorFrame, GroupByUnit,
+    HostNetworkGroup, Measure, PolicyRawEventKind, PublishBehavior, TimeSeriesGenerationPolicy,
+    cert_key, cleanup_test_resources, setup_request_client, spawn_subscribe_client_with_timer,
     start_window_servers_with,
 };
 use crate::cancellation::CancellationCoordinator;
@@ -242,9 +242,9 @@ async fn run(input: &Input) -> Vec<StoredWindow> {
             ..flush.clone()
         });
     }
-    let records: Vec<(i64, Vec<u8>)> = events
+    let records: Vec<GeneratorFrame> = events
         .iter()
-        .map(|event| (event.timestamp, record(input.kind, event)))
+        .map(|event| GeneratorFrame::Event(event.timestamp, record(input.kind, event)))
         .collect();
 
     let servers = start_window_servers_with(
