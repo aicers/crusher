@@ -290,7 +290,7 @@ impl WindowBuilder {
             });
         match self.network_changes.last_mut() {
             // Watermarks only grow, so a boundary is never before the latest.
-            Some((last, latest)) if *last >= boundary => *latest = networks,
+            Some((last, network)) if *last >= boundary => *network = networks,
             _ => self.network_changes.push((boundary, networks)),
         }
     }
