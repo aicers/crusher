@@ -168,8 +168,16 @@ async fn drain_connection_generation(
 
 // The ingest queue of each policy's sender, by policy id. Every frame of a
 // policy is written on that one sender's stream.
-static INGEST_CHANNEL: LazyLock<RwLock<HashMap<u32, Sender<IngestFrame>>>> =
+static INGEST_CHANNEL: LazyLock<RwLock<HashMap<u32, IngestQueue>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// The queue of a policy's ingest sender.
+struct IngestQueue {
+    frames: Sender<IngestFrame>,
+    /// The policy token the sender stops on. Once it is cancelled, the sender
+    /// drops whatever is still queued.
+    run: CancellationToken,
+}
 
 /// Returns the Giganto stream kind that carries the raw events of `kind`.
 ///
@@ -600,30 +608,13 @@ async fn ingest_connection_control(
                             continue 'connection;
                         }
                         Ok(series) = series_recv.recv() => {
-                            // Queue behind the policy's live sender to keep its writes in order.
-                            let Err(series) = queue_to_ingest_sender(series).await else {
-                                continue;
-                            };
-                            // Bind the freshly received series to the currently active policy id by
-                            // looking up its `CancellationToken` in a single actor call. If the
-                            // policy is no longer active by the time we dequeue the series, drop it
-                            // instead of spawning another sender task.
-                            let Some(policy_token) = policy_token_for_series(
-                                &policy_handle,
-                                series.policy_id(),
-                            )
-                            .await else {
-                                continue;
-                            };
-                            let connection = arc_conn.clone();
-                            spawn_time_series_sender(
-                                &coordinator,
-                                connection,
+                            route_series(
                                 series,
-                                policy_token,
-                                connection_lifecycle.clone(),
-                                policy_handle.clone(),
-                                connection_notify.clone(),
+                                &coordinator,
+                                &arc_conn,
+                                &connection_lifecycle,
+                                &policy_handle,
+                                &connection_notify,
                             )
                             .await;
                         }
@@ -660,6 +651,48 @@ async fn ingest_connection_control(
     }
 }
 
+/// Queues `series` behind its policy's live sender, which keeps the policy's
+/// writes in order, or starts a sender with it. A frame of a replaced request
+/// or a deleted policy is dropped, as its own sender would drop it, rather
+/// than written behind the next run's.
+async fn route_series(
+    series: IngestFrame,
+    coordinator: &CancellationCoordinator,
+    connection: &Arc<Connection>,
+    connection_lifecycle: &ConnectionLifecycle,
+    policy_handle: &PolicyHandle,
+    connection_notify: &Arc<Notify>,
+) {
+    if series.run_stopped() {
+        return;
+    }
+    let Err(series) = queue_to_ingest_sender(series).await else {
+        return;
+    };
+    // Bind the series to the currently active policy by looking up its
+    // `CancellationToken` in a single actor call. If the policy is no longer
+    // active, drop the series instead of spawning another sender task.
+    let Some(policy_token) = policy_token_for_series(policy_handle, series.policy_id()).await
+    else {
+        return;
+    };
+    // A policy token is replaced only after it is cancelled, so a run still
+    // live now is the run of the token just looked up.
+    if series.run_stopped() {
+        return;
+    }
+    spawn_time_series_sender(
+        coordinator,
+        connection.clone(),
+        series,
+        policy_token,
+        connection_lifecycle.clone(),
+        policy_handle.clone(),
+        connection_notify.clone(),
+    )
+    .await;
+}
+
 /// Producers observe the same cancellation as the ingest control and drop
 /// their senders. Keep receiving until the outer queue closes so a series
 /// already queued at the shutdown boundary is still handed to an ingest worker.
@@ -676,6 +709,9 @@ async fn drain_series_at_shutdown(
     connection_notify: &Arc<Notify>,
 ) {
     while let Ok(series) = series_recv.recv().await {
+        if series.run_stopped() {
+            continue;
+        }
         let Err(series) = queue_to_ingest_sender(series).await else {
             continue;
         };
@@ -1358,14 +1394,14 @@ async fn run_policy(
                                 &close_timer,
                             );
                             for series in written {
-                                write_window(&sender, series).await?;
+                                write_window(&sender, series.of_run(&policy_token)).await?;
                             }
                         }
                     }
                 }
                 _ = check.tick() => {
                     for series in windows.close_due(&close_timer.pass_clock()) {
-                        write_window(&sender, series).await?;
+                        write_window(&sender, series.of_run(&policy_token)).await?;
                     }
                 }
             }
@@ -1397,7 +1433,8 @@ async fn write_window(send_channel: &Sender<IngestFrame>, series: IngestFrame) -
 
 /// Queues `series` to its policy's ingest sender. Returns the series back when
 /// the policy has no sender, or its sender closed with a deleted policy, a
-/// replaced ingest connection or shutdown, so that the caller starts one.
+/// replaced ingest connection or shutdown, or stops with a replaced request,
+/// so that the caller starts one.
 ///
 /// The ingest control takes every window in the order its policy runner wrote
 /// it, and queues it here before it takes the next. A corrected window thus
@@ -1406,35 +1443,51 @@ async fn write_window(send_channel: &Sender<IngestFrame>, series: IngestFrame) -
 async fn queue_to_ingest_sender(series: IngestFrame) -> Result<(), IngestFrame> {
     // Clone the sender out of the lock to avoid holding the RwLock read
     // guard across an await point.
-    let cached_sender = INGEST_CHANNEL
+    let cached = INGEST_CHANNEL
         .read()
         .await
         .get(&series.policy_id())
-        .cloned();
-    let Some(sender) = cached_sender else {
+        .map(|queue| (queue.frames.clone(), queue.run.clone()));
+    let Some((sender, run)) = cached else {
         return Err(series);
     };
+    if run.is_cancelled() {
+        // The sender of a replaced request can still be writing, its queue
+        // still installed, but drops whatever is queued once it sees its
+        // token. A row of the next run queued there would be lost, and the
+        // window's marker, starting a sender of its own, stored without it.
+        // Closing the queue lets nothing more in; the caller then starts the
+        // next run's sender, whose queue replaces this one.
+        sender.close();
+        return Err(series);
+    }
     sender
         .send(series)
         .await
         .map_err(|async_channel::SendError(series)| series)
 }
 
-/// Installs a new queue as the ingest sender of policy `policy_id`,
-/// replacing a closed one. The ingest control installs it before it takes the
-/// next window, so that window finds it.
-async fn register_ingest_queue(policy_id: u32) -> Receiver<IngestFrame> {
+/// Installs a new queue as the ingest sender of policy `policy_id`, which
+/// stops on `run`, replacing a closed one. The ingest control installs it
+/// before it takes the next window, so that window finds it.
+async fn register_ingest_queue(policy_id: u32, run: CancellationToken) -> Receiver<IngestFrame> {
     let (send_channel, recv_channel) =
         async_channel::bounded::<IngestFrame>(TIME_SERIES_CHANNEL_SIZE);
-    INGEST_CHANNEL.write().await.insert(policy_id, send_channel);
+    INGEST_CHANNEL.write().await.insert(
+        policy_id,
+        IngestQueue {
+            frames: send_channel,
+            run,
+        },
+    );
     recv_channel
 }
 
 /// Closes every policy's ingest queue. Each sender writes what is queued and
 /// then finishes its stream.
 async fn close_ingest_queues() {
-    for sender in INGEST_CHANNEL.read().await.values() {
-        sender.close();
+    for queue in INGEST_CHANNEL.read().await.values() {
+        queue.frames.close();
     }
 }
 
@@ -1472,7 +1525,7 @@ async fn spawn_time_series_sender(
     connection_notify: Arc<Notify>,
 ) {
     let policy_id = series.policy_id();
-    let recv_channel = register_ingest_queue(policy_id).await;
+    let recv_channel = register_ingest_queue(policy_id, policy_token.clone()).await;
     let error_notify = connection_notify.clone();
     let task_coordinator = coordinator.clone();
     let connection_tasks = connection_lifecycle.tasks.clone();
@@ -1594,7 +1647,7 @@ async fn send_time_series(
     recv_channel.close();
     let mut map = INGEST_CHANNEL.write().await;
     if let Some(existing) = map.get(&policy_id)
-        && existing.is_closed()
+        && existing.frames.is_closed()
     {
         map.remove(&policy_id);
     }

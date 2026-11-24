@@ -9,6 +9,7 @@ use review_protocol::types::{
 };
 use serde::Serialize;
 use tokio::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::Event;
@@ -60,6 +61,10 @@ pub(super) struct TimeSeries {
 pub(super) struct IngestFrame {
     policy_id: u32,
     rows: Vec<TimeSeries>,
+    /// The policy token of the run that wrote the frame, cancelled once that
+    /// run's request is replaced or its policy deleted. `None` for a frame no
+    /// run wrote.
+    run: Option<CancellationToken>,
 }
 
 impl IngestFrame {
@@ -78,11 +83,27 @@ impl IngestFrame {
         self.rows
     }
 
+    /// Returns the frame as written by the run whose policy token is `run`.
+    #[must_use]
+    pub(super) fn of_run(mut self, run: &CancellationToken) -> Self {
+        self.run = Some(run.clone());
+        self
+    }
+
+    /// Returns whether the run that wrote the frame has stopped, so that the
+    /// frame is no longer written.
+    pub(super) fn run_stopped(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    }
+
     /// Returns a frame of `row` followed by `then`, both of one policy.
     fn pair(row: TimeSeries, then: TimeSeries) -> Self {
         Self {
             policy_id: row.policy_id,
             rows: vec![row, then],
+            run: None,
         }
     }
 }
@@ -92,6 +113,7 @@ impl From<TimeSeries> for IngestFrame {
         Self {
             policy_id: row.policy_id,
             rows: vec![row],
+            run: None,
         }
     }
 }
@@ -262,11 +284,15 @@ pub(super) struct WindowBuilder {
     network_changes: Vec<(i64, HostNetworkGroup)>,
     /// The start of the window of the first event any stream received.
     first_event_window: Option<i64>,
+    /// The start of the earliest window not yet warned about as due. A grouped
+    /// window can be due long before it closes, so this runs ahead of
+    /// [`Self::current`].
+    warned: i64,
     /// The IPs a grouped policy keeps a series for in this request.
     accepted: HashSet<IpAddr>,
     /// The most IPs [`Self::accepted`] takes.
     max_series: usize,
-    /// The IPs refused for the cap, by the window whose close reports them.
+    /// The IPs refused for the cap, by the window that reports them once due.
     refused: BTreeMap<i64, HashSet<IpAddr>>,
     /// A grouped policy's write generation, carried by every row of this run.
     /// `None` for an ungrouped policy.
@@ -347,6 +373,7 @@ impl WindowBuilder {
             networks: policy.internal_networks.clone(),
             network_changes: Vec::new(),
             first_event_window: None,
+            warned: current,
             accepted: HashSet::new(),
             max_series: MAX_SERIES_PER_POLICY,
             refused: BTreeMap::new(),
@@ -599,7 +626,7 @@ impl WindowBuilder {
     /// Returns whether `value` may have a series, accepting an IP the cap
     /// still has room for. A refused IP is recorded for the warning of the
     /// window starting at `window_start`, or of the earliest window not yet
-    /// due if that one is already closed.
+    /// warned about as due if that one already is.
     fn admit(&mut self, value: Value, window_start: i64) -> bool {
         let Value::Ip(ip) = value else {
             return true;
@@ -612,7 +639,7 @@ impl WindowBuilder {
             return true;
         }
         self.refused
-            .entry(window_start.max(self.current))
+            .entry(window_start.max(self.warned))
             .or_default()
             .insert(ip);
         false
@@ -632,7 +659,8 @@ impl WindowBuilder {
     ///
     /// A grouped policy warns for each due window in which it refused IPs for
     /// the cap, and for each due window, from the one of the first event any
-    /// stream received on, whose internal network is empty.
+    /// stream received on, whose internal network is empty, even while that
+    /// window cannot close yet.
     pub(super) fn close_due(&mut self, clock: &PassClock) -> Vec<IngestFrame> {
         let mut written = Vec::new();
         loop {
@@ -642,11 +670,11 @@ impl WindowBuilder {
                 .map(|stream| self.pass_limit(stream, clock))
                 .min()
                 .unwrap_or(i64::MIN);
+            self.warn_due(due);
             let target = self.closable_until(due);
             if target <= self.current {
                 break;
             }
-            self.warn_due(target);
             let later = self.open.split_off(&target);
             let closing = std::mem::replace(&mut self.open, later);
             if self.generation.is_some() {
@@ -820,12 +848,12 @@ impl WindowBuilder {
         self.dropped = self.dropped.saturating_add(1);
     }
 
-    /// Warns about the windows from the earliest not yet due up to `target`,
-    /// which are becoming due: those that refused IPs for the cap, and, from
-    /// the window of the first event on, those whose internal network is
-    /// empty.
-    fn warn_due(&mut self, target: i64) {
-        let later = self.refused.split_off(&target);
+    /// Warns once about each window before `due`, which is due whether or not
+    /// it can close yet: those that refused IPs for the cap, and, for a
+    /// grouped policy from the window of the first event any stream received
+    /// on, those whose internal network is empty.
+    fn warn_due(&mut self, due: i64) {
+        let later = self.refused.split_off(&due);
         for (window_start, refused) in std::mem::replace(&mut self.refused, later) {
             warn!(
                 policy_id = %self.policy_id,
@@ -837,16 +865,18 @@ impl WindowBuilder {
                 refused.len()
             );
         }
+        let warned = self.warned;
+        self.warned = warned.max(due);
         if self.policy.group_by.is_none() {
             return;
         }
         let Some(first) = self.first_event_window else {
             return;
         };
-        let mut start = self.current.max(first);
-        while start < target {
+        let mut start = warned.max(first);
+        while start < due {
             let (next_boundary, network) = self.network_segment(start);
-            let end = target.min(next_boundary);
+            let end = due.min(next_boundary);
             if is_empty(network) {
                 while start < end {
                     warn!(
@@ -3662,6 +3692,46 @@ mod tests {
                 "{warning}"
             );
         }
+    }
+
+    /// A window whose internal network is empty is warned about once, when it
+    /// becomes due, even when it becomes due by the idle rule alone and so
+    /// cannot close yet. Closing it later warns no more.
+    #[test]
+    fn empty_network_warns_when_a_window_is_due_by_idle_before_it_closes() {
+        let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
+        let mut builder = single(&by_source(&[]), start).unwrap();
+        let origin = Instant::now();
+        let wall = datetime_from_utc("2024/1/15 01:20:00");
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), wall);
+        let warning = "Policy 42 has no internal network";
+
+        let (written, lines) =
+            logged(|| deliver(&mut builder, 0, "2024/1/15 00:20:00", "10.0.0.1", &at(0)));
+        assert_eq!(written.len(), 0, "{written:?}");
+        assert!(containing(&lines, warning).is_empty(), "{lines:?}");
+        assert!(builder.replay_end(0, origin));
+
+        let (written, lines) = logged(|| {
+            let mut written = builder.close_rows(&at(60));
+            written.extend(builder.close_rows(&at(120)));
+            written
+        });
+        assert_eq!(written.len(), 0, "due by the idle rule only: {written:?}");
+        let warnings = containing(&lines, warning);
+        assert_eq!(warnings.len(), 1, "00:00 once: {lines:?}");
+        assert!(
+            warnings[0].contains(&format!(
+                "window_start={}",
+                datetime_from_utc("2024/1/15 00:00:00")
+            )),
+            "{warnings:?}"
+        );
+
+        let (written, lines) =
+            logged(|| deliver(&mut builder, 0, "2024/1/15 01:20:00", "10.0.0.1", &at(180)));
+        assert_eq!(written, [marker("2024/1/15 00:00:00", 0)]);
+        assert!(containing(&lines, warning).is_empty(), "{lines:?}");
     }
 
     /// Without a checkpoint, no marker is written for a window before the

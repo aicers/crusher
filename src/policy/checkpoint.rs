@@ -75,9 +75,10 @@ impl Checkpoint {
 pub(super) type Checkpoints = HashMap<String, Checkpoint>;
 
 /// Atomically writes the checkpoints to the given path by writing to a
-/// temporary file in the same directory, flushing to disk, and then renaming
-/// over the target path. This prevents partial writes on crash, and a written
-/// generation is on disk before any row of it is sent.
+/// temporary file in the same directory, flushing it to disk, renaming it over
+/// the target path, and then flushing the directory. This prevents partial
+/// writes on crash, and a written generation is on disk before any row of it
+/// is sent.
 pub(super) async fn write_timestamp_file(path: &Path, data: &Checkpoints) -> Result<()> {
     let path = path.to_path_buf();
     let json = to_json(data);
@@ -103,6 +104,12 @@ fn atomic_write_timestamp_file(path: &Path, data: &Value) -> Result<()> {
     let dir = path
         .parent()
         .context("timestamp file has no parent directory")?;
+    // A bare file name has an empty parent: the working directory.
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .context("Failed to create temporary timestamp file")?;
     serde_json::to_writer(&mut tmp, data)
@@ -115,6 +122,12 @@ fn atomic_write_timestamp_file(path: &Path, data: &Value) -> Result<()> {
         .context("Failed to sync temporary timestamp file")?;
     tmp.persist(path)
         .context("Failed to atomically replace timestamp file")?;
+    // The rename is durable only once the directory is. A replacement lost
+    // to a power failure after rows of its generation were sent would let a
+    // restart with the clock set back fix that generation again.
+    File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("Failed to sync timestamp file directory {}", dir.display()))?;
     Ok(())
 }
 

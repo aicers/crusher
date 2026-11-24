@@ -1851,6 +1851,122 @@ async fn ingest_control_queues_consecutive_writes_on_one_sender() {
     INGEST_CHANNEL.write().await.clear();
 }
 
+/// A restarting policy change cancels the token of the policy's sender, which
+/// may still be blocked writing with its queue installed. The next run's IP
+/// row and marker then go out together on a sender of the new run, not into
+/// that queue, whose sender would drop the row once it saw its token, leaving
+/// the marker to be stored without it. A frame the stopped run still wrote is
+/// dropped rather than written between them.
+#[serial]
+#[tokio::test]
+async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+    policy_handle
+        .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .await
+        .unwrap();
+    let old_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the policy is active");
+    // The old run's sender, blocked: nothing takes from its queue.
+    let old_queue = register_ingest_queue(DEFAULT_POLICY_ID, old_run.clone()).await;
+    let changed = TimeSeriesGenerationPolicy {
+        slot_size: Duration::from_secs(5 * SECS_PER_MINUTE),
+        ..new_policy(DEFAULT_POLICY_ID)
+    };
+    policy_handle.replace_policies(vec![changed]).await.unwrap();
+    assert!(old_run.is_cancelled(), "the change restarts the policy");
+    let new_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the changed policy is active");
+
+    let start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
+    let frame = |id: String, value, run: &CancellationToken| {
+        IngestFrame::from(TimeSeries {
+            time_series_id: id,
+            policy_id: DEFAULT_POLICY_ID,
+            start_secs,
+            series: vec![value],
+        })
+        .of_run(run)
+    };
+    let (series_send, series_recv) = async_channel::unbounded();
+    let ip_row = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
+    for (id, value, run) in [
+        (ip_row.clone(), 1.0, &new_run),
+        (ip_row.clone(), 9.0, &old_run),
+        (DEFAULT_POLICY_ID.to_string(), 2.0, &new_run),
+    ] {
+        series_send.try_send(frame(id, value, run)).unwrap();
+    }
+    let control = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                Arc::new(Notify::new()),
+                coordinator,
+            )
+            .await
+            .expect("ingest control exits cleanly");
+            endpoint
+        }
+    });
+
+    let mut writes = Vec::new();
+    for _ in 0..2 {
+        let (_, series) = timeout(TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("the new run's row and marker are stored")
+            .unwrap();
+        writes.push((series.time_series_id, series.series));
+    }
+    assert_eq!(
+        writes,
+        [
+            (ip_row, vec![1.0]),
+            (DEFAULT_POLICY_ID.to_string(), vec![2.0]),
+        ],
+        "the row precedes its marker, and the stopped run's frame is dropped"
+    );
+    assert!(
+        old_queue.is_closed(),
+        "the replaced queue lets nothing more in"
+    );
+    assert!(old_queue.is_empty(), "no frame entered the replaced queue");
+
+    coordinator.request_cancellation("replaced request test");
+    drop(series_send);
+    let endpoint = control.await.expect("ingest control joins");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
 /// Windows still queued in the ingest control at shutdown are handed to an
 /// ingest sender: the first starts one, and the next is queued behind it.
 #[serial]
@@ -2062,12 +2178,13 @@ async fn cancellation_drains_queued_time_series() {
         series: vec![2.0],
     });
 
-    let recv_channel = register_ingest_queue(policy_id).await;
+    let sender_token = CancellationToken::new();
+    let recv_channel = register_ingest_queue(policy_id, sender_token.clone()).await;
     let sender_task = coordinator.tracker().spawn(send_time_series(
         Arc::new(connection),
         first,
         recv_channel,
-        CancellationToken::new(),
+        sender_token,
         ConnectionLifecycle::new(),
         policy_handle,
         Arc::new(Notify::new()),
@@ -2087,7 +2204,7 @@ async fn cancellation_drains_queued_time_series() {
         .read()
         .await
         .get(&policy_id)
-        .cloned()
+        .map(|queue| queue.frames.clone())
         .expect("per-policy sender exists");
     queued_sender
         .try_send(second)
