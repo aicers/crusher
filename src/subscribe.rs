@@ -58,7 +58,9 @@ const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a policy's new ingest sender waits for Giganto to store what the
-/// sender it replaces wrote before giving up on the connection.
+/// sender it replaces wrote before giving up on the connection, and how long
+/// a reconnect waits for Giganto to store what the senders on the connection
+/// it replaces wrote.
 const PREVIOUS_STREAM_STORE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The fewest inbound streams a Publish connection lets Giganto have open at
@@ -186,6 +188,9 @@ struct IngestQueue {
     /// stays installed until then, so that a sender replacing this one finds
     /// it.
     stored: CancellationToken,
+    /// The [`Self::stored`] of the sender this one replaced, if Giganto had
+    /// not stored its writes yet when this one was installed.
+    previous: Option<CancellationToken>,
 }
 
 /// The receiving end of a policy's ingest queue, as its sender takes it.
@@ -614,6 +619,7 @@ async fn ingest_connection_control(
                         }
                         () = connection_notify.notified() => {
                             drop(connection_notify);
+                            store_before_reconnect(&arc_conn, &coordinator).await;
                             INGEST_CHANNEL.write().await.clear();
                             drain_connection_generation(
                                 arc_conn.as_ref(),
@@ -1501,23 +1507,73 @@ async fn register_ingest_queue(policy_id: u32, run: CancellationToken) -> QueueR
     let (send_channel, recv_channel) =
         async_channel::bounded::<IngestFrame>(TIME_SERIES_CHANNEL_SIZE);
     let stored = CancellationToken::new();
-    let previous = INGEST_CHANNEL
-        .write()
-        .await
-        .insert(
-            policy_id,
-            IngestQueue {
-                frames: send_channel,
-                run,
-                stored: stored.clone(),
-            },
-        )
-        .map(|replaced| replaced.stored)
+    let mut map = INGEST_CHANNEL.write().await;
+    let previous = map
+        .get(&policy_id)
+        .map(|replaced| replaced.stored.clone())
         .filter(|previous| !previous.is_cancelled());
+    map.insert(
+        policy_id,
+        IngestQueue {
+            frames: send_channel,
+            run,
+            stored: stored.clone(),
+            previous: previous.clone(),
+        },
+    );
+    drop(map);
     QueueRegistration {
         frames: recv_channel,
         stored,
         previous,
+    }
+}
+
+/// Lets every policy's ingest sender on `connection`, which a reconnect is
+/// about to replace, write what is queued and finish its stream, and waits
+/// until Giganto has stored what each sender and the one it replaced wrote.
+///
+/// Giganto keeps the order of one stream only, and the policy's next writes
+/// go on a stream of the next connection. Without this wait a frame Giganto
+/// received here but had not stored yet could be stored after the next run's
+/// row and marker, and an old-generation row would replace the row the
+/// marker counts. Giganto finishes its side of a stream only after storing
+/// every frame of it, which is what the senders' `stored` tokens wait for.
+///
+/// The wait ends early when `connection` closes, since Giganto can then tell
+/// nothing more about the frames it received on it, at shutdown, and after
+/// [`PREVIOUS_STREAM_STORE_TIMEOUT`].
+async fn store_before_reconnect(connection: &Connection, coordinator: &CancellationCoordinator) {
+    let pending: Vec<CancellationToken> = {
+        let map = INGEST_CHANNEL.read().await;
+        for queue in map.values() {
+            queue.frames.close();
+        }
+        map.values()
+            .flat_map(|queue| std::iter::once(&queue.stored).chain(queue.previous.as_ref()))
+            .filter(|stored| !stored.is_cancelled())
+            .cloned()
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let all_stored = async {
+        for stored in &pending {
+            stored.cancelled().await;
+        }
+    };
+    tokio::select! {
+        biased;
+        () = coordinator.cancelled() => {}
+        () = all_stored => {}
+        error = connection.closed() => warn!(
+            "Ingest connection closed before Giganto stored every time series written on it: {error}"
+        ),
+        () = sleep(PREVIOUS_STREAM_STORE_TIMEOUT) => warn!(
+            "Giganto did not store every time series written on the replaced ingest connection within {} seconds",
+            PREVIOUS_STREAM_STORE_TIMEOUT.as_secs(),
+        ),
     }
 }
 

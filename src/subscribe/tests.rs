@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -137,6 +137,14 @@ enum IngestBehavior {
     /// Reads the first stream of each connection only after this delay, so
     /// that a write on a later stream would be stored before it.
     DelayFirstStream(Duration),
+    /// Stores the first frame received on any connection only `delay` after
+    /// receiving it, and notifies `received` on its receipt, so that a frame
+    /// written on a later connection would be stored before it.
+    DelayFirstStore {
+        delay: Duration,
+        received: Arc<Notify>,
+        pending: Arc<AtomicBool>,
+    },
 }
 
 struct FakeGigantoServer {
@@ -707,6 +715,16 @@ async fn handle_ingest_stream(
         let Ok(batch) = bincode::deserialize::<Vec<(i64, Vec<u8>)>>(&buf) else {
             continue;
         };
+        if let IngestBehavior::DelayFirstStore {
+            delay,
+            received,
+            pending,
+        } = &behavior
+            && pending.swap(false, Ordering::SeqCst)
+        {
+            received.notify_one();
+            sleep(*delay).await;
+        }
         // The policy id is the part of the series id before `/`.
         let policy_id = batch
             .first()
@@ -1975,6 +1993,117 @@ async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
         stored.try_recv().is_err(),
         "nothing else is stored, the stopped run's frame included"
     );
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
+/// A reconnect replaces the ingest connection while Giganto has received a
+/// policy's frame on it but not yet stored it. The policy's next writes, on
+/// the new connection, are stored only after that frame: an old-generation
+/// row stored after the new run's row and marker would replace the row the
+/// marker counts.
+#[serial]
+#[tokio::test]
+async fn reconnect_stores_the_old_connections_writes_before_the_new_ones() {
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let received = Arc::new(Notify::new());
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::DelayFirstStore {
+            delay: Duration::from_millis(500),
+            received: received.clone(),
+            pending: Arc::new(AtomicBool::new(true)),
+        })
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+    policy_handle
+        .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .await
+        .unwrap();
+    let run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the policy is active");
+
+    let start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
+    let frame = |id: String, value| {
+        IngestFrame::from(TimeSeries {
+            time_series_id: id,
+            policy_id: DEFAULT_POLICY_ID,
+            start_secs,
+            series: vec![value],
+        })
+        .of_run(&run)
+    };
+    let ip_row = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
+    let (series_send, series_recv) = async_channel::unbounded();
+    series_send.try_send(frame(ip_row.clone(), 9.0)).unwrap();
+    let connection_notify = Arc::new(Notify::new());
+    let control = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        let connection_notify = connection_notify.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                connection_notify,
+                coordinator,
+            )
+            .await
+            .expect("ingest control exits cleanly");
+            endpoint
+        }
+    });
+    timeout(TEST_TIMEOUT, received.notified())
+        .await
+        .expect("Giganto receives the old connection's row");
+
+    // The reconnect signal, as a lost Publish connection gives it, and then
+    // the rows of the run requested on the new connections.
+    connection_notify.notify_one();
+    for (id, value) in [(ip_row.clone(), 1.0), (DEFAULT_POLICY_ID.to_string(), 2.0)] {
+        series_send.try_send(frame(id, value)).unwrap();
+    }
+
+    let mut writes = Vec::new();
+    for _ in 0..3 {
+        let (_, series) = timeout(RECONNECT_TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("the old row and the new row and marker are stored")
+            .unwrap();
+        writes.push((series.time_series_id, series.series));
+    }
+    assert_eq!(
+        writes,
+        [
+            (ip_row.clone(), vec![9.0]),
+            (ip_row, vec![1.0]),
+            (DEFAULT_POLICY_ID.to_string(), vec![2.0]),
+        ],
+        "the old connection's row is stored first, and the row precedes its marker"
+    );
+
+    coordinator.request_cancellation("reconnect ordering test");
+    drop(series_send);
+    let endpoint = control.await.expect("ingest control joins");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
     endpoint.close(0u32.into(), &[]);
     shutdown.notify_one();
     ingest_handle.await.expect("ingest server joins");
