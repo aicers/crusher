@@ -1,8 +1,11 @@
 //! Replays the raw events of `tests/fixtures/ungrouped_regression` through
 //! crusher and fake Giganto servers, and checks that what crusher stores for
-//! each ungrouped single-sensor policy equals what crusher 0.12.4 stored for
-//! the equivalent policy of its own schema. The fixture's `README.md` says how
-//! the expected output was produced.
+//! each ungrouped single-sensor policy matches what crusher 0.12.4 stored for
+//! the equivalent policy of its own schema: equal for every input without late
+//! events, and for the input with late events the same keys and no value
+//! smaller, since a window now stays open for its grace and takes events
+//! 0.12.4 dropped. The fixture's `README.md` says how the expected output was
+//! produced.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -31,6 +34,8 @@ const INPUTS: [&str; 6] = [
     "http_count",
     "late_event",
 ];
+/// The inputs with events that arrive after a later window's events.
+const LATE_INPUTS: [&str; 1] = ["late_event"];
 const POLICY_ID: u32 = 1;
 const DAY_NANOS: i64 = 86_400_000_000_000;
 /// Long enough that no window of a test run is written for an idle stream.
@@ -222,10 +227,11 @@ fn read_expected(name: &str) -> Vec<StoredWindow> {
 /// Runs crusher over `input` and returns, per Giganto key, the window value
 /// written last.
 ///
-/// Two events far after the input follow it. The first closes the input's
-/// last window; the second closes the first one's window, whose write, after
-/// every write of the input on the same ingest stream, ends the run. Nothing
-/// is closed by the timer, so the result depends only on the events' order.
+/// Two events far after the input follow it. The first passes the input's
+/// last window, which closes; the second passes the first one's window, whose
+/// write, after every write of the input on the same ingest stream, ends the
+/// run. Nothing is closed by the timer, so the result depends only on the
+/// events' order.
 async fn run(input: &Input) -> Vec<StoredWindow> {
     let last = input
         .events
@@ -304,6 +310,28 @@ async fn ungrouped_policies_store_what_0_12_4_stored() {
     for name in INPUTS {
         let input = read_input(name);
         let stored = run(&input).await;
-        assert_eq!(stored, read_expected(name), "{name}");
+        let expected = read_expected(name);
+        if !LATE_INPUTS.contains(&name) {
+            assert_eq!(stored, expected, "{name}");
+            continue;
+        }
+        let keys = |windows: &[StoredWindow]| -> Vec<(String, i64)> {
+            windows
+                .iter()
+                .map(|window| (window.series_id.clone(), window.window_start))
+                .collect()
+        };
+        assert_eq!(keys(&stored), keys(&expected), "{name}");
+        for (stored, expected) in stored.iter().zip(&expected) {
+            assert_eq!(stored.series.len(), expected.series.len(), "{name}");
+            assert!(
+                stored
+                    .series
+                    .iter()
+                    .zip(&expected.series)
+                    .all(|(stored, expected)| stored >= expected),
+                "{name}: {stored:?} has a value smaller than {expected:?}"
+            );
+        }
     }
 }

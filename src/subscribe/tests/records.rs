@@ -4,9 +4,10 @@
 use std::net::IpAddr;
 
 use review_protocol::types::{ConnField, Measure, RawEventKind as PolicyRawEventKind};
+use tokio::time::{Duration, Instant};
 
 use super::{SECS_PER_MINUTE, new_policy};
-use crate::subscribe::time_series::{SECOND_TO_NANO, WindowBuilder};
+use crate::subscribe::time_series::{PassClock, SECOND_TO_NANO, WindowBuilder};
 use crate::subscribe::{
     Bootp, Conn, DceRpc, Dhcp, Dns, Event, Ftp, Http, Icmp, Kerberos, Ldap, MalformedDns, Mqtt,
     Nfs, Ntlm, Radius, Rdp, RequestStreamRecord, Smb, Smtp, Ssh, Tls, stream_record,
@@ -418,27 +419,40 @@ fn non_network_stream_kinds_are_not_decoded() {
     }
 }
 
-/// Feeds `events` (raw records within one 1-hour window) and an event of the
-/// next window to a builder for `policy`, and returns the closed window.
+/// Feeds `events` (raw records within one 1-hour window) and an event past
+/// the window's end plus its grace to a builder for `policy` over one stream,
+/// and returns the closed window.
 fn closed_window(
     policy: &review_protocol::types::TimeSeriesGenerationPolicy,
     events: &[Vec<u8>],
 ) -> Vec<f64> {
     const WINDOW_START: i64 = 1_700_000_000 / 3600 * 3600;
     let record = stream_record(policy.raw_event_kind).unwrap();
-    let mut builder = WindowBuilder::try_new(policy, 0).unwrap();
+    let mut builder = WindowBuilder::try_new(policy, 0, 1).unwrap();
+    let stream = builder.open_stream().unwrap();
+    let clock = PassClock {
+        wall_secs: i64::MIN,
+        now: Instant::now(),
+        idle: Duration::from_secs(30),
+    };
     let at = |secs: i64| (WINDOW_START + secs) * SECOND_TO_NANO;
+    let mut feed = |timestamp: i64, event: &Event| {
+        builder.receive(stream, timestamp, Instant::now());
+        let mut written = builder.close_due(&clock);
+        written.extend(builder.add(stream, timestamp, event).unwrap());
+        written
+    };
     for (i, bytes) in events.iter().enumerate() {
         let event = Event::try_new(record, bytes).unwrap();
         let offset = i64::try_from(i).unwrap() * 60;
-        assert!(builder.add(at(offset), &event).unwrap().is_none());
+        assert!(feed(at(offset), &event).is_empty());
     }
     let next = Event::try_new(record, events.last().unwrap()).unwrap();
-    builder
-        .add(at(3600), &next)
-        .unwrap()
-        .expect("an event of the next window closes the window")
-        .series
+    let written = feed(at(3600 + 901), &next);
+    let [window] = written.as_slice() else {
+        panic!("an event past the window's grace closes the window: {written:?}");
+    };
+    window.series.clone()
 }
 
 fn hourly_policy(

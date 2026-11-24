@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
 use review_protocol::types::{Measure, TimeSeriesGenerationPolicy};
 use serde::Serialize;
+use tokio::time::{Duration, Instant};
 use tracing::warn;
 
 use super::Event;
@@ -17,7 +20,9 @@ const SENSOR_BATCH_SECS: i64 = 600;
 /// Clock skew between the Sensor and this host.
 const CLOSE_SKEW_SECS: i64 = 300;
 
-/// How long after its end a window on a quiet stream is closed by the timer.
+/// How far past a window's end a stream must be before it has passed the
+/// window: by event time, or by the wall clock once it is quiet after its
+/// replay end.
 ///
 /// Covers a Sensor batch of up to 600 s (piglet 0.23.0 `BATCH_INTERVAL`) plus
 /// 300 s of skew; a shorter batch interval in a later Sensor needs no change,
@@ -36,30 +41,126 @@ pub(super) struct TimeSeries {
     pub(super) series: Vec<f64>,
 }
 
-/// Builds one stream's windows from its events.
+/// The time a policy runner reads when it decides which windows are due.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PassClock {
+    /// The wall clock, in seconds since the Unix epoch.
+    pub(super) wall_secs: i64,
+    /// The monotonic time now, against which idle starts are measured.
+    pub(super) now: Instant,
+    /// How long a stream past its replay end must have been quiet to pass a
+    /// window by the wall clock.
+    pub(super) idle: Duration,
+}
+
+/// What a policy knows of one of its generator streams.
+#[derive(Debug, Default)]
+struct StreamState {
+    opened: bool,
+    /// The largest event time received, in nanoseconds, counting every event
+    /// the stream delivered, whether or not it was counted.
+    watermark: Option<i64>,
+    /// The later of the moment the replay-end frame arrived and the moment
+    /// the last event after it arrived. `None` until the replay-end frame.
+    idle_start: Option<Instant>,
+    /// An event too far ahead of the windows being built; the stream reads
+    /// nothing more until it is counted.
+    held: Option<HeldEvent>,
+    /// Set once the stream ended: the bound it had reached, which it keeps.
+    ended_bound: Option<i64>,
+}
+
+impl StreamState {
+    fn replay_ended(&self) -> bool {
+        self.idle_start.is_some()
+    }
+
+    /// Returns the bound, in nanoseconds, below which this stream has passed
+    /// every window's end plus [`CLOSE_GRACE_SECS`]: the stream has passed a
+    /// window when that window's end plus the grace is less than this.
+    /// `i64::MIN` means it has passed nothing.
+    fn bound(&self, clock: &PassClock) -> i64 {
+        if let Some(bound) = self.ended_bound {
+            return bound;
+        }
+        if !self.opened {
+            return i64::MIN;
+        }
+        let by_events = self.watermark.unwrap_or(i64::MIN);
+        // Passing by the wall clock is "at or past", so it reaches one
+        // nanosecond beyond the wall clock's second.
+        let by_idle = match self.idle_start {
+            Some(idle_start) if clock.now.saturating_duration_since(idle_start) >= clock.idle => {
+                clock
+                    .wall_secs
+                    .saturating_mul(SECOND_TO_NANO)
+                    .saturating_add(1)
+            }
+            _ => i64::MIN,
+        };
+        by_events.max(by_idle)
+    }
+}
+
+/// An event a paused stream holds until its window may be counted.
+#[derive(Debug)]
+struct HeldEvent {
+    timestamp: i64,
+    window_start: i64,
+    key: String,
+    value: f64,
+}
+
+/// A window that has counted at least one event: the values of each of its
+/// value keys.
+#[derive(Debug)]
+struct Window {
+    start_secs: i64,
+    values: BTreeMap<String, Vec<f64>>,
+}
+
+impl Window {
+    fn series(&self, key: &str) -> Option<TimeSeries> {
+        self.values.get(key).map(|values| TimeSeries {
+            time_series_id: key.to_owned(),
+            start_secs: self.start_secs,
+            series: values.clone(),
+        })
+    }
+}
+
+/// Builds one policy's windows from the events of all of its generator
+/// streams, one per sensor, and decides when each window is closed.
 ///
-/// A window exists only once an event is counted in it, so a window without
-/// events is never written. At most one window is open; the last closed one
-/// is kept so that an event arriving after its window closed can still be
-/// counted there, and the window written again under the same key.
+/// All windows share one boundary grid. A window exists only once an event is
+/// counted in it, so a window without events is never written. A window is
+/// due once every stream has passed it, either by event time or, after its
+/// replay end, by being quiet while the wall clock is past the window's end
+/// plus [`CLOSE_GRACE_SECS`]; windows become due in time order. The last
+/// closed window is kept so that an event arriving after its window closed can
+/// still be counted there, and the window written again under the same key.
 pub(super) struct WindowBuilder {
     policy: TimeSeriesGenerationPolicy,
     policy_id: String,
     slot_size_secs: i64,
     window_size_secs: i64,
     slots: usize,
-    /// The stream's request start, in nanoseconds. Giganto replays the events
-    /// from here, so an older event is not part of this stream's history.
+    /// The request start, in nanoseconds. Giganto replays the events from
+    /// here, so an older event is not part of this request's history.
     request_start: i64,
-    open: Option<TimeSeries>,
-    last_closed: Option<TimeSeries>,
+    streams: Vec<StreamState>,
+    /// The start of the earliest window that is not yet due.
+    current: i64,
+    /// The windows from `current` on that have counted events, by start.
+    open: BTreeMap<i64, Window>,
+    last_closed: Option<Window>,
     /// Events dropped since the previous close.
     dropped: u64,
 }
 
 impl WindowBuilder {
-    /// Creates a builder for the stream of `policy` requested from
-    /// `request_start` (nanoseconds).
+    /// Creates a builder for `streams` generator streams of `policy`, all
+    /// requested from `request_start` (nanoseconds).
     ///
     /// # Errors
     ///
@@ -70,7 +171,13 @@ impl WindowBuilder {
     ///   `window_size % slot_size != 0`).
     /// - The policy's window size is not a divisor of 1 day (86400 seconds).
     /// - The series length overflows `usize`.
-    pub(super) fn try_new(policy: &TimeSeriesGenerationPolicy, request_start: i64) -> Result<Self> {
+    /// - `streams` is zero.
+    /// - The window of the request start overflows.
+    pub(super) fn try_new(
+        policy: &TimeSeriesGenerationPolicy,
+        request_start: i64,
+        streams: usize,
+    ) -> Result<Self> {
         let slot_size_secs = policy.slot_size.as_secs();
         let window_size_secs = policy.window_size.as_secs();
         if slot_size_secs == 0 {
@@ -85,6 +192,9 @@ impl WindowBuilder {
         if !window_size_secs.is_multiple_of(slot_size_secs) {
             bail!("window size must be a multiple of slot size");
         }
+        if streams == 0 {
+            bail!("a policy needs at least one stream");
+        }
 
         Ok(Self {
             policy: policy.clone(),
@@ -93,91 +203,265 @@ impl WindowBuilder {
             window_size_secs: i64::try_from(window_size_secs)?,
             slots: usize::try_from(window_size_secs / slot_size_secs)?,
             request_start,
-            open: None,
+            streams: std::iter::repeat_with(StreamState::default)
+                .take(streams)
+                .collect(),
+            current: start_time(policy, request_start.div_euclid(SECOND_TO_NANO))?,
+            open: BTreeMap::new(),
             last_closed: None,
             dropped: 0,
         })
     }
 
-    /// Counts an event at `timestamp` (nanoseconds) in its window, and
-    /// returns the window to write, if any: the open window when the event
-    /// belongs to a later one, or the last closed window when the event was
-    /// counted in it.
+    /// Binds an inbound stream to the policy and returns its index, or `None`
+    /// if every stream of the policy has already opened.
+    pub(super) fn open_stream(&mut self) -> Option<usize> {
+        let (index, stream) = self
+            .streams
+            .iter_mut()
+            .enumerate()
+            .find(|(_, stream)| !stream.opened)?;
+        stream.opened = true;
+        Some(index)
+    }
+
+    /// Records that stream `index` received an event at `timestamp`
+    /// (nanoseconds) at the monotonic time `now`, whether or not the event is
+    /// then counted.
+    pub(super) fn receive(&mut self, index: usize, timestamp: i64, now: Instant) {
+        let Some(stream) = self.streams.get_mut(index) else {
+            return;
+        };
+        stream.watermark = Some(stream.watermark.map_or(timestamp, |w| w.max(timestamp)));
+        if stream.replay_ended() {
+            stream.idle_start = Some(now);
+        }
+    }
+
+    /// Records that stream `index` received its replay-end frame at the
+    /// monotonic time `now`. Returns `false`, changing nothing, if the stream
+    /// had already received one.
+    pub(super) fn replay_end(&mut self, index: usize, now: Instant) -> bool {
+        let Some(stream) = self.streams.get_mut(index) else {
+            return false;
+        };
+        if stream.replay_ended() {
+            return false;
+        }
+        stream.idle_start = Some(now);
+        true
+    }
+
+    /// Records that stream `index` ended: it passes no window it had not
+    /// passed by `clock`.
+    pub(super) fn end_stream(&mut self, index: usize, clock: &PassClock) {
+        if let Some(stream) = self.streams.get_mut(index) {
+            stream.ended_bound = Some(stream.bound(clock));
+        }
+    }
+
+    /// Returns whether stream `index` holds an event and reads nothing more.
+    pub(super) fn is_paused(&self, index: usize) -> bool {
+        self.streams
+            .get(index)
+            .is_some_and(|stream| stream.held.is_some())
+    }
+
+    /// Returns the number of streams that have not opened and the number of
+    /// opened streams that have not received their replay-end frame.
+    pub(super) fn stall_counts(&self) -> (usize, usize) {
+        let unopened = self.streams.iter().filter(|s| !s.opened).count();
+        let replaying = self
+            .streams
+            .iter()
+            .filter(|s| s.opened && !s.replay_ended())
+            .count();
+        (unopened, replaying)
+    }
+
+    /// Counts an event that stream `index` received at `timestamp`
+    /// (nanoseconds), and returns the window to write again, if the event was
+    /// counted in the last closed one.
     ///
-    /// An event rejected by the policy's address filter still advances time:
-    /// it may close the open window, but it neither opens a window nor counts.
+    /// The event is counted in its window when that window is the earliest
+    /// one not yet due or the one after it. An event further ahead pauses the
+    /// stream (see [`Self::is_paused`]) until enough windows have closed,
+    /// unless the stream has not yet passed the earliest window, in which case
+    /// it is counted at once (see [`Self::counts_now`]). An event rejected by
+    /// the policy's address filter is never counted, and an event older than
+    /// the earliest window, other than one in the last closed window, is
+    /// dropped.
+    ///
+    /// Call [`Self::receive`] and [`Self::close_due`] for the event first.
     ///
     /// # Errors
     ///
     /// Returns an error if the event's window start or slot overflows, or if
     /// the policy sums a Conn field over an event of another kind.
-    pub(super) fn add(&mut self, timestamp: i64, event: &Event) -> Result<Option<TimeSeries>> {
-        let counted = self.accepts(event);
+    pub(super) fn add(
+        &mut self,
+        index: usize,
+        timestamp: i64,
+        event: &Event,
+    ) -> Result<Option<TimeSeries>> {
+        let accepted = self.accepts(event);
         if timestamp < self.request_start {
-            self.drop_event(counted);
+            self.drop_event(accepted);
+            return Ok(None);
+        }
+        if !accepted {
             return Ok(None);
         }
         let time_secs = timestamp.div_euclid(SECOND_TO_NANO);
         let window_start = start_time(&self.policy, time_secs)?;
         let value = event_value(self.policy.measure, event)?;
-
+        let key = value_key(&self.policy_id, event);
         let slot_size_secs = self.slot_size_secs;
-        match self.open.as_mut() {
-            Some(open) if window_start == open.start_secs => {
-                if counted {
-                    count(open, slot_size_secs, time_secs, value)?;
-                }
-                return Ok(None);
-            }
-            Some(open) if window_start > open.start_secs => {
-                let closed = self.close_open();
-                if counted {
-                    self.open_window(window_start, time_secs, value)?;
-                }
-                return Ok(closed);
-            }
-            _ => {}
-        }
+        let slots = self.slots;
 
-        // No window is open, or the event is older than the open one.
         if let Some(last) = self
             .last_closed
             .as_mut()
             .filter(|last| last.start_secs == window_start)
         {
-            if !counted {
-                return Ok(None);
-            }
-            count(last, slot_size_secs, time_secs, value)?;
-            return Ok(Some(last.clone()));
+            count_in(last, key, slots, slot_size_secs, time_secs, value)?;
+            return Ok(last.series(key));
         }
-        let newer_than_last = self
-            .last_closed
-            .as_ref()
-            .is_none_or(|last| window_start > last.start_secs);
-        if self.open.is_none() && newer_than_last {
-            if counted {
-                self.open_window(window_start, time_secs, value)?;
-            }
+        if window_start < self.current {
+            // Older than the last closed window, or a window that was never
+            // written because it had no events when it became due.
+            self.drop_event(true);
             return Ok(None);
         }
-        // Older than the last closed window, or a window that was never
-        // written because no event arrived before a later one opened.
-        self.drop_event(counted);
+        if self.counts_now(window_start, timestamp) {
+            count_open(
+                &mut self.open,
+                slots,
+                slot_size_secs,
+                window_start,
+                key,
+                time_secs,
+                value,
+            )?;
+            return Ok(None);
+        }
+        let held = HeldEvent {
+            timestamp,
+            window_start,
+            key: key.to_owned(),
+            value,
+        };
+        let Some(stream) = self.streams.get_mut(index) else {
+            bail!("no stream {index} in policy {}", self.policy_id);
+        };
+        stream.held = Some(held);
         Ok(None)
     }
 
-    /// Closes the open window once the wall clock `now_secs` is at least
-    /// [`CLOSE_GRACE_SECS`] past its end, and returns it for writing.
-    pub(super) fn close_if_due(&mut self, now_secs: i64) -> Option<TimeSeries> {
-        let open_start = self.open.as_ref()?.start_secs;
-        let due = open_start
-            .saturating_add(self.window_size_secs)
-            .saturating_add(CLOSE_GRACE_SECS);
-        if now_secs < due {
-            return None;
+    /// Closes the windows that every stream has passed by `clock`, in time
+    /// order, and returns those to write. A due window without events is not
+    /// written. Held events whose window may now be counted are counted, and
+    /// their streams resume.
+    pub(super) fn close_due(&mut self, clock: &PassClock) -> Vec<TimeSeries> {
+        let mut written = Vec::new();
+        loop {
+            let target = self
+                .streams
+                .iter()
+                .map(|stream| self.pass_limit(stream, clock))
+                .min()
+                .unwrap_or(i64::MIN);
+            if target <= self.current {
+                break;
+            }
+            let later = self.open.split_off(&target);
+            for (_, window) in std::mem::replace(&mut self.open, later) {
+                written.extend(self.close(window));
+            }
+            self.current = target;
+            self.release_held();
         }
-        self.close_open()
+        written
+    }
+
+    /// Returns the start of the earliest window `stream` has not passed.
+    ///
+    /// A stream that holds an event never passes the window before the held
+    /// event's window, so that the held event is counted before its window
+    /// can close.
+    fn pass_limit(&self, stream: &StreamState, clock: &PassClock) -> i64 {
+        let bound = stream.bound(clock);
+        let limit = if bound == i64::MIN {
+            i64::MIN
+        } else {
+            // A window is passed when its end plus the grace is below the
+            // bound, so the earliest one not passed is the one containing
+            // the bound minus the grace minus one nanosecond.
+            let last_passed_end = bound
+                .saturating_sub(CLOSE_GRACE_SECS.saturating_mul(SECOND_TO_NANO))
+                .saturating_sub(1);
+            start_time(&self.policy, last_passed_end.div_euclid(SECOND_TO_NANO)).unwrap_or(i64::MIN)
+        };
+        match &stream.held {
+            Some(held) => limit.min(held.window_start.saturating_sub(self.window_size_secs)),
+            None => limit,
+        }
+    }
+
+    /// Returns whether an event at `timestamp` in the window starting at
+    /// `window_start`, not older than the earliest window, is counted now
+    /// rather than held: its window is the earliest one or the next, or the
+    /// event has not passed the earliest window's end plus the grace.
+    ///
+    /// The second case arises only for windows shorter than the grace. A
+    /// stream holding such an event would not have passed the earliest window
+    /// by its events, so the window could close only by the wall clock, which
+    /// a replaying stream never reaches: holding it could deadlock the policy.
+    /// The windows open at once are therefore those starting at or before the
+    /// earliest window's end plus the grace: two when a window is longer than
+    /// the grace, and `2 + grace / window_size` (rounded down) otherwise.
+    fn counts_now(&self, window_start: i64, timestamp: i64) -> bool {
+        let next = self.current.saturating_add(self.window_size_secs);
+        window_start <= next
+            || timestamp
+                <= next
+                    .saturating_add(CLOSE_GRACE_SECS)
+                    .saturating_mul(SECOND_TO_NANO)
+    }
+
+    /// Counts every held event whose window may now be counted.
+    fn release_held(&mut self) {
+        for index in 0..self.streams.len() {
+            let Some(held) = self
+                .streams
+                .get(index)
+                .and_then(|stream| stream.held.as_ref())
+            else {
+                continue;
+            };
+            if !self.counts_now(held.window_start, held.timestamp) {
+                continue;
+            }
+            let Some(held) = self
+                .streams
+                .get_mut(index)
+                .and_then(|stream| stream.held.take())
+            else {
+                continue;
+            };
+            let time_secs = held.timestamp.div_euclid(SECOND_TO_NANO);
+            if let Err(e) = count_open(
+                &mut self.open,
+                self.slots,
+                self.slot_size_secs,
+                held.window_start,
+                &held.key,
+                time_secs,
+                held.value,
+            ) {
+                warn!("Failed to generate time series: {e}");
+            }
+        }
     }
 
     fn accepts(&self, event: &Event) -> bool {
@@ -196,38 +480,70 @@ impl WindowBuilder {
         }
     }
 
-    /// Opens the window starting at `start_secs` with its first event.
-    fn open_window(&mut self, start_secs: i64, time_secs: i64, value: f64) -> Result<()> {
-        let mut window = TimeSeries {
-            time_series_id: self.policy_id.clone(),
-            start_secs,
-            series: vec![0_f64; self.slots],
-        };
-        count(&mut window, self.slot_size_secs, time_secs, value)?;
-        self.open = Some(window);
-        Ok(())
-    }
-
-    /// Makes the open window the last closed one and returns it for writing.
-    fn close_open(&mut self) -> Option<TimeSeries> {
-        let closed = self.open.take()?;
+    /// Makes `window` the last closed one and returns its series for writing.
+    fn close(&mut self, window: Window) -> Vec<TimeSeries> {
         if self.dropped > 0 {
             warn!(
                 policy_id = %self.policy_id,
                 dropped = self.dropped,
-                "Dropped late events that neither the open nor the last closed window takes"
+                "Dropped late events that neither an open nor the last closed window takes"
             );
             self.dropped = 0;
         }
-        self.last_closed = Some(closed.clone());
-        Some(closed)
+        let series = window
+            .values
+            .keys()
+            .filter_map(|key| window.series(key))
+            .collect();
+        self.last_closed = Some(window);
+        series
     }
 }
 
-/// Adds `value` to the slot of `time_secs` in `window`.
-fn count(window: &mut TimeSeries, slot_size_secs: i64, time_secs: i64, value: f64) -> Result<()> {
+/// Returns the key of the series `event` adds to, given the policy's id: the
+/// policy's own id, as the policy is not grouped.
+fn value_key<'a>(policy_id: &'a str, _event: &Event) -> &'a str {
+    policy_id
+}
+
+/// Adds `value` at `time_secs` to the `key` series of the open window
+/// starting at `start_secs`, creating the window with its first event.
+fn count_open(
+    open: &mut BTreeMap<i64, Window>,
+    slots: usize,
+    slot_size_secs: i64,
+    start_secs: i64,
+    key: &str,
+    time_secs: i64,
+    value: f64,
+) -> Result<()> {
+    let window = open.entry(start_secs).or_insert_with(|| Window {
+        start_secs,
+        values: BTreeMap::new(),
+    });
+    count_in(window, key, slots, slot_size_secs, time_secs, value)
+}
+
+/// Adds `value` at `time_secs` to the `key` series of `window`, creating the
+/// series with `slots` zero slots if it has none.
+fn count_in(
+    window: &mut Window,
+    key: &str,
+    slots: usize,
+    slot_size_secs: i64,
+    time_secs: i64,
+    value: f64,
+) -> Result<()> {
     let slot = slot(slot_size_secs, window.start_secs, time_secs)?;
-    let Some(slot_value) = window.series.get_mut(slot) else {
+    let values = if let Some(values) = window.values.get_mut(key) {
+        values
+    } else {
+        window
+            .values
+            .entry(key.to_owned())
+            .or_insert_with(|| vec![0_f64; slots])
+    };
+    let Some(slot_value) = values.get_mut(slot) else {
         bail!("cannot access the time slot");
     };
     *slot_value += value;
@@ -730,13 +1046,13 @@ mod tests {
         // measure: Count => count events (each event adds 1.0)
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         // Event at 00:05:00 => slot 0
         let event_time = datetime_from_utc("2024/1/15 00:05:00");
         let conn = create_test_conn();
         builder
-            .add(nanos(event_time), &Event::Conn(conn))
+            .feed(nanos(event_time), &Event::Conn(conn))
             .expect("add should succeed");
 
         // Verify slot 0 has value 1.0
@@ -752,7 +1068,7 @@ mod tests {
         // measure: Count => count events
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         // Three events at different times within slot 0 (00:00 - 00:15)
         let event_times = [
@@ -764,7 +1080,7 @@ mod tests {
             let event_time = datetime_from_utc(event_time);
             let conn = create_test_conn();
             builder
-                .add(nanos(event_time), &Event::Conn(conn))
+                .feed(nanos(event_time), &Event::Conn(conn))
                 .expect("add should succeed");
         }
 
@@ -777,7 +1093,7 @@ mod tests {
         // Window: 1 hour, Slot: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         // Events in each slot
         // Slot 0: 00:05:00 (2 events)
@@ -800,7 +1116,7 @@ mod tests {
                 let event_time = datetime_from_utc(event_time);
                 let conn = create_test_conn();
                 builder
-                    .add(nanos(event_time), &Event::Conn(conn))
+                    .feed(nanos(event_time), &Event::Conn(conn))
                     .expect("add should succeed");
             }
             assert_eq!(
@@ -825,7 +1141,7 @@ mod tests {
             Measure::Sum(ConnField::Duration),
         );
 
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         // Add events with different durations to slot 0
         let durations = [1_000_000_000_i64, 2_000_000_000, 500_000_000];
@@ -838,7 +1154,7 @@ mod tests {
             let event_time = datetime_from_utc(event_time);
             let conn = create_conn_with_values(duration, 0, 0, 0, 0);
             builder
-                .add(nanos(event_time), &Event::Conn(conn))
+                .feed(nanos(event_time), &Event::Conn(conn))
                 .expect("add should succeed");
         }
 
@@ -865,7 +1181,7 @@ mod tests {
             Measure::Sum(ConnField::OrigBytes),
         );
 
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         // Add events with different orig_bytes to slot 1 (15-30 minutes)
         let bytes_values = [100_u64, 200, 300, 400];
@@ -879,7 +1195,7 @@ mod tests {
             let event_time = datetime_from_utc(event_time);
             let conn = create_conn_with_values(0, bytes, 0, 0, 0);
             builder
-                .add(nanos(event_time), &Event::Conn(conn))
+                .feed(nanos(event_time), &Event::Conn(conn))
                 .expect("add should succeed");
         }
 
@@ -909,7 +1225,7 @@ mod tests {
             Measure::Sum(ConnField::OrigPkts),
         );
 
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         // Add events to both slots
         // Slot 0: packets 10, 20, 30
@@ -923,7 +1239,7 @@ mod tests {
             let event_time = datetime_from_utc(event_time);
             let conn = create_conn_with_values(0, 0, 0, packets, 0);
             builder
-                .add(nanos(event_time), &Event::Conn(conn))
+                .feed(nanos(event_time), &Event::Conn(conn))
                 .expect("add should succeed");
         }
 
@@ -933,7 +1249,7 @@ mod tests {
             let event_time = datetime_from_utc(event_time);
             let conn = create_conn_with_values(0, 0, 0, packets, 0);
             builder
-                .add(nanos(event_time), &Event::Conn(conn))
+                .feed(nanos(event_time), &Event::Conn(conn))
                 .expect("add should succeed");
         }
 
@@ -958,29 +1274,35 @@ mod tests {
     fn test_add_window_boundary_sends_and_resets() {
         // Window: 1 hour, Slot: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         // Add an event in the first period (slot 0)
         let written = add_at(&mut builder, "2024/1/15 00:05:00");
-        assert!(written.is_none());
+        assert!(written.is_empty());
         assert_eq!(open(&builder).series[0], 1.0);
 
-        // An event of the next period writes the first window and opens the
-        // next one with that event.
-        let sent_series =
-            add_at(&mut builder, "2024/1/15 01:01:05").expect("the first window is written");
-        assert_eq!(
-            sent_series.start_secs,
-            datetime_from_utc("2024/1/15 00:00:00")
-        );
-        assert_eq!(sent_series.series, [1.0, 0.0, 0.0, 0.0]);
+        // Events of the next period within the first one's grace count there
+        // and leave the first open; exactly end + 900 s has not passed it.
+        assert!(add_at(&mut builder, "2024/1/15 01:01:05").is_empty());
+        assert!(add_at(&mut builder, "2024/1/15 01:15:00").is_empty());
+        assert_eq!(open_windows(&builder).len(), 2);
 
-        // The new event at 01:01:05 falls into slot 0 of the new period
+        // An event past the first window's end plus the grace writes it.
+        let written = add_at(&mut builder, "2024/1/15 01:15:01");
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![1.0, 0.0, 0.0, 0.0]
+            )]
+        );
+
+        // The next period holds the three events after 01:00.
         assert_eq!(
             open(&builder).start_secs,
             datetime_from_utc("2024/1/15 01:00:00")
         );
-        assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(open(&builder).series, [1.0, 2.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -994,7 +1316,7 @@ mod tests {
             32_400,
             Measure::Count,
         );
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         for event_time in [
             "2022/11/17 00:03:00",
@@ -1003,7 +1325,7 @@ mod tests {
         ] {
             let conn = create_test_conn();
             builder
-                .add(nanos(datetime_from_utc(event_time)), &Event::Conn(conn))
+                .feed(nanos(datetime_from_utc(event_time)), &Event::Conn(conn))
                 .expect("add should succeed");
         }
 
@@ -1018,14 +1340,14 @@ mod tests {
         let policy = create_policy(1, SECS_PER_DAY, SECS_PER_HOUR, 32_400, Measure::Count);
 
         let kst_midnight_utc = datetime_from_utc("2024/1/14 15:00:00");
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
         // The window opens at its first event's KST midnight.
 
         // KST midnight (UTC 15:00) event maps to slot 0
         let event_time = datetime_from_utc("2024/1/14 15:00:00");
         let conn = create_test_conn();
         builder
-            .add(nanos(event_time), &Event::Conn(conn))
+            .feed(nanos(event_time), &Event::Conn(conn))
             .expect("add should succeed");
 
         assert_eq!(open(&builder).start_secs, kst_midnight_utc);
@@ -1044,7 +1366,7 @@ mod tests {
         // Window: 1 hour, Slot: 10 min => 6 slots
         let policy = create_policy(1, SECS_PER_HOUR, 10 * SECS_PER_MINUTE, 0, Measure::Count);
 
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         // Only add events to slots 0, 2, and 5 (skip 1, 3, 4)
         let event_times = [
@@ -1056,7 +1378,7 @@ mod tests {
             let event_time = datetime_from_utc(event_time);
             let conn = create_test_conn();
             builder
-                .add(nanos(event_time), &Event::Conn(conn))
+                .feed(nanos(event_time), &Event::Conn(conn))
                 .expect("add should succeed");
         }
 
@@ -1074,14 +1396,14 @@ mod tests {
         // Window: 1 hour, Slot: 15 min => 4 slots
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
 
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
 
         // Add multiple events with exactly the same timestamp
         let event_time = datetime_from_utc("2024/1/15 00:05:00");
         for _ in 0..5 {
             let conn = create_test_conn();
             builder
-                .add(nanos(event_time), &Event::Conn(conn))
+                .feed(nanos(event_time), &Event::Conn(conn))
                 .expect("add should succeed");
         }
 
@@ -1096,9 +1418,14 @@ mod tests {
     fn try_new_opens_no_window_at_the_request_start() {
         let policy = create_simple_policy(60, 3600);
         for request_start in [1_700_003_600_000_000_001, -1, 0] {
-            let builder = WindowBuilder::try_new(&policy, request_start).unwrap();
+            let builder = single(&policy, request_start).unwrap();
             assert_eq!(builder.request_start, request_start);
-            assert!(builder.open.is_none());
+            assert_eq!(
+                builder.current,
+                start_time(&policy, request_start.div_euclid(SECOND_TO_NANO)).unwrap(),
+                "windows become due from the one of the request start"
+            );
+            assert!(builder.open.is_empty());
             assert!(builder.last_closed.is_none());
         }
     }
@@ -1107,7 +1434,7 @@ mod tests {
     fn try_new_valid_window_and_slot_sizes() {
         // window size (3600) is a multiple of slot size (60)
         let policy = create_simple_policy(60, 3600);
-        let result = WindowBuilder::try_new(&policy, 0);
+        let result = single(&policy, 0);
         assert!(result.is_ok());
         let ts = result.unwrap();
         assert_eq!(ts.slots, 60); // 3600 / 60 = 60
@@ -1117,7 +1444,7 @@ mod tests {
     fn try_new_invalid_window_not_divisor_of_1_day() {
         // window size (777) is not a divisor of 1 day (86400 seconds)
         let policy = create_simple_policy(7, 777);
-        let result = WindowBuilder::try_new(&policy, 0);
+        let result = single(&policy, 0);
         let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
             err_msg.contains("window size must be a divisor of 1 day (86400 seconds)"),
@@ -1129,7 +1456,7 @@ mod tests {
     fn try_new_invalid_window_not_multiple_of_slot() {
         // window size (100) is not a multiple of slot size (30)
         let policy = create_simple_policy(30, 100);
-        let result = WindowBuilder::try_new(&policy, 0);
+        let result = single(&policy, 0);
         let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
             err_msg.contains("window size must be a multiple of slot size"),
@@ -1141,7 +1468,7 @@ mod tests {
     fn try_new_slot_size_zero() {
         // slot size is 0, should error before division
         let policy = create_simple_policy(0, 3600);
-        let result = WindowBuilder::try_new(&policy, 0);
+        let result = single(&policy, 0);
         let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
             err_msg.contains("slot size must be greater than 0"),
@@ -1153,7 +1480,7 @@ mod tests {
     fn try_new_window_size_zero() {
         // window size is 0, should error
         let policy = create_simple_policy(60, 0);
-        let result = WindowBuilder::try_new(&policy, 0);
+        let result = single(&policy, 0);
         let err_msg = result.err().expect("the policy is rejected").to_string();
         assert!(
             err_msg.contains("window size must be greater than 0"),
@@ -1169,18 +1496,114 @@ mod tests {
         secs * SECOND_TO_NANO
     }
 
-    fn open(builder: &WindowBuilder) -> &TimeSeries {
-        builder.open.as_ref().expect("a window is open")
+    /// A builder for `policy` over one stream, which has opened.
+    fn single(policy: &TimeSeriesGenerationPolicy, request_start: i64) -> Result<WindowBuilder> {
+        let mut builder = WindowBuilder::try_new(policy, request_start, 1)?;
+        builder.open_stream().expect("the stream opens");
+        Ok(builder)
     }
 
-    /// Adds a counted event at `datetime` and returns the window to write.
-    fn add_at(builder: &mut WindowBuilder, datetime: &str) -> Option<TimeSeries> {
+    /// A clock under which no stream passes a window by being quiet.
+    fn event_time_only() -> PassClock {
+        PassClock {
+            wall_secs: i64::MIN,
+            now: Instant::now(),
+            idle: Duration::from_secs(30),
+        }
+    }
+
+    /// Delivers events to a builder as the policy runner does.
+    trait Feed {
+        /// Delivers an event on stream 0 and returns the windows written.
+        fn feed(&mut self, timestamp: i64, event: &Event) -> Result<Vec<TimeSeries>> {
+            self.feed_on(0, timestamp, event)
+        }
+
+        /// Delivers an event on `stream` and returns the windows written.
+        fn feed_on(
+            &mut self,
+            stream: usize,
+            timestamp: i64,
+            event: &Event,
+        ) -> Result<Vec<TimeSeries>>;
+    }
+
+    impl Feed for WindowBuilder {
+        fn feed_on(
+            &mut self,
+            stream: usize,
+            timestamp: i64,
+            event: &Event,
+        ) -> Result<Vec<TimeSeries>> {
+            self.receive(stream, timestamp, Instant::now());
+            let mut written = self.close_due(&event_time_only());
+            written.extend(self.add(stream, timestamp, event)?);
+            Ok(written)
+        }
+    }
+
+    /// Returns the earliest open window.
+    fn open(builder: &WindowBuilder) -> TimeSeries {
         builder
-            .add(
+            .open
+            .values()
+            .next()
+            .and_then(|window| window.series(&builder.policy_id))
+            .expect("a window is open")
+    }
+
+    /// Adds a counted event at `datetime` on stream 0 and returns the windows
+    /// written.
+    fn add_at(builder: &mut WindowBuilder, datetime: &str) -> Vec<TimeSeries> {
+        add_on(builder, 0, datetime)
+    }
+
+    /// Adds a counted event at `datetime` on stream `stream` and returns the
+    /// windows written.
+    fn add_on(builder: &mut WindowBuilder, stream: usize, datetime: &str) -> Vec<TimeSeries> {
+        builder
+            .feed_on(
+                stream,
                 nanos(datetime_from_utc(datetime)),
                 &Event::Conn(create_test_conn()),
             )
             .expect("add should succeed")
+    }
+
+    /// Returns the start and the values of every written window.
+    fn starts_and_values(written: &[TimeSeries]) -> Vec<(i64, Vec<f64>)> {
+        written
+            .iter()
+            .map(|series| (series.start_secs, series.series.clone()))
+            .collect()
+    }
+
+    /// Returns the start and the values of every open window.
+    fn open_windows(builder: &WindowBuilder) -> Vec<(i64, Vec<f64>)> {
+        builder
+            .open
+            .values()
+            .filter_map(|window| window.series(&builder.policy_id))
+            .map(|series| (series.start_secs, series.series))
+            .collect()
+    }
+
+    fn last_closed(builder: &WindowBuilder) -> TimeSeries {
+        builder
+            .last_closed
+            .as_ref()
+            .and_then(|window| window.series(&builder.policy_id))
+            .expect("a window was closed")
+    }
+
+    /// Returns a clock for `after` past `origin` at the wall clock
+    /// `wall_secs`, with the production idle time.
+    fn clock_at(origin: Instant, after: Duration, wall_secs: i64) -> PassClock {
+        PassClock {
+            wall_secs,
+            now: origin + after,
+            idle: Duration::from_secs(30),
+        }
     }
 
     fn conn_between(orig_addr: &str, resp_addr: &str) -> Event {
@@ -1195,9 +1618,9 @@ mod tests {
     fn first_event_opens_its_window_and_the_first_close_writes_it() {
         // Window: 1 hour, Slot: 15 min. No checkpoint: the request starts at 0.
         for (offset, window_start, next_event) in [
-            (0, "2024/1/15 05:00:00", "2024/1/15 06:10:00"),
+            (0, "2024/1/15 05:00:00", "2024/1/15 06:20:00"),
             // With offset 13200 (3h40m) an hourly window starts at hh:20.
-            (13_200, "2024/1/15 05:20:00", "2024/1/15 06:25:00"),
+            (13_200, "2024/1/15 05:20:00", "2024/1/15 06:40:00"),
         ] {
             let policy = create_policy(
                 1,
@@ -1206,12 +1629,15 @@ mod tests {
                 offset,
                 Measure::Count,
             );
-            let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+            let mut builder = single(&policy, 0).unwrap();
 
-            assert!(add_at(&mut builder, "2024/1/15 05:40:00").is_none());
+            assert!(add_at(&mut builder, "2024/1/15 05:40:00").is_empty());
             assert_eq!(open(&builder).start_secs, datetime_from_utc(window_start));
 
-            let written = add_at(&mut builder, next_event).expect("the first window is written");
+            let written = add_at(&mut builder, next_event);
+            let [written] = written.as_slice() else {
+                panic!("the first window is written: {written:?}");
+            };
             assert_eq!(written.start_secs, datetime_from_utc(window_start));
             assert_ne!(written.start_secs, 0);
             assert_eq!(written.series.iter().sum::<f64>(), 1.0);
@@ -1224,7 +1650,7 @@ mod tests {
         // window after it, 06:00, had no events.
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         let checkpoint = datetime_from_utc("2024/1/15 05:00:00");
-        let mut builder = WindowBuilder::try_new(&policy, nanos(checkpoint)).unwrap();
+        let mut builder = single(&policy, nanos(checkpoint)).unwrap();
 
         let mut written = Vec::new();
         for event in [
@@ -1248,44 +1674,56 @@ mod tests {
     #[test]
     fn late_event_for_the_last_closed_window_rewrites_it() {
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
         add_at(&mut builder, "2024/1/15 00:05:00");
-        let first = add_at(&mut builder, "2024/1/15 01:05:00").expect("00:00 is written");
-        assert_eq!(first.series, [1.0, 0.0, 0.0, 0.0]);
+        let first = add_at(&mut builder, "2024/1/15 01:20:00");
+        let window = datetime_from_utc("2024/1/15 00:00:00");
+        assert_eq!(
+            starts_and_values(&first),
+            [(window, vec![1.0, 0.0, 0.0, 0.0])]
+        );
 
-        let rewritten = add_at(&mut builder, "2024/1/15 00:35:00").expect("00:00 is rewritten");
-        assert_eq!(rewritten.start_secs, first.start_secs);
-        assert_eq!(rewritten.series, [1.0, 0.0, 1.0, 0.0]);
+        let rewritten = add_at(&mut builder, "2024/1/15 00:35:00");
+        assert_eq!(
+            starts_and_values(&rewritten),
+            [(window, vec![1.0, 0.0, 1.0, 0.0])]
+        );
 
         // The open window is unchanged.
         assert_eq!(
             open(&builder).start_secs,
             datetime_from_utc("2024/1/15 01:00:00")
         );
-        assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(open(&builder).series, [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(builder.dropped, 0);
     }
 
     #[test]
     fn event_older_than_the_last_closed_window_is_dropped_and_counted() {
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
         add_at(&mut builder, "2024/1/15 00:05:00");
-        add_at(&mut builder, "2024/1/15 01:05:00").expect("00:00 is written");
-        add_at(&mut builder, "2024/1/15 02:05:00").expect("01:00 is written");
+        assert_eq!(add_at(&mut builder, "2024/1/15 01:20:00").len(), 1, "00:00");
+        assert_eq!(add_at(&mut builder, "2024/1/15 02:20:00").len(), 1, "01:00");
 
-        assert!(add_at(&mut builder, "2024/1/15 00:10:00").is_none());
+        assert!(add_at(&mut builder, "2024/1/15 00:10:00").is_empty());
         assert_eq!(builder.dropped, 1);
-        assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(
-            builder.last_closed.as_ref().unwrap().series,
-            [1.0, 0.0, 0.0, 0.0]
-        );
+        assert_eq!(open(&builder).series, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(last_closed(&builder).series, [0.0, 1.0, 0.0, 0.0]);
 
-        // A gap window, never written because it had no events, takes none.
-        add_at(&mut builder, "2024/1/15 04:05:00").expect("02:00 is written");
+        // A gap window, never written because it had no events when it
+        // became due, takes none.
+        let written = add_at(&mut builder, "2024/1/15 05:20:00");
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 02:00:00"),
+                vec![0.0, 1.0, 0.0, 0.0]
+            )],
+            "03:00 and 04:00 are due without events and not written"
+        );
         assert_eq!(builder.dropped, 0, "the close reports and resets the count");
-        assert!(add_at(&mut builder, "2024/1/15 03:05:00").is_none());
+        assert!(add_at(&mut builder, "2024/1/15 03:05:00").is_empty());
         assert_eq!(builder.dropped, 1);
     }
 
@@ -1293,48 +1731,460 @@ mod tests {
     fn event_before_the_request_start_is_dropped_and_opens_no_window() {
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         let request_start = nanos(datetime_from_utc("2024/1/15 05:00:00"));
-        let mut builder = WindowBuilder::try_new(&policy, request_start).unwrap();
+        let mut builder = single(&policy, request_start).unwrap();
 
         let written = builder
-            .add(request_start - 1, &Event::Conn(create_test_conn()))
+            .feed(request_start - 1, &Event::Conn(create_test_conn()))
             .unwrap();
-        assert!(written.is_none());
-        assert!(builder.open.is_none());
+        assert!(written.is_empty());
+        assert!(builder.open.is_empty());
         assert_eq!(builder.dropped, 1);
 
         builder
-            .add(request_start, &Event::Conn(create_test_conn()))
+            .feed(request_start, &Event::Conn(create_test_conn()))
             .unwrap();
         assert_eq!(open(&builder).start_secs, request_start / SECOND_TO_NANO);
     }
 
     #[test]
-    fn timer_closes_the_open_window_after_its_grace() {
+    fn quiet_stream_passes_after_its_replay_end_idle_and_the_wall_clock() {
         let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
         add_at(&mut builder, "2024/1/15 00:05:00");
         let end = datetime_from_utc("2024/1/15 01:00:00");
+        let origin = Instant::now();
+        let at = |after_secs, wall| clock_at(origin, Duration::from_secs(after_secs), wall);
 
+        // Before its replay end a stream never passes by the wall clock,
+        // however long it is quiet.
+        assert!(builder.close_due(&at(86_400, end + 86_400)).is_empty());
+
+        assert!(builder.replay_end(0, origin));
         assert_eq!(CLOSE_GRACE_SECS, 900);
-        assert!(builder.close_if_due(end + 899).is_none());
-        let written = builder.close_if_due(end + 900).expect("due at end + 900 s");
-        assert_eq!(written.start_secs, datetime_from_utc("2024/1/15 00:00:00"));
-        assert_eq!(written.series, [1.0, 0.0, 0.0, 0.0]);
-        assert!(builder.open.is_none());
-        assert!(builder.close_if_due(end + 10_000).is_none(), "written once");
+        assert!(
+            builder.close_due(&at(29, end + 10_000)).is_empty(),
+            "idle 29 s"
+        );
+        assert!(
+            builder.close_due(&at(30, end + 899)).is_empty(),
+            "end + 899 s"
+        );
+        let written = builder.close_due(&at(30, end + 900));
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![1.0, 0.0, 0.0, 0.0]
+            )],
+            "due at idle 30 s and end + 900 s"
+        );
+        assert!(builder.open.is_empty());
+        assert!(
+            builder.close_due(&at(60, end + 10_000)).is_empty(),
+            "written once"
+        );
 
-        // A straggler after the timer close rewrites the window.
-        let rewritten = add_at(&mut builder, "2024/1/15 00:50:00").expect("rewritten");
-        assert_eq!(rewritten.start_secs, written.start_secs);
-        assert_eq!(rewritten.series, [1.0, 0.0, 0.0, 1.0]);
-        assert!(builder.open.is_none());
+        // A straggler after the close rewrites the window.
+        let rewritten = add_at(&mut builder, "2024/1/15 00:50:00");
+        assert_eq!(
+            starts_and_values(&rewritten),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![1.0, 0.0, 0.0, 1.0]
+            )]
+        );
+        assert!(builder.open.is_empty());
     }
 
     #[test]
-    fn filter_rejected_event_closes_but_neither_opens_nor_counts() {
+    fn idle_start_follows_the_last_event_after_the_replay_end() {
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
+        let mut builder = single(&policy, 0).unwrap();
+        let event = nanos(datetime_from_utc("2024/1/15 00:05:00"));
+        let end = datetime_from_utc("2024/1/15 01:00:00");
+        let origin = Instant::now();
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), end + 900);
+
+        // An event before the replay end does not start the idle time.
+        builder.receive(0, event, origin + Duration::from_secs(100));
+        builder
+            .add(0, event, &Event::Conn(create_test_conn()))
+            .unwrap();
+        assert!(builder.replay_end(0, origin));
+        // An event after the replay end restarts it.
+        builder.receive(0, event, origin + Duration::from_secs(20));
+        builder
+            .add(0, event, &Event::Conn(create_test_conn()))
+            .unwrap();
+        assert!(builder.close_due(&at(49)).is_empty(), "idle since 20 s");
+        assert_eq!(builder.close_due(&at(50)).len(), 1);
+    }
+
+    #[test]
+    fn second_replay_end_changes_nothing() {
+        let policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
+        let mut builder = single(&policy, 0).unwrap();
+        add_at(&mut builder, "2024/1/15 00:05:00");
+        let end = datetime_from_utc("2024/1/15 01:00:00");
+        let origin = Instant::now();
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), end + 900);
+
+        assert!(builder.replay_end(0, origin));
+        assert!(
+            !builder.replay_end(0, origin + Duration::from_secs(20)),
+            "a second replay end is not a replay end"
+        );
+        assert_eq!(builder.stall_counts(), (0, 0));
+        assert_eq!(
+            builder.close_due(&at(30)).len(),
+            1,
+            "the idle start is still the first replay end"
+        );
+    }
+
+    // =========================================================================
+    // Tests for a policy over several streams
+    // =========================================================================
+
+    /// A builder for `policy` over two streams requested from 2024/1/15 00:00,
+    /// both opened.
+    fn pair(policy: &TimeSeriesGenerationPolicy) -> WindowBuilder {
+        let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
+        let mut builder = WindowBuilder::try_new(policy, start, 2).unwrap();
+        assert_eq!(builder.open_stream(), Some(0));
+        assert_eq!(builder.open_stream(), Some(1));
+        builder
+    }
+
+    fn hourly() -> TimeSeriesGenerationPolicy {
+        create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count)
+    }
+
+    #[test]
+    fn events_of_every_stream_add_into_the_same_window_and_slot() {
+        let mut builder = pair(&hourly());
+        add_on(&mut builder, 0, "2024/1/15 00:05:00");
+        add_on(&mut builder, 1, "2024/1/15 00:06:00");
+        add_on(&mut builder, 1, "2024/1/15 00:20:00");
+        assert_eq!(
+            open_windows(&builder),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![2.0, 1.0, 0.0, 0.0]
+            )]
+        );
+        assert_eq!(open(&builder).time_series_id, "1");
+    }
+
+    #[test]
+    fn window_closes_only_once_every_stream_passed_it() {
+        let mut builder = pair(&hourly());
+        add_on(&mut builder, 0, "2024/1/15 00:05:00");
+        add_on(&mut builder, 1, "2024/1/15 00:10:00");
+
+        // Stream 0 is past 00:00's end plus the grace; stream 1 is not.
+        assert!(add_on(&mut builder, 0, "2024/1/15 01:20:00").is_empty());
+        // Stream 1's later events still count in 00:00.
+        assert!(add_on(&mut builder, 1, "2024/1/15 00:50:00").is_empty());
+        assert!(add_on(&mut builder, 1, "2024/1/15 01:15:00").is_empty());
+
+        let written = add_on(&mut builder, 1, "2024/1/15 01:15:01");
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![2.0, 0.0, 0.0, 1.0]
+            )]
+        );
+        assert_eq!(
+            open_windows(&builder),
+            [(
+                datetime_from_utc("2024/1/15 01:00:00"),
+                vec![0.0, 3.0, 0.0, 0.0]
+            )]
+        );
+    }
+
+    #[test]
+    fn unopened_stream_holds_every_window_open() {
+        let policy = hourly();
+        let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
+        let end = datetime_from_utc("2024/1/15 01:00:00");
+        let origin = Instant::now();
+        let mut builder = WindowBuilder::try_new(&policy, start, 2).unwrap();
+        assert_eq!(builder.stall_counts(), (2, 0));
+        assert_eq!(builder.open_stream(), Some(0));
+        assert_eq!(builder.stall_counts(), (1, 1));
+
+        add_on(&mut builder, 0, "2024/1/15 00:05:00");
+        assert!(builder.replay_end(0, origin));
+        assert_eq!(builder.stall_counts(), (1, 0));
+        // Stream 0 is past 00:00 by event time and by the wall clock.
+        assert!(add_on(&mut builder, 0, "2024/1/15 01:20:00").is_empty());
+        let far = clock_at(origin, Duration::from_hours(24), end + 86_400);
+        assert!(builder.close_due(&far).is_empty());
+
+        // The late stream opens and replays: its events of 00:00 count there.
+        assert_eq!(builder.open_stream(), Some(1));
+        assert_eq!(builder.open_stream(), None, "only two streams bind");
+        assert_eq!(builder.stall_counts(), (0, 1));
+        assert!(add_on(&mut builder, 1, "2024/1/15 00:30:00").is_empty());
+        let written = add_on(&mut builder, 1, "2024/1/15 01:16:00");
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![1.0, 0.0, 1.0, 0.0]
+            )]
+        );
+    }
+
+    #[test]
+    fn replaying_stream_never_passes_by_idle() {
+        let mut builder = pair(&hourly());
+        let end = datetime_from_utc("2024/1/15 01:00:00");
+        let origin = Instant::now();
+        add_on(&mut builder, 0, "2024/1/15 00:05:00");
+        add_on(&mut builder, 1, "2024/1/15 00:06:00");
+        assert!(builder.replay_end(0, origin));
+
+        // Stream 1 has not reached its replay end: an hour quiet with the wall
+        // clock a day past the window's end does not pass it.
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), end + 86_400);
+        assert!(builder.close_due(&at(3600)).is_empty());
+        assert_eq!(builder.stall_counts(), (0, 1));
+
+        // Its replay continues into the same window, then ends.
+        assert!(add_on(&mut builder, 1, "2024/1/15 00:40:00").is_empty());
+        assert!(builder.replay_end(1, origin + Duration::from_secs(3600)));
+        assert_eq!(builder.stall_counts(), (0, 0));
+        assert!(builder.close_due(&at(3629)).is_empty());
+        let written = builder.close_due(&at(3630));
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![2.0, 0.0, 1.0, 0.0]
+            )]
+        );
+    }
+
+    #[test]
+    fn stream_with_nothing_to_replay_passes_30_s_after_its_replay_end() {
+        let mut builder = pair(&hourly());
+        let end = datetime_from_utc("2024/1/15 01:00:00");
+        let origin = Instant::now();
+        add_on(&mut builder, 0, "2024/1/15 00:05:00");
+        assert!(builder.replay_end(0, origin));
+        assert!(builder.replay_end(1, origin + Duration::from_secs(100)));
+
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), end + 900);
+        assert!(builder.close_due(&at(129)).is_empty());
+        assert_eq!(builder.close_due(&at(130)).len(), 1);
+    }
+
+    #[test]
+    fn event_two_windows_ahead_pauses_its_stream_until_the_window_closes() {
+        // No stream has reached its replay end: the window closes by event
+        // time alone.
+        let mut builder = pair(&hourly());
+        add_on(&mut builder, 0, "2024/1/15 00:05:00");
+        add_on(&mut builder, 1, "2024/1/15 00:10:00");
+
+        assert!(add_on(&mut builder, 0, "2024/1/15 02:30:00").is_empty());
+        assert!(builder.is_paused(0));
+        assert!(!builder.is_paused(1));
+        assert_eq!(
+            open_windows(&builder),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![2.0, 0.0, 0.0, 0.0]
+            )],
+            "the held event is not counted yet"
+        );
+
+        // Stream 1 passes 00:00; the held event counts in 02:00.
+        let written = add_on(&mut builder, 1, "2024/1/15 01:20:00");
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![2.0, 0.0, 0.0, 0.0]
+            )]
+        );
+        assert!(!builder.is_paused(0));
+        assert_eq!(
+            open_windows(&builder),
+            [
+                (
+                    datetime_from_utc("2024/1/15 01:00:00"),
+                    vec![0.0, 1.0, 0.0, 0.0]
+                ),
+                (
+                    datetime_from_utc("2024/1/15 02:00:00"),
+                    vec![0.0, 0.0, 1.0, 0.0]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn paused_stream_resumes_once_the_other_passes_by_idle() {
+        let mut builder = pair(&hourly());
+        let end = datetime_from_utc("2024/1/15 01:00:00");
+        let origin = Instant::now();
+        add_on(&mut builder, 0, "2024/1/15 00:05:00");
+        assert!(add_on(&mut builder, 0, "2024/1/15 02:30:00").is_empty());
+        assert!(builder.is_paused(0));
+        assert!(builder.replay_end(1, origin));
+
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), end + 900);
+        assert!(builder.close_due(&at(29)).is_empty());
+        assert!(builder.is_paused(0));
+        let written = builder.close_due(&at(30));
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![1.0, 0.0, 0.0, 0.0]
+            )]
+        );
+        assert!(!builder.is_paused(0));
+        assert_eq!(
+            open_windows(&builder),
+            [(
+                datetime_from_utc("2024/1/15 02:00:00"),
+                vec![0.0, 0.0, 1.0, 0.0]
+            )]
+        );
+    }
+
+    #[test]
+    fn held_event_is_counted_before_its_window_can_close() {
+        // Both streams end up far past every window by the wall clock, but
+        // the held window still takes the held event.
+        let mut builder = pair(&hourly());
+        let origin = Instant::now();
+        add_on(&mut builder, 0, "2024/1/15 00:05:00");
+        assert!(add_on(&mut builder, 0, "2024/1/15 02:30:00").is_empty());
+        assert!(builder.replay_end(0, origin));
+        assert!(builder.replay_end(1, origin));
+        let far = clock_at(
+            origin,
+            Duration::from_secs(60),
+            datetime_from_utc("2024/1/16 00:00:00"),
+        );
+        let written = builder.close_due(&far);
+        assert_eq!(
+            starts_and_values(&written),
+            [
+                (
+                    datetime_from_utc("2024/1/15 00:00:00"),
+                    vec![1.0, 0.0, 0.0, 0.0]
+                ),
+                (
+                    datetime_from_utc("2024/1/15 02:00:00"),
+                    vec![0.0, 0.0, 1.0, 0.0]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn streams_replayed_at_different_speeds_lose_no_events() {
+        const EVENTS: i64 = 36;
+        let mut builder = pair(&hourly());
+        let start = datetime_from_utc("2024/1/15 00:00:00");
+        // One event every 10 minutes over six hours on each stream. Stream 0
+        // is replayed five times as fast as stream 1.
+        let mut queues: [std::collections::VecDeque<i64>; 2] =
+            std::array::from_fn(|_| (0..EVENTS).map(|i| nanos(start + i * 600)).collect());
+        let mut written = Vec::new();
+        let mut paused = false;
+        while queues.iter().any(|queue| !queue.is_empty()) {
+            let mut progressed = false;
+            for (stream, batch) in [(0, 5), (1, 1)] {
+                for _ in 0..batch {
+                    if builder.is_paused(stream) {
+                        paused = true;
+                        break;
+                    }
+                    let Some(timestamp) = queues[stream].pop_front() else {
+                        break;
+                    };
+                    progressed = true;
+                    written.extend(
+                        builder
+                            .feed_on(stream, timestamp, &Event::Conn(create_test_conn()))
+                            .unwrap(),
+                    );
+                }
+            }
+            assert!(progressed, "a pause never deadlocks");
+        }
+        assert!(paused, "the faster stream pauses");
+        let origin = Instant::now();
+        assert!(builder.replay_end(0, origin));
+        assert!(builder.replay_end(1, origin));
+        written.extend(builder.close_due(&clock_at(
+            origin,
+            Duration::from_secs(60),
+            datetime_from_utc("2024/1/16 00:00:00"),
+        )));
+
+        let mut last_values = BTreeMap::new();
+        for series in written {
+            last_values.insert(series.start_secs, series.series);
+        }
+        assert_eq!(last_values.len(), 6);
+        for (window_start, values) in &last_values {
+            // Per stream: 00 and 10 in slot 0, 20 in 1, 30 and 40 in 2, 50 in 3.
+            assert_eq!(values, &[4.0, 2.0, 4.0, 2.0], "{window_start}");
+        }
+        assert_eq!(builder.dropped, 0);
+    }
+
+    #[test]
+    fn event_not_past_the_earliest_windows_grace_is_counted_not_held() {
+        // With 1-minute windows an event two windows ahead is still within
+        // the earliest window's grace; its stream has not passed that window,
+        // so holding it could never resume.
+        let policy = create_policy(1, SECS_PER_MINUTE, SECS_PER_MINUTE, 0, Measure::Count);
+        let mut builder = pair(&policy);
+        add_on(&mut builder, 0, "2024/1/15 00:00:10");
+        add_on(&mut builder, 0, "2024/1/15 00:02:10");
+        add_on(&mut builder, 0, "2024/1/15 00:15:30");
+        assert!(!builder.is_paused(0));
+        assert_eq!(open_windows(&builder).len(), 3);
+
+        // Past the earliest window's grace, an event two windows ahead holds.
+        assert!(add_on(&mut builder, 0, "2024/1/15 00:16:30").is_empty());
+        assert!(builder.is_paused(0));
+        let written = add_on(&mut builder, 1, "2024/1/15 00:16:01");
+        assert_eq!(written.len(), 1, "00:00 closes");
+        assert!(!builder.is_paused(0));
+    }
+
+    #[test]
+    fn ended_stream_passes_no_further_window() {
+        let mut builder = pair(&hourly());
+        let end = datetime_from_utc("2024/1/15 01:00:00");
+        let origin = Instant::now();
+        add_on(&mut builder, 0, "2024/1/15 00:05:00");
+        add_on(&mut builder, 1, "2024/1/15 00:06:00");
+        assert!(builder.replay_end(1, origin));
+        builder.end_stream(1, &clock_at(origin, Duration::ZERO, end));
+        assert!(add_on(&mut builder, 0, "2024/1/15 01:20:00").is_empty());
+        assert!(builder.replay_end(0, origin));
+        let far = clock_at(origin, Duration::from_secs(3600), end + 86_400);
+        assert!(builder.close_due(&far).is_empty());
+    }
+
+    #[test]
+    fn filter_rejected_event_passes_windows_but_neither_opens_nor_counts() {
         let mut policy = create_policy(1, SECS_PER_HOUR, 15 * SECS_PER_MINUTE, 0, Measure::Count);
         policy.src_ip = Some("10.0.0.1".parse().unwrap());
-        let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+        let mut builder = single(&policy, 0).unwrap();
         let accepted = conn_between("10.0.0.1", "10.0.0.9");
         let rejected = conn_between("10.0.0.2", "10.0.0.9");
         let at = |datetime| nanos(datetime_from_utc(datetime));
@@ -1342,37 +2192,38 @@ mod tests {
         // A rejected event neither opens a window nor counts.
         assert!(
             builder
-                .add(at("2024/1/15 00:01:00"), &rejected)
+                .feed(at("2024/1/15 00:01:00"), &rejected)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
-        assert!(builder.open.is_none());
-        builder.add(at("2024/1/15 00:05:00"), &accepted).unwrap();
-        builder.add(at("2024/1/15 00:06:00"), &rejected).unwrap();
+        assert!(builder.open.is_empty());
+        builder.feed(at("2024/1/15 00:05:00"), &accepted).unwrap();
+        builder.feed(at("2024/1/15 00:06:00"), &rejected).unwrap();
         assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
 
-        // A rejected event of a later window closes the open one.
-        let written = builder
-            .add(at("2024/1/15 01:05:00"), &rejected)
-            .unwrap()
-            .expect("the open window is written");
-        assert_eq!(written.series, [1.0, 0.0, 0.0, 0.0]);
-        assert!(builder.open.is_none());
+        // A rejected event past the open window's end plus the grace passes
+        // it, so the window is written.
+        let written = builder.feed(at("2024/1/15 01:20:00"), &rejected).unwrap();
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![1.0, 0.0, 0.0, 0.0]
+            )]
+        );
+        assert!(builder.open.is_empty());
 
         // It does not rewrite the last closed window either.
         assert!(
             builder
-                .add(at("2024/1/15 00:30:00"), &rejected)
+                .feed(at("2024/1/15 00:30:00"), &rejected)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
-        assert_eq!(
-            builder.last_closed.as_ref().unwrap().series,
-            [1.0, 0.0, 0.0, 0.0]
-        );
+        assert_eq!(last_closed(&builder).series, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(builder.dropped, 0);
 
-        builder.add(at("2024/1/15 01:10:00"), &accepted).unwrap();
+        builder.feed(at("2024/1/15 01:10:00"), &accepted).unwrap();
         assert_eq!(
             open(&builder).start_secs,
             datetime_from_utc("2024/1/15 01:00:00")
@@ -1403,7 +2254,7 @@ mod tests {
             let mut policy = create_simple_policy(60, 3600);
             policy.src_ip = src_ip.map(|ip| ip.parse().unwrap());
             policy.dst_ip = dst_ip.map(|ip| ip.parse().unwrap());
-            let builder = WindowBuilder::try_new(&policy, 0).unwrap();
+            let builder = single(&policy, 0).unwrap();
             for ((name, event), expected) in events.iter().zip(expected) {
                 assert_eq!(
                     builder.accepts(event),
@@ -1602,8 +2453,8 @@ mod tests {
         #[test]
         fn event_at_exact_window_end_opens_the_next_window() {
             // Windows are [start, start + period). An event at exactly
-            // start + period belongs to the next window, so it writes the
-            // current one and opens the next.
+            // start + period belongs to the next window, so it opens the next
+            // one, and the current one stays open for its grace.
             let policy = create_policy(
                 TEST_POLICY_ID,
                 SECS_PER_HOUR,
@@ -1611,20 +2462,22 @@ mod tests {
                 NO_OFFSET,
                 Measure::Count,
             );
-            let mut builder = WindowBuilder::try_new(&policy, 0).unwrap();
+            let mut builder = single(&policy, 0).unwrap();
 
             let start_ts = datetime_from_utc("2024/1/15 00:00:00");
-            assert!(add_at(&mut builder, "2024/1/15 00:59:59").is_none());
+            assert!(add_at(&mut builder, "2024/1/15 00:59:59").is_empty());
             assert_eq!(open(&builder).start_secs, start_ts);
             assert_eq!(open(&builder).series, [0.0, 0.0, 0.0, 1.0]);
 
             let boundary = datetime_from_utc("2024/1/15 01:00:00");
-            let sent = add_at(&mut builder, "2024/1/15 01:00:00")
-                .expect("the window is written at its exact end");
-            assert_eq!(sent.start_secs, start_ts);
-            assert_eq!(sent.series, [0.0, 0.0, 0.0, 1.0]);
-            assert_eq!(open(&builder).start_secs, boundary);
-            assert_eq!(open(&builder).series, [1.0, 0.0, 0.0, 0.0]);
+            assert!(add_at(&mut builder, "2024/1/15 01:00:00").is_empty());
+            assert_eq!(
+                open_windows(&builder),
+                [
+                    (start_ts, vec![0.0, 0.0, 0.0, 1.0]),
+                    (boundary, vec![1.0, 0.0, 0.0, 0.0]),
+                ]
+            );
         }
 
         #[test]
