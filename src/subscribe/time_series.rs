@@ -194,9 +194,7 @@ impl Window {
             values: BTreeMap::new(),
         }
     }
-}
 
-impl Window {
     fn series(&self, policy_id: u32, key: &str) -> Option<TimeSeries> {
         self.values.get(key).map(|values| TimeSeries {
             time_series_id: key.to_owned(),
@@ -3733,6 +3731,75 @@ mod tests {
         assert_eq!(run(&[], 102), [marker_of(0, 102)]);
         // A rewrite stopped before its close is done again by the next run.
         assert_eq!(run(&[], 103), [marker_of(0, 103)]);
+    }
+
+    /// A run stopped with checkpoint W while W+1 is open and W's row is being
+    /// corrected: the next run, resumed from W, rewrites W with its own
+    /// generation, correction included. Once W+1 has closed, an event for W
+    /// is dropped and counted in the drop warning of the next close.
+    #[test]
+    fn stop_during_a_correction_rewrites_it_and_drops_it_after_the_next_close() {
+        let w = "2024/1/15 00:00:00";
+        let next = "2024/1/15 01:00:00";
+        let with = |datetime: &str, values: [f64; 4], generation: u64| {
+            let mut data = values.to_vec();
+            data.push(generation as f64);
+            ("42/10.0.0.1".to_owned(), datetime_from_utc(datetime), data)
+        };
+        let marker_of = |datetime: &str, generation: u64| {
+            (
+                "42".to_owned(),
+                datetime_from_utc(datetime),
+                vec![1.0, generation as f64],
+            )
+        };
+        let policy = by_source(&["10.0.0.1"]);
+        let builder_for = |run: RunStart| {
+            let mut builder = WindowBuilder::try_new(&policy, run, 1).unwrap();
+            builder.open_stream().unwrap();
+            builder
+        };
+
+        let mut first = builder_for(RunStart {
+            start: 0,
+            resumed: false,
+            generation: Some(100),
+        });
+        from_ip(&mut first, "2024/1/15 00:05:00", "10.0.0.1");
+        assert_eq!(
+            rows(&from_ip(&mut first, "2024/1/15 01:20:00", "10.0.0.1")),
+            [with(w, [1.0, 0.0, 0.0, 0.0], 100), marker_of(w, 100)]
+        );
+        assert_eq!(
+            rows(&from_ip(&mut first, "2024/1/15 00:40:00", "10.0.0.1")),
+            [with(w, [1.0, 0.0, 1.0, 0.0], 100)],
+            "the correction under way when the run stops"
+        );
+        drop(first);
+
+        // The restart requests from W, whose window was acknowledged.
+        let mut second = builder_for(RunStart {
+            start: nanos(datetime_from_utc(w)),
+            resumed: true,
+            generation: Some(101),
+        });
+        from_ip(&mut second, "2024/1/15 00:05:00", "10.0.0.1");
+        from_ip(&mut second, "2024/1/15 00:40:00", "10.0.0.1");
+        assert_eq!(
+            rows(&from_ip(&mut second, "2024/1/15 01:20:00", "10.0.0.1")),
+            [with(w, [1.0, 0.0, 1.0, 0.0], 101), marker_of(w, 101)],
+            "W rewritten with the new generation"
+        );
+        assert_eq!(
+            rows(&from_ip(&mut second, "2024/1/15 02:20:00", "10.0.0.1")),
+            [with(next, [0.0, 1.0, 0.0, 0.0], 101), marker_of(next, 101)]
+        );
+        assert!(from_ip(&mut second, "2024/1/15 00:50:00", "10.0.0.1").is_empty());
+        assert_eq!(second.dropped, 1);
+        let (_, lines) = logged(|| from_ip(&mut second, "2024/1/15 03:20:00", "10.0.0.1"));
+        let warnings = containing(&lines, "Dropped late events");
+        assert_eq!(warnings.len(), 1, "{lines:?}");
+        assert!(warnings[0].contains("policy_id=42"), "{warnings:?}");
     }
 
     #[test]
