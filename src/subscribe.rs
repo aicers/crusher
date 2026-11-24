@@ -58,8 +58,13 @@ const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a policy's new ingest sender waits for Giganto to store what the
-/// sender it replaces wrote before giving up on the connection.
-const PREVIOUS_STREAM_STORE_TIMEOUT: Duration = Duration::from_secs(10);
+/// sender it replaces wrote before it fails and signals a reconnect. Shorter
+/// in tests, which hold that storing beyond it.
+const PREVIOUS_STREAM_STORE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(10)
+};
 /// How often a reconnect warns while it still waits for Giganto to store what
 /// the senders on the connection it replaces wrote. Shorter in tests, which
 /// hold that storing for several intervals.
@@ -190,9 +195,10 @@ struct IngestQueue {
     run: CancellationToken,
     /// Cancelled once Giganto has stored everything the sender wrote and
     /// finished its side of the stream, or once the stream can carry nothing
-    /// more (the sender failed or the connection was replaced). The entry
-    /// stays installed until then, so that a sender replacing this one finds
-    /// it.
+    /// more (the sender failed or the connection was replaced), and in either
+    /// case only after [`Self::previous`] is cancelled too. The entry stays
+    /// installed until then, so that a sender replacing this one, and a
+    /// reconnect, find it.
     stored: CancellationToken,
     /// The [`Self::stored`] of the sender this one replaced, if Giganto had
     /// not stored its writes yet when this one was installed.
@@ -1639,11 +1645,12 @@ async fn spawn_time_series_sender(
 ) {
     let policy_id = series.policy_id();
     let queue = register_ingest_queue(policy_id, policy_token.clone()).await;
-    let error_notify = connection_notify.clone();
     let task_coordinator = coordinator.clone();
     let connection_tasks = connection_lifecycle.tasks.clone();
     let tracked = connection_tasks.track_future(async move {
-        if let Err(e) = send_time_series(
+        // The sender logs its failure and signals the reconnect itself,
+        // before it waits for its writes to be stored.
+        let _ = send_time_series(
             connection,
             series,
             queue,
@@ -1653,11 +1660,7 @@ async fn spawn_time_series_sender(
             connection_notify,
             task_coordinator,
         )
-        .await
-        {
-            warn!(policy_id, "Time-series sender failed: {e:#}");
-            error_notify.notify_waiters();
-        }
+        .await;
     });
     coordinator.tracker().spawn(tracked);
 }
@@ -1667,7 +1670,8 @@ async fn spawn_time_series_sender(
 ///
 /// It writes nothing before Giganto has stored what the sender it replaced
 /// wrote, and it removes its queue only once Giganto has stored what it wrote
-/// itself, so that the policy's writes are stored in order across senders.
+/// itself and what that sender wrote, so that the policy's writes are stored
+/// in order across senders. A failure is logged and signals a reconnect.
 #[allow(clippy::too_many_arguments)]
 async fn send_time_series(
     connection: Arc<Connection>,
@@ -1685,6 +1689,10 @@ async fn send_time_series(
         stored,
         previous,
     } = queue;
+    let error_notify = connection_notify.clone();
+    // Kept through the cleanup below: a sender that ends before the one it
+    // replaced is stored must still hold that barrier.
+    let predecessor = previous.clone();
     // Moved to the ACK receiver once it runs; dropped here otherwise, as
     // nothing this sender wrote is then waiting to be stored.
     let mut stored_guard = Some(stored.clone().drop_guard());
@@ -1782,12 +1790,43 @@ async fn send_time_series(
     }
     .await;
 
-    // Always clean up on both success and error paths.
-    // Close our channel to mark its instance, and keep the entry until what
-    // this sender wrote is stored, so that a sender replacing it waits for
-    // that. Then remove the entry only if it is still a finished one (not a
-    // newer sender registered by a replaced request or a reconnect).
+    // Always clean up on both success and error paths. Closing our channel
+    // marks this instance as finished.
     recv_channel.close();
+    if let Err(e) = &result {
+        // Signalled before the waits below, so that the reconnect starts
+        // now and waits for the same writes through this sender's entry.
+        warn!(policy_id, "Time-series sender failed: {e:#}");
+        error_notify.notify_waiters();
+    }
+    release_ingest_queue(policy_id, predecessor, stored_guard, stored).await;
+
+    result
+}
+
+/// Removes the finished ingest queue of policy `policy_id` once Giganto has
+/// stored what its sender wrote (`stored`, held by `stored_guard` until then
+/// unless the ACK receiver took it) and what the sender it replaced wrote
+/// (`predecessor`).
+///
+/// The entry stays until then, so that a sender replacing this one, and a
+/// reconnect's [`store_before_reconnect`], find it and wait. A sender that
+/// ended before its predecessor was stored (its wait timed out, or its
+/// connection was replaced) still stands for that predecessor's writes, as
+/// the predecessor's own entry was replaced by this one. The predecessor's
+/// `stored` is cancelled only once Giganto has stored its writes or its
+/// connection is gone. The entry is removed only if it is still a finished
+/// one, not that of a newer sender registered by a replaced request or a
+/// reconnect.
+async fn release_ingest_queue(
+    policy_id: u32,
+    predecessor: Option<CancellationToken>,
+    stored_guard: Option<DropGuard>,
+    stored: CancellationToken,
+) {
+    if let Some(predecessor) = predecessor {
+        predecessor.cancelled().await;
+    }
     drop(stored_guard);
     stored.cancelled().await;
     let mut map = INGEST_CHANNEL.write().await;
@@ -1797,9 +1836,6 @@ async fn send_time_series(
     {
         map.remove(&policy_id);
     }
-    drop(map);
-
-    result
 }
 
 /// Sends every row of `frame`, keyed by its window start in nanoseconds, in
