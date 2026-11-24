@@ -10,7 +10,9 @@ use giganto_client::frame::{send_bytes, send_raw};
 use giganto_client::publish::send_time_series_generator_replay_end;
 use quinn::{Connection, Endpoint, SendStream};
 use review_protocol::request::Handler;
-use review_protocol::types::{ConnField, Measure, TimeSeriesGenerationPolicy};
+use review_protocol::types::{
+    ConnField, EndpointRole, HostNetworkGroup, Measure, TimeSeriesGenerationPolicy,
+};
 use serial_test::serial;
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -25,8 +27,8 @@ use crate::cancellation::CancellationCoordinator;
 use crate::policy::PolicyHandle;
 use crate::subscribe::time_series::{CLOSE_GRACE_SECS, SECOND_TO_NANO, TimeSeries};
 use crate::subscribe::{
-    CloseTimer, REQUIRED_GIGANTO_VERSION, RequestStreamRecord, RequestTimeSeriesGeneratorStream,
-    client, publish_connection_control,
+    CloseTimer, Conn, REQUIRED_GIGANTO_VERSION, RequestStreamRecord,
+    RequestTimeSeriesGeneratorStream, client, publish_connection_control,
 };
 
 const POLICY_ID: u32 = 1;
@@ -220,10 +222,24 @@ impl GigantoStream {
     }
 
     async fn event(&mut self, timestamp: i64) {
+        self.send_conn(timestamp, &gen_conn()).await;
+    }
+
+    /// Sends a Conn event from `orig` to `resp`.
+    async fn conn(&mut self, timestamp: i64, orig: &str, resp: &str) {
+        let conn = Conn {
+            orig_addr: orig.parse().unwrap(),
+            resp_addr: resp.parse().unwrap(),
+            ..gen_conn()
+        };
+        self.send_conn(timestamp, &conn).await;
+    }
+
+    async fn send_conn(&mut self, timestamp: i64, conn: &Conn) {
         send_bytes(&mut self.0, &timestamp.to_le_bytes())
             .await
             .unwrap();
-        send_raw(&mut self.0, &bincode::serialize(&gen_conn()).unwrap())
+        send_raw(&mut self.0, &bincode::serialize(conn).unwrap())
             .await
             .unwrap();
     }
@@ -712,5 +728,148 @@ async fn stall_warning_is_logged_while_another_stream_keeps_replaying() {
     bundle
         .assert_no_window("a stream that has not opened holds the window open")
         .await;
+    bundle.finish().await;
+}
+
+const EXTERNAL: &str = "8.8.8.8";
+
+fn of_hosts(hosts: &[&str]) -> HostNetworkGroup {
+    HostNetworkGroup {
+        hosts: hosts.iter().map(|host| host.parse().unwrap()).collect(),
+        networks: Vec::new(),
+        ip_ranges: Vec::new(),
+    }
+}
+
+/// `policy` grouped by source over the internal network `hosts`.
+fn by_source(mut policy: TimeSeriesGenerationPolicy, hosts: &[&str]) -> TimeSeriesGenerationPolicy {
+    policy.group_by = Some(EndpointRole::Source);
+    policy.internal_networks = of_hosts(hosts);
+    policy
+}
+
+/// Returns the id, the window start and the total of each written series.
+fn summary(written: &[TimeSeries]) -> Vec<(&str, i64, f64)> {
+    written
+        .iter()
+        .map(|series| {
+            (
+                series.time_series_id.as_str(),
+                series.start_secs,
+                series.series.iter().sum(),
+            )
+        })
+        .collect()
+}
+
+/// A grouped two-sensor policy adds both streams' events of one IP into the
+/// same slot. When the window closes by event time, every IP's row of it is
+/// written together in ascending series-id order, the quiet IP's among them.
+#[serial]
+#[tokio::test]
+async fn grouped_bundle_writes_every_ip_of_a_window_together() {
+    let policy = by_source(bundle_policy(), &["10.0.0.1", "10.0.0.9", "10.0.0.10"]);
+    let bundle = Bundle::start(policy, None, event_time_only()).await;
+    let mut streams = bundle.open_streams(2).await;
+    let [first, second] = streams.as_mut_slice() else {
+        panic!("two streams open");
+    };
+    first.conn(in_window(0, 5), "10.0.0.1", EXTERNAL).await;
+    second.conn(in_window(0, 6), "10.0.0.1", EXTERNAL).await;
+    // The quiet IP has one event.
+    first.conn(in_window(0, 7), "10.0.0.9", EXTERNAL).await;
+    second.conn(in_window(0, 2000), "10.0.0.10", EXTERNAL).await;
+    // An external source: not counted, but it moves the stream.
+    first.conn(in_window(0, 3000), EXTERNAL, "10.0.0.1").await;
+    first.conn(past_grace(0), "10.0.0.1", EXTERNAL).await;
+    bundle
+        .assert_no_window("the second stream has not passed the window")
+        .await;
+    second.conn(past_grace(0), EXTERNAL, EXTERNAL).await;
+
+    let mut written = Vec::new();
+    for _ in 0..3 {
+        written.push(bundle.next_window().await);
+    }
+    let start = window_start_secs(0);
+    assert_eq!(
+        summary(&written),
+        [
+            ("1/10.0.0.1", start, 2.0),
+            ("1/10.0.0.10", start, 1.0),
+            ("1/10.0.0.9", start, 1.0),
+        ]
+    );
+    assert_eq!(written[0].series[0], 2.0, "both streams in the same slot");
+    assert!(written.iter().all(|series| series.policy_id == POLICY_ID));
+    bundle.assert_no_window("no row for an external IP").await;
+    bundle.finish().await;
+}
+
+/// A policy whose internal network alone changes keeps running on its
+/// request: the new network applies from the window after the one of the
+/// latest event, and the windows before it keep the previous one.
+#[serial]
+#[tokio::test]
+async fn internal_network_change_applies_from_the_next_window_without_a_restart() {
+    let policy = by_source(new_policy(POLICY_ID), &["10.0.0.1"]);
+    let mut bundle = Bundle::start(policy.clone(), None, event_time_only()).await;
+    let mut streams = bundle.open_streams(1).await;
+    let [stream] = streams.as_mut_slice() else {
+        panic!("one stream opens");
+    };
+    let token = bundle.handle.get_policy_token(POLICY_ID).await.unwrap();
+    stream.conn(in_window(0, 5), "10.0.0.1", EXTERNAL).await;
+    stream.conn(in_window(0, 6), "10.0.0.2", EXTERNAL).await;
+    // Closing window 0 shows the runner took every event so far: the latest
+    // is in window 1.
+    stream.conn(past_grace(0), "10.0.0.1", EXTERNAL).await;
+    assert_eq!(
+        summary(&[bundle.next_window().await]),
+        [("1/10.0.0.1", window_start_secs(0), 1.0)]
+    );
+
+    let mut changed = policy;
+    changed.internal_networks = of_hosts(&["10.0.0.2"]);
+    bundle
+        .review
+        .time_series_generation_policy_list(std::slice::from_ref(&changed))
+        .await
+        .unwrap();
+    assert!(!token.is_cancelled(), "the policy keeps running");
+    assert_eq!(
+        bundle
+            .handle
+            .stream_policy(POLICY_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .policy
+            .internal_networks,
+        changed.internal_networks,
+        "a later request starts with the new network"
+    );
+
+    // Window 1 keeps the previous network; window 2 takes the new one.
+    stream.conn(in_window(1, 1000), "10.0.0.1", EXTERNAL).await;
+    stream.conn(in_window(1, 1001), "10.0.0.2", EXTERNAL).await;
+    stream.conn(in_window(2, 5), "10.0.0.2", EXTERNAL).await;
+    stream.conn(in_window(2, 6), "10.0.0.1", EXTERNAL).await;
+    stream.conn(past_grace(2), EXTERNAL, EXTERNAL).await;
+    let written = [bundle.next_window().await, bundle.next_window().await];
+    assert_eq!(
+        summary(&written),
+        [
+            ("1/10.0.0.1", window_start_secs(1), 2.0),
+            ("1/10.0.0.2", window_start_secs(2), 1.0),
+        ]
+    );
+    bundle
+        .assert_no_window("the removed IP gets no window from the boundary")
+        .await;
+    assert!(
+        bundle.requests.try_recv().is_err(),
+        "no new stream request is sent"
+    );
     bundle.finish().await;
 }

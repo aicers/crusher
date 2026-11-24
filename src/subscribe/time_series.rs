@@ -1,7 +1,12 @@
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
+use std::net::IpAddr;
 
 use anyhow::{Context, Result, bail};
-use review_protocol::types::{Measure, TimeSeriesGenerationPolicy};
+use review_protocol::types::{
+    CounterpartScope, EndpointRole, GroupByUnit, HostNetworkGroup, Measure,
+    TimeSeriesGenerationPolicy,
+};
 use serde::Serialize;
 use tokio::time::{Duration, Instant};
 use tracing::warn;
@@ -29,6 +34,10 @@ const CLOSE_SKEW_SECS: i64 = 300;
 /// only less latency.
 pub(super) const CLOSE_GRACE_SECS: i64 = SENSOR_BATCH_SECS + CLOSE_SKEW_SECS;
 
+/// The most values, one per IP, a grouped policy keeps a series for in one
+/// request. A placeholder until a measurement sets it.
+const MAX_SERIES_PER_POLICY: usize = 10_000;
+
 #[cfg_attr(test, derive(serde::Deserialize))]
 #[derive(Default, Clone, Debug, Serialize)]
 pub(super) struct TimeSeries {
@@ -36,6 +45,10 @@ pub(super) struct TimeSeries {
     /// this struct, so the shared prefix is the name it has everywhere else.
     #[allow(clippy::struct_field_names)]
     pub(super) time_series_id: String,
+    /// The policy the series belongs to, whose ingest stream writes it and
+    /// whose checkpoint its ACK moves. Not part of the record Giganto stores.
+    #[serde(skip)]
+    pub(super) policy_id: u32,
     #[serde(skip)]
     pub(super) start_secs: i64,
     pub(super) series: Vec<f64>,
@@ -120,13 +133,22 @@ struct Window {
 }
 
 impl Window {
-    fn series(&self, key: &str) -> Option<TimeSeries> {
+    fn series(&self, policy_id: u32, key: &str) -> Option<TimeSeries> {
         self.values.get(key).map(|values| TimeSeries {
             time_series_id: key.to_owned(),
+            policy_id,
             start_secs: self.start_secs,
             series: values.clone(),
         })
     }
+}
+
+/// What an event is counted for: the policy's single series, or, for a
+/// grouped policy, the series of the IP at its group side.
+#[derive(Clone, Copy, Debug)]
+enum Value {
+    Policy,
+    Ip(IpAddr),
 }
 
 /// Builds one policy's windows from the events of all of its generator
@@ -139,6 +161,13 @@ impl Window {
 /// plus [`CLOSE_GRACE_SECS`]; windows become due in time order. The last
 /// closed window is kept so that an event arriving after its window closed can
 /// still be counted there, and the window written again under the same key.
+///
+/// An ungrouped policy counts every event in one series, keyed by the policy
+/// id. A grouped policy counts an event in the series of the IP at its group
+/// side, keyed `P/IP`, if that IP is in the internal network in effect for the
+/// event's window and the other endpoint is in the policy's counterpart scope.
+/// Every value shares the policy's windows, which close for all values at
+/// once.
 pub(super) struct WindowBuilder {
     policy: TimeSeriesGenerationPolicy,
     policy_id: String,
@@ -156,6 +185,20 @@ pub(super) struct WindowBuilder {
     last_closed: Option<Window>,
     /// Events dropped since the previous close.
     dropped: u64,
+    /// The internal network in effect before the first of
+    /// [`Self::network_changes`].
+    networks: HostNetworkGroup,
+    /// The internal network in effect from each boundary (a window start, in
+    /// seconds) on, by boundary.
+    network_changes: Vec<(i64, HostNetworkGroup)>,
+    /// The start of the window of the first event any stream received.
+    first_event_window: Option<i64>,
+    /// The IPs a grouped policy keeps a series for in this request.
+    accepted: HashSet<IpAddr>,
+    /// The most IPs [`Self::accepted`] takes.
+    max_series: usize,
+    /// The IPs refused for the cap, by the window whose close reports them.
+    refused: BTreeMap<i64, HashSet<IpAddr>>,
 }
 
 impl WindowBuilder {
@@ -173,6 +216,7 @@ impl WindowBuilder {
     /// - The series length overflows `usize`.
     /// - `streams` is zero.
     /// - The window of the request start overflows.
+    /// - The policy groups by a unit other than a single IP.
     pub(super) fn try_new(
         policy: &TimeSeriesGenerationPolicy,
         request_start: i64,
@@ -195,6 +239,9 @@ impl WindowBuilder {
         if streams == 0 {
             bail!("a policy needs at least one stream");
         }
+        if policy.group_by.is_some() && policy.group_by_unit != GroupByUnit::Ip {
+            bail!("grouping by {:?} is not supported", policy.group_by_unit);
+        }
 
         Ok(Self {
             policy: policy.clone(),
@@ -210,7 +257,42 @@ impl WindowBuilder {
             open: BTreeMap::new(),
             last_closed: None,
             dropped: 0,
+            networks: policy.internal_networks.clone(),
+            network_changes: Vec::new(),
+            first_event_window: None,
+            accepted: HashSet::new(),
+            max_series: MAX_SERIES_PER_POLICY,
+            refused: BTreeMap::new(),
         })
+    }
+
+    /// Makes `networks` the policy's internal network from the window after
+    /// the one of the latest event any stream has received, or for every
+    /// window if no stream has received one. Windows before that boundary keep
+    /// the network they had. A network equal to the latest one changes
+    /// nothing.
+    pub(super) fn change_networks(&mut self, networks: HostNetworkGroup) {
+        let latest_network = self
+            .network_changes
+            .last()
+            .map_or(&self.networks, |(_, network)| network);
+        if *latest_network == networks {
+            return;
+        }
+        let Some(latest) = self.streams.iter().filter_map(|s| s.watermark).max() else {
+            self.networks = networks;
+            self.network_changes.clear();
+            return;
+        };
+        let boundary = start_time(&self.policy, latest.div_euclid(SECOND_TO_NANO))
+            .map_or(i64::MAX, |start| {
+                start.saturating_add(self.window_size_secs)
+            });
+        match self.network_changes.last_mut() {
+            // Watermarks only grow, so a boundary is never before the latest.
+            Some((last, latest)) if *last >= boundary => *latest = networks,
+            _ => self.network_changes.push((boundary, networks)),
+        }
     }
 
     /// Binds an inbound stream to the policy and returns its index, or `None`
@@ -229,6 +311,10 @@ impl WindowBuilder {
     /// (nanoseconds) at the monotonic time `now`, whether or not the event is
     /// then counted.
     pub(super) fn receive(&mut self, index: usize, timestamp: i64, now: Instant) {
+        if self.first_event_window.is_none() {
+            self.first_event_window =
+                start_time(&self.policy, timestamp.div_euclid(SECOND_TO_NANO)).ok();
+        }
         let Some(stream) = self.streams.get_mut(index) else {
             return;
         };
@@ -280,17 +366,21 @@ impl WindowBuilder {
     }
 
     /// Counts an event that stream `index` received at `timestamp`
-    /// (nanoseconds), and returns the window to write again, if the event was
-    /// counted in the last closed one.
+    /// (nanoseconds), and returns the series to write again, if the event was
+    /// counted in the last closed window.
+    ///
+    /// The checks run in order. An event rejected by the policy's address
+    /// filter, or, for a grouped policy, whose group-side IP is not in the
+    /// internal network in effect for its window or whose counterpart is out
+    /// of scope, is never counted. An event before the request start, or older
+    /// than the earliest window other than one in the last closed window, is
+    /// dropped. An IP beyond [`MAX_SERIES_PER_POLICY`] is refused.
     ///
     /// The event is counted in its window when that window is the earliest
     /// one not yet due or the one after it. An event further ahead pauses the
     /// stream (see [`Self::is_paused`]) until enough windows have closed,
     /// unless the stream has not yet passed the earliest window, in which case
-    /// it is counted at once (see [`Self::counts_now`]). An event rejected by
-    /// the policy's address filter is never counted, and an event older than
-    /// the earliest window, other than one in the last closed window, is
-    /// dropped.
+    /// it is counted at once (see [`Self::counts_now`]).
     ///
     /// Call [`Self::receive`] and [`Self::close_due`] for the event first.
     ///
@@ -304,34 +394,36 @@ impl WindowBuilder {
         timestamp: i64,
         event: &Event,
     ) -> Result<Option<TimeSeries>> {
-        let accepted = self.accepts(event);
-        if timestamp < self.request_start {
-            self.drop_event(accepted);
-            return Ok(None);
-        }
-        if !accepted {
-            return Ok(None);
-        }
         let time_secs = timestamp.div_euclid(SECOND_TO_NANO);
         let window_start = start_time(&self.policy, time_secs)?;
-        let value = event_value(self.policy.measure, event)?;
-        let key = value_key(&self.policy_id, event);
+        let Some(value) = self.counted_value(event, window_start) else {
+            return Ok(None);
+        };
+        if timestamp < self.request_start {
+            self.drop_event();
+            return Ok(None);
+        }
+        let in_last_closed = self
+            .last_closed
+            .as_ref()
+            .is_some_and(|last| last.start_secs == window_start);
+        if !in_last_closed && window_start < self.current {
+            // Older than the last closed window, or a window that was never
+            // written because it had no events when it became due.
+            self.drop_event();
+            return Ok(None);
+        }
+        if !self.admit(value, window_start) {
+            return Ok(None);
+        }
+        let measured = event_value(self.policy.measure, event)?;
+        let key = value_key(&self.policy_id, value);
         let slot_size_secs = self.slot_size_secs;
         let slots = self.slots;
 
-        if let Some(last) = self
-            .last_closed
-            .as_mut()
-            .filter(|last| last.start_secs == window_start)
-        {
-            count_in(last, key, slots, slot_size_secs, time_secs, value)?;
-            return Ok(last.series(key));
-        }
-        if window_start < self.current {
-            // Older than the last closed window, or a window that was never
-            // written because it had no events when it became due.
-            self.drop_event(true);
-            return Ok(None);
+        if let Some(last) = self.last_closed.as_mut().filter(|_| in_last_closed) {
+            count_in(last, &key, slots, slot_size_secs, time_secs, measured)?;
+            return Ok(last.series(self.policy.id, &key));
         }
         if self.counts_now(window_start, timestamp) {
             count_open(
@@ -339,17 +431,17 @@ impl WindowBuilder {
                 slots,
                 slot_size_secs,
                 window_start,
-                key,
+                &key,
                 time_secs,
-                value,
+                measured,
             )?;
             return Ok(None);
         }
         let held = HeldEvent {
             timestamp,
             window_start,
-            key: key.to_owned(),
-            value,
+            key: key.into_owned(),
+            value: measured,
         };
         let Some(stream) = self.streams.get_mut(index) else {
             bail!("no stream {index} in policy {}", self.policy_id);
@@ -358,10 +450,86 @@ impl WindowBuilder {
         Ok(None)
     }
 
+    /// Returns the value `event` is counted for in the window starting at
+    /// `window_start`, or `None` if the policy does not count it.
+    fn counted_value(&self, event: &Event, window_start: i64) -> Option<Value> {
+        if !self.accepts(event) {
+            return None;
+        }
+        let Some(side) = self.policy.group_by else {
+            return Some(Value::Policy);
+        };
+        let (ip, counterpart) = match side {
+            EndpointRole::Source => (event.orig_addr(), event.resp_addr()),
+            EndpointRole::Destination => (event.resp_addr(), event.orig_addr()),
+        };
+        let network = self.network_at(window_start);
+        if !in_network(network, ip) {
+            return None;
+        }
+        let in_scope = match self.policy.counterpart_scope {
+            CounterpartScope::Any => true,
+            CounterpartScope::Internal => in_network(network, counterpart),
+            CounterpartScope::External => !in_network(network, counterpart),
+        };
+        in_scope.then_some(Value::Ip(ip))
+    }
+
+    /// Returns the internal network in effect for the window starting at
+    /// `window_start`.
+    fn network_at(&self, window_start: i64) -> &HostNetworkGroup {
+        let (_, network) = self.network_segment(window_start);
+        network
+    }
+
+    /// Returns the internal network in effect for the window starting at
+    /// `window_start` and the boundary of the next one, or `i64::MAX`.
+    fn network_segment(&self, window_start: i64) -> (i64, &HostNetworkGroup) {
+        let next = self
+            .network_changes
+            .partition_point(|(boundary, _)| *boundary <= window_start);
+        let network = next
+            .checked_sub(1)
+            .and_then(|current| self.network_changes.get(current))
+            .map_or(&self.networks, |(_, network)| network);
+        let next_boundary = self
+            .network_changes
+            .get(next)
+            .map_or(i64::MAX, |(boundary, _)| *boundary);
+        (next_boundary, network)
+    }
+
+    /// Returns whether `value` may have a series, accepting an IP the cap
+    /// still has room for. A refused IP is recorded for the warning of the
+    /// window starting at `window_start`, or of the earliest window not yet
+    /// due if that one is already closed.
+    fn admit(&mut self, value: Value, window_start: i64) -> bool {
+        let Value::Ip(ip) = value else {
+            return true;
+        };
+        if self.accepted.contains(&ip) {
+            return true;
+        }
+        if self.accepted.len() < self.max_series {
+            self.accepted.insert(ip);
+            return true;
+        }
+        self.refused
+            .entry(window_start.max(self.current))
+            .or_default()
+            .insert(ip);
+        false
+    }
+
     /// Closes the windows that every stream has passed by `clock`, in time
-    /// order, and returns those to write. A due window without events is not
-    /// written. Held events whose window may now be counted are counted, and
-    /// their streams resume.
+    /// order, and returns those to write: every value's series of one window
+    /// together, in ascending byte order of their series ids. A due window
+    /// without events is not written. Held events whose window may now be
+    /// counted are counted, and their streams resume.
+    ///
+    /// A grouped policy warns for each due window in which it refused IPs for
+    /// the cap, and for each due window, from the one of the first event any
+    /// stream received on, whose internal network is empty.
     pub(super) fn close_due(&mut self, clock: &PassClock) -> Vec<TimeSeries> {
         let mut written = Vec::new();
         loop {
@@ -374,6 +542,7 @@ impl WindowBuilder {
             if target <= self.current {
                 break;
             }
+            self.warn_due(target);
             let later = self.open.split_off(&target);
             for (_, window) in std::mem::replace(&mut self.open, later) {
                 written.extend(self.close(window));
@@ -474,9 +643,49 @@ impl WindowBuilder {
                 .is_none_or(|dst_ip| event.resp_addr() == dst_ip)
     }
 
-    fn drop_event(&mut self, counted: bool) {
-        if counted {
-            self.dropped = self.dropped.saturating_add(1);
+    fn drop_event(&mut self) {
+        self.dropped = self.dropped.saturating_add(1);
+    }
+
+    /// Warns about the windows from the earliest not yet due up to `target`,
+    /// which are becoming due: those that refused IPs for the cap, and, from
+    /// the window of the first event on, those whose internal network is
+    /// empty.
+    fn warn_due(&mut self, target: i64) {
+        let later = self.refused.split_off(&target);
+        for (window_start, refused) in std::mem::replace(&mut self.refused, later) {
+            warn!(
+                policy_id = %self.policy_id,
+                window_start,
+                refused = refused.len(),
+                max_series = self.max_series,
+                "Policy {} refused {} IPs beyond its series cap in a window",
+                self.policy_id,
+                refused.len()
+            );
+        }
+        if self.policy.group_by.is_none() {
+            return;
+        }
+        let Some(first) = self.first_event_window else {
+            return;
+        };
+        let mut start = self.current.max(first);
+        while start < target {
+            let (next_boundary, network) = self.network_segment(start);
+            let end = target.min(next_boundary);
+            if is_empty(network) {
+                while start < end {
+                    warn!(
+                        policy_id = %self.policy_id,
+                        window_start = start,
+                        "Policy {} has no internal network; its window counts no events",
+                        self.policy_id
+                    );
+                    start = start.saturating_add(self.window_size_secs);
+                }
+            }
+            start = end;
         }
     }
 
@@ -493,17 +702,39 @@ impl WindowBuilder {
         let series = window
             .values
             .keys()
-            .filter_map(|key| window.series(key))
+            .filter_map(|key| window.series(self.policy.id, key))
             .collect();
         self.last_closed = Some(window);
         series
     }
 }
 
-/// Returns the key of the series `event` adds to, given the policy's id: the
-/// policy's own id, as the policy is not grouped.
-fn value_key<'a>(policy_id: &'a str, _event: &Event) -> &'a str {
-    policy_id
+/// Returns the key of the series `value` adds to, given the policy's id: the
+/// policy's own id for an ungrouped policy, and `P/IP` for an IP, with the IP
+/// in its `Display` form.
+fn value_key(policy_id: &str, value: Value) -> Cow<'_, str> {
+    match value {
+        Value::Policy => Cow::Borrowed(policy_id),
+        Value::Ip(ip) => Cow::Owned(format!("{policy_id}/{ip}")),
+    }
+}
+
+/// Returns whether `ip` is one of the hosts of `network`, or lies in one of
+/// its networks or ranges. Addresses are compared as they are: an IPv4
+/// address is never in an IPv6 network or range, nor the reverse.
+fn in_network(network: &HostNetworkGroup, ip: IpAddr) -> bool {
+    network.hosts.contains(&ip)
+        || network.networks.iter().any(|net| net.contains(&ip))
+        || network.ip_ranges.iter().any(|range| {
+            range.start().is_ipv4() == ip.is_ipv4()
+                && range.end().is_ipv4() == ip.is_ipv4()
+                && range.contains(&ip)
+        })
+}
+
+/// Returns whether `network` has no host, network or range.
+fn is_empty(network: &HostNetworkGroup) -> bool {
+    network.hosts.is_empty() && network.networks.is_empty() && network.ip_ranges.is_empty()
 }
 
 /// Adds `value` at `time_secs` to the `key` series of the open window
@@ -599,9 +830,7 @@ fn start_time(policy: &TimeSeriesGenerationPolicy, time_secs: i64) -> Result<i64
 mod tests {
     use std::time::Duration;
 
-    use review_protocol::types::{
-        ConnField, CounterpartScope, GroupByUnit, HostNetworkGroup, Measure, RawEventKind,
-    };
+    use review_protocol::types::{ConnField, Measure, RawEventKind};
     use time::{Date, Month};
 
     use super::*;
@@ -1548,7 +1777,7 @@ mod tests {
             .open
             .values()
             .next()
-            .and_then(|window| window.series(&builder.policy_id))
+            .and_then(|window| window.series(builder.policy.id, &builder.policy_id))
             .expect("a window is open")
     }
 
@@ -1583,7 +1812,7 @@ mod tests {
         builder
             .open
             .values()
-            .filter_map(|window| window.series(&builder.policy_id))
+            .filter_map(|window| window.series(builder.policy.id, &builder.policy_id))
             .map(|series| (series.start_secs, series.series))
             .collect()
     }
@@ -1592,7 +1821,7 @@ mod tests {
         builder
             .last_closed
             .as_ref()
-            .and_then(|window| window.series(&builder.policy_id))
+            .and_then(|window| window.series(builder.policy.id, &builder.policy_id))
             .expect("a window was closed")
     }
 
@@ -2265,6 +2494,603 @@ mod tests {
         }
     }
 
+    // =========================================================================
+    // Tests for grouped policies
+    // =========================================================================
+
+    const GROUPED_ID: u32 = 42;
+    const EXTERNAL: &str = "8.8.8.8";
+
+    /// An hourly policy with 15-minute slots grouped by `side`.
+    fn grouped(
+        side: EndpointRole,
+        scope: CounterpartScope,
+        networks: HostNetworkGroup,
+    ) -> TimeSeriesGenerationPolicy {
+        let mut policy = create_policy(
+            GROUPED_ID,
+            SECS_PER_HOUR,
+            15 * SECS_PER_MINUTE,
+            0,
+            Measure::Count,
+        );
+        policy.group_by = Some(side);
+        policy.counterpart_scope = scope;
+        policy.internal_networks = networks;
+        policy
+    }
+
+    /// A grouped-by-source policy over every counterpart whose internal
+    /// network is `hosts`.
+    fn by_source(hosts: &[&str]) -> TimeSeriesGenerationPolicy {
+        grouped(EndpointRole::Source, CounterpartScope::Any, of_hosts(hosts))
+    }
+
+    fn of_hosts(hosts: &[&str]) -> HostNetworkGroup {
+        HostNetworkGroup {
+            hosts: hosts.iter().map(|host| host.parse().unwrap()).collect(),
+            networks: Vec::new(),
+            ip_ranges: Vec::new(),
+        }
+    }
+
+    /// Delivers a Conn event from `orig` to `resp` at `datetime` on `stream`
+    /// and returns the series written.
+    fn conn_on(
+        builder: &mut WindowBuilder,
+        stream: usize,
+        datetime: &str,
+        orig: &str,
+        resp: &str,
+    ) -> Vec<TimeSeries> {
+        builder
+            .feed_on(
+                stream,
+                nanos(datetime_from_utc(datetime)),
+                &conn_between(orig, resp),
+            )
+            .expect("add should succeed")
+    }
+
+    /// Delivers a Conn event from `orig` to an external IP on stream 0.
+    fn from_ip(builder: &mut WindowBuilder, datetime: &str, orig: &str) -> Vec<TimeSeries> {
+        conn_on(builder, 0, datetime, orig, EXTERNAL)
+    }
+
+    /// Returns the id, the start and the values of every written series.
+    fn rows(written: &[TimeSeries]) -> Vec<(String, i64, Vec<f64>)> {
+        written
+            .iter()
+            .map(|series| {
+                assert_eq!(series.policy_id, GROUPED_ID, "{series:?}");
+                (
+                    series.time_series_id.clone(),
+                    series.start_secs,
+                    series.series.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn row(id: &str, datetime: &str, values: [f64; 4]) -> (String, i64, Vec<f64>) {
+        (id.to_owned(), datetime_from_utc(datetime), values.to_vec())
+    }
+
+    /// Runs `f` and returns its result with the lines it logged.
+    fn logged<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        #[derive(Clone, Default)]
+        struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        (result, text.lines().map(str::to_owned).collect())
+    }
+
+    fn containing<'a>(lines: &'a [String], text: &str) -> Vec<&'a String> {
+        lines.iter().filter(|line| line.contains(text)).collect()
+    }
+
+    #[test]
+    fn grouped_series_id_is_the_policy_and_the_group_side_ip() {
+        let internal = of_hosts(&["10.100.0.5", "2001:db8::1"]);
+        for (side, orig, resp, id) in [
+            (
+                EndpointRole::Source,
+                "10.100.0.5",
+                EXTERNAL,
+                "42/10.100.0.5",
+            ),
+            (
+                EndpointRole::Destination,
+                EXTERNAL,
+                "10.100.0.5",
+                "42/10.100.0.5",
+            ),
+            (
+                EndpointRole::Source,
+                "2001:db8::1",
+                "2001:db8::99",
+                "42/2001:db8::1",
+            ),
+            (
+                EndpointRole::Destination,
+                "2001:db8::99",
+                "2001:db8::1",
+                "42/2001:db8::1",
+            ),
+        ] {
+            let policy = grouped(side, CounterpartScope::Any, internal.clone());
+            let mut builder = single(&policy, 0).unwrap();
+            assert!(conn_on(&mut builder, 0, "2024/1/15 00:05:00", orig, resp).is_empty());
+            // Both endpoints external: not counted, but it passes 00:00.
+            let written = conn_on(&mut builder, 0, "2024/1/15 01:20:00", EXTERNAL, EXTERNAL);
+            assert_eq!(
+                rows(&written),
+                [row(id, "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0])],
+                "{side:?} {orig} → {resp}"
+            );
+            assert!(builder.open.is_empty(), "the external event opens nothing");
+        }
+
+        // An ungrouped policy writes under its own id.
+        let mut builder = single(&create_simple_policy(900, 3600), 0).unwrap();
+        add_at(&mut builder, "2024/1/15 00:05:00");
+        let written = add_at(&mut builder, "2024/1/15 01:20:00");
+        let ids: Vec<&str> = written.iter().map(|s| s.time_series_id.as_str()).collect();
+        assert_eq!(ids, ["1"]);
+        assert_eq!(written[0].policy_id, 1);
+    }
+
+    #[test]
+    fn target_ip_is_internal_by_host_network_or_range() {
+        let internal = HostNetworkGroup {
+            hosts: vec!["10.0.0.1".parse().unwrap(), "2001:db8::1".parse().unwrap()],
+            networks: vec![
+                "192.168.0.0/16".parse().unwrap(),
+                "2001:db8:1::/48".parse().unwrap(),
+            ],
+            ip_ranges: vec![
+                "172.16.0.10".parse().unwrap()..="172.16.0.20".parse().unwrap(),
+                "2001:db8:2::10".parse().unwrap()..="2001:db8:2::20".parse().unwrap(),
+            ],
+        };
+        let policy = grouped(EndpointRole::Source, CounterpartScope::Any, internal);
+        let builder = single(&policy, 0).unwrap();
+        for (ip, expected) in [
+            ("10.0.0.1", true),
+            ("10.0.0.2", false),
+            ("2001:db8::1", true),
+            ("192.168.200.7", true),
+            ("192.169.0.1", false),
+            ("2001:db8:1:ffff::1", true),
+            ("172.16.0.10", true),
+            ("172.16.0.15", true),
+            ("172.16.0.20", true),
+            ("172.16.0.9", false),
+            ("172.16.0.21", false),
+            ("2001:db8:2::15", true),
+            ("2001:db8:2::21", false),
+            // An IPv4-mapped IPv6 address is not an IPv4 address.
+            ("::ffff:10.0.0.1", false),
+            ("::ffff:192.168.0.1", false),
+            ("::ffff:172.16.0.15", false),
+        ] {
+            assert_eq!(
+                builder
+                    .counted_value(&conn_between(ip, EXTERNAL), 0)
+                    .is_some(),
+                expected,
+                "{ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn counterpart_scope_filters_by_the_other_endpoint() {
+        const IN_A: &str = "10.0.0.1";
+        const IN_B: &str = "10.0.0.2";
+        const OUT_A: &str = "8.8.8.8";
+        const OUT_B: &str = "1.1.1.1";
+        let events = [
+            ("internal→internal", conn_between(IN_A, IN_B)),
+            ("internal→external", conn_between(IN_A, OUT_A)),
+            ("external→internal", conn_between(OUT_A, IN_B)),
+            ("external→external", conn_between(OUT_A, OUT_B)),
+        ];
+        let internal = HostNetworkGroup {
+            hosts: Vec::new(),
+            networks: vec!["10.0.0.0/8".parse().unwrap()],
+            ip_ranges: Vec::new(),
+        };
+        let cases = [
+            (
+                EndpointRole::Source,
+                CounterpartScope::Any,
+                [Some(IN_A), Some(IN_A), None, None],
+            ),
+            (
+                EndpointRole::Source,
+                CounterpartScope::Internal,
+                [Some(IN_A), None, None, None],
+            ),
+            (
+                EndpointRole::Source,
+                CounterpartScope::External,
+                [None, Some(IN_A), None, None],
+            ),
+            (
+                EndpointRole::Destination,
+                CounterpartScope::Any,
+                [Some(IN_B), None, Some(IN_B), None],
+            ),
+            (
+                EndpointRole::Destination,
+                CounterpartScope::Internal,
+                [Some(IN_B), None, None, None],
+            ),
+            (
+                EndpointRole::Destination,
+                CounterpartScope::External,
+                [None, None, Some(IN_B), None],
+            ),
+        ];
+        for (side, scope, expected) in cases {
+            let builder = single(&grouped(side, scope, internal.clone()), 0).unwrap();
+            for ((name, event), expected) in events.iter().zip(expected) {
+                let counted = match builder.counted_value(event, 0) {
+                    Some(Value::Ip(ip)) => Some(ip),
+                    Some(Value::Policy) => panic!("a grouped policy counts IPs"),
+                    None => None,
+                };
+                assert_eq!(
+                    counted,
+                    expected.map(|ip| ip.parse().unwrap()),
+                    "{side:?} {scope:?} {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counted_or_not_every_event_moves_the_watermark() {
+        let mut builder = single(&by_source(&["10.0.0.1"]), 0).unwrap();
+        from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
+        from_ip(&mut builder, "2024/1/15 00:50:00", "10.0.0.7");
+        assert_eq!(
+            builder.streams[0].watermark,
+            Some(nanos(datetime_from_utc("2024/1/15 00:50:00")))
+        );
+        let keys: Vec<&String> = builder
+            .open
+            .values()
+            .flat_map(|window| window.values.keys())
+            .collect();
+        assert_eq!(keys, ["42/10.0.0.1"]);
+    }
+
+    #[test]
+    fn two_streams_add_the_same_ip_into_the_same_slot() {
+        let mut builder = pair(&by_source(&["10.0.0.1", "10.0.0.2"]));
+        conn_on(&mut builder, 0, "2024/1/15 00:05:00", "10.0.0.1", EXTERNAL);
+        conn_on(&mut builder, 1, "2024/1/15 00:06:00", "10.0.0.1", EXTERNAL);
+        conn_on(&mut builder, 1, "2024/1/15 00:07:00", "10.0.0.2", EXTERNAL);
+        conn_on(&mut builder, 0, "2024/1/15 01:20:00", EXTERNAL, EXTERNAL);
+        let written = conn_on(&mut builder, 1, "2024/1/15 01:20:00", EXTERNAL, EXTERNAL);
+        assert_eq!(
+            rows(&written),
+            [
+                row("42/10.0.0.1", "2024/1/15 00:00:00", [2.0, 0.0, 0.0, 0.0]),
+                row("42/10.0.0.2", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_ip_of_a_window_closes_together_in_series_id_order() {
+        let mut builder = single(&by_source(&["10.0.0.1", "10.0.0.9", "10.0.0.10"]), 0).unwrap();
+        // 10.0.0.9 falls quiet after one event.
+        from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.9");
+        from_ip(&mut builder, "2024/1/15 00:10:00", "10.0.0.10");
+        from_ip(&mut builder, "2024/1/15 00:20:00", "10.0.0.1");
+        assert!(from_ip(&mut builder, "2024/1/15 01:10:00", "10.0.0.1").is_empty());
+        // The busy IP's event passes 00:00, which closes for every IP.
+        let written = from_ip(&mut builder, "2024/1/15 01:20:00", "10.0.0.1");
+        assert_eq!(
+            rows(&written),
+            [
+                row("42/10.0.0.1", "2024/1/15 00:00:00", [0.0, 1.0, 0.0, 0.0]),
+                row("42/10.0.0.10", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+                row("42/10.0.0.9", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+            ],
+            "ascending byte order of the series ids"
+        );
+        assert!(builder.open.values().all(|window| {
+            window.values.keys().eq(["42/10.0.0.1"])
+                && window.start_secs == datetime_from_utc("2024/1/15 01:00:00")
+        }));
+    }
+
+    #[test]
+    fn late_event_rewrites_or_adds_an_ip_row_and_an_older_one_is_dropped() {
+        let mut builder = single(&by_source(&["10.0.0.1", "10.0.0.5", "10.0.0.9"]), 0).unwrap();
+        from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
+        from_ip(&mut builder, "2024/1/15 00:06:00", "10.0.0.9");
+        assert_eq!(
+            from_ip(&mut builder, "2024/1/15 01:20:00", "10.0.0.1").len(),
+            2
+        );
+
+        let rewritten = from_ip(&mut builder, "2024/1/15 00:40:00", "10.0.0.9");
+        assert_eq!(
+            rows(&rewritten),
+            [row(
+                "42/10.0.0.9",
+                "2024/1/15 00:00:00",
+                [1.0, 0.0, 1.0, 0.0]
+            )]
+        );
+        let added = from_ip(&mut builder, "2024/1/15 00:50:00", "10.0.0.5");
+        assert_eq!(
+            rows(&added),
+            [row(
+                "42/10.0.0.5",
+                "2024/1/15 00:00:00",
+                [0.0, 0.0, 0.0, 1.0]
+            )]
+        );
+        assert_eq!(builder.dropped, 0);
+
+        let written = from_ip(&mut builder, "2024/1/15 02:20:00", "10.0.0.1");
+        assert_eq!(
+            rows(&written),
+            [row(
+                "42/10.0.0.1",
+                "2024/1/15 01:00:00",
+                [0.0, 1.0, 0.0, 0.0]
+            )]
+        );
+        assert!(from_ip(&mut builder, "2024/1/15 00:30:00", "10.0.0.9").is_empty());
+        assert!(from_ip(&mut builder, "2024/1/15 00:30:00", "10.0.0.6").is_empty());
+        assert_eq!(builder.dropped, 1, "only the counted IP's event is dropped");
+    }
+
+    #[test]
+    fn network_change_applies_from_the_window_after_the_latest_event() {
+        let mut builder = single(&by_source(&["10.0.0.1"]), 0).unwrap();
+        from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
+        from_ip(&mut builder, "2024/1/15 00:10:00", "10.0.0.2");
+        builder.change_networks(of_hosts(&["10.0.0.2"]));
+        assert_eq!(
+            builder.network_changes,
+            [(
+                datetime_from_utc("2024/1/15 01:00:00"),
+                of_hosts(&["10.0.0.2"])
+            )]
+        );
+
+        // 00:00 keeps the previous network.
+        from_ip(&mut builder, "2024/1/15 00:20:00", "10.0.0.2");
+        from_ip(&mut builder, "2024/1/15 00:30:00", "10.0.0.1");
+        // From 01:00 on the new one: the removed IP gets no window.
+        from_ip(&mut builder, "2024/1/15 01:05:00", "10.0.0.2");
+        from_ip(&mut builder, "2024/1/15 01:06:00", "10.0.0.1");
+        let written = from_ip(&mut builder, "2024/1/15 02:20:00", EXTERNAL);
+        assert_eq!(
+            rows(&written),
+            [
+                row("42/10.0.0.1", "2024/1/15 00:00:00", [1.0, 0.0, 1.0, 0.0]),
+                row("42/10.0.0.2", "2024/1/15 01:00:00", [1.0, 0.0, 0.0, 0.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_network_change_applies_from_its_own_boundary() {
+        let mut builder = single(&by_source(&["10.0.0.1"]), 0).unwrap();
+        from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
+        builder.change_networks(of_hosts(&["10.0.0.2"]));
+        from_ip(&mut builder, "2024/1/15 01:05:00", "10.0.0.2");
+        builder.change_networks(of_hosts(&["10.0.0.9"]));
+        // A later change at the same latest event replaces it.
+        builder.change_networks(of_hosts(&["10.0.0.3"]));
+        // A resend of the network in effect adds no boundary.
+        builder.change_networks(of_hosts(&["10.0.0.3"]));
+        assert_eq!(builder.network_changes.len(), 2);
+
+        let mut written = Vec::new();
+        for (datetime, ip) in [
+            ("2024/1/15 00:40:00", "10.0.0.1"),
+            ("2024/1/15 01:30:00", "10.0.0.2"),
+            ("2024/1/15 01:40:00", "10.0.0.3"),
+            ("2024/1/15 02:05:00", "10.0.0.3"),
+            ("2024/1/15 02:06:00", "10.0.0.2"),
+            ("2024/1/15 03:20:00", EXTERNAL),
+        ] {
+            written.extend(from_ip(&mut builder, datetime, ip));
+        }
+        assert_eq!(
+            rows(&written),
+            [
+                row("42/10.0.0.1", "2024/1/15 00:00:00", [1.0, 0.0, 1.0, 0.0]),
+                row("42/10.0.0.2", "2024/1/15 01:00:00", [1.0, 0.0, 1.0, 0.0]),
+                row("42/10.0.0.3", "2024/1/15 02:00:00", [1.0, 0.0, 0.0, 0.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn network_change_before_any_event_applies_to_every_window() {
+        let mut builder = single(&by_source(&["10.0.0.1"]), 0).unwrap();
+        builder.change_networks(of_hosts(&["10.0.0.2"]));
+        assert_eq!(builder.network_changes, []);
+        from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
+        from_ip(&mut builder, "2024/1/15 00:06:00", "10.0.0.2");
+        let written = from_ip(&mut builder, "2024/1/15 01:20:00", EXTERNAL);
+        assert_eq!(
+            rows(&written),
+            [row(
+                "42/10.0.0.2",
+                "2024/1/15 00:00:00",
+                [1.0, 0.0, 0.0, 0.0]
+            )]
+        );
+    }
+
+    #[test]
+    fn empty_network_warns_at_each_due_window_from_the_first_event_on() {
+        // Requested from 0: the first close passes every window since 1970.
+        let mut builder = single(&by_source(&[]), 0).unwrap();
+        let (written, lines) = logged(|| {
+            let mut written = from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
+            written.extend(from_ip(&mut builder, "2024/1/15 03:20:00", "10.0.0.1"));
+            written
+        });
+        assert!(written.is_empty());
+        assert!(builder.open.is_empty(), "no window opens");
+        let warnings = containing(&lines, "Policy 42 has no internal network");
+        assert_eq!(warnings.len(), 3, "00:00, 01:00 and 02:00: {lines:?}");
+        for (warning, window) in warnings.iter().zip(["00:00", "01:00", "02:00"]) {
+            let start = datetime_from_utc(&format!("2024/1/15 {window}:00"));
+            assert!(
+                warning.contains(&format!("window_start={start}")),
+                "{warning}"
+            );
+            assert!(warning.contains("WARN"), "{warning}");
+        }
+
+        // An ungrouped policy does not look at its internal network.
+        let mut builder = single(&create_simple_policy(900, 3600), 0).unwrap();
+        let ((), lines) = logged(|| {
+            add_at(&mut builder, "2024/1/15 00:05:00");
+            add_at(&mut builder, "2024/1/15 03:20:00");
+        });
+        assert_eq!(containing(&lines, "no internal network").len(), 0);
+    }
+
+    #[test]
+    fn network_that_becomes_empty_warns_from_its_boundary() {
+        let mut builder = single(&by_source(&["10.0.0.1"]), 0).unwrap();
+        from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
+        builder.change_networks(HostNetworkGroup::default());
+        let (written, lines) = logged(|| from_ip(&mut builder, "2024/1/15 03:20:00", "10.0.0.1"));
+        assert_eq!(
+            rows(&written),
+            [row(
+                "42/10.0.0.1",
+                "2024/1/15 00:00:00",
+                [1.0, 0.0, 0.0, 0.0]
+            )]
+        );
+        assert!(builder.open.is_empty(), "no new window opens");
+        assert_eq!(
+            containing(&lines, "Policy 42 has no internal network").len(),
+            2,
+            "01:00 and 02:00: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn ips_beyond_the_cap_are_refused_and_counted_per_window() {
+        assert_eq!(MAX_SERIES_PER_POLICY, 10_000);
+        let internal = HostNetworkGroup {
+            hosts: Vec::new(),
+            networks: vec!["10.0.0.0/8".parse().unwrap()],
+            ip_ranges: Vec::new(),
+        };
+        let policy = grouped(EndpointRole::Source, CounterpartScope::Any, internal);
+        let mut builder = single(&policy, 0).unwrap();
+        builder.max_series = 2;
+        from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
+        from_ip(&mut builder, "2024/1/15 00:10:00", "10.0.0.2");
+        from_ip(&mut builder, "2024/1/15 00:15:00", "10.0.0.3");
+        from_ip(&mut builder, "2024/1/15 00:16:00", "10.0.0.3");
+        from_ip(&mut builder, "2024/1/15 00:20:00", "10.0.0.4");
+        from_ip(&mut builder, "2024/1/15 00:25:00", "10.0.0.1");
+        let refused = "IPs beyond its series cap";
+
+        let (written, lines) = logged(|| from_ip(&mut builder, "2024/1/15 01:20:00", EXTERNAL));
+        assert_eq!(
+            rows(&written),
+            [
+                row("42/10.0.0.1", "2024/1/15 00:00:00", [1.0, 1.0, 0.0, 0.0]),
+                row("42/10.0.0.2", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+            ],
+            "the accepted IPs keep counting"
+        );
+        let warnings = containing(&lines, refused);
+        assert_eq!(warnings.len(), 1, "{lines:?}");
+        assert!(warnings[0].contains("refused=2"), "{warnings:?}");
+        assert!(warnings[0].contains("policy_id=42"), "{warnings:?}");
+
+        // A window in which every event was refused holds no rows but warns.
+        from_ip(&mut builder, "2024/1/15 01:30:00", "10.0.0.5");
+        let (written, lines) = logged(|| from_ip(&mut builder, "2024/1/15 02:20:00", EXTERNAL));
+        assert!(written.is_empty());
+        assert_eq!(containing(&lines, "refused=1").len(), 1, "{lines:?}");
+
+        // A window without rows is not closed, so 00:00 is still the last
+        // closed window. A refusal there is reported by the next close.
+        assert!(from_ip(&mut builder, "2024/1/15 00:40:00", "10.0.0.6").is_empty());
+        assert_eq!(
+            builder.refused.keys().copied().collect::<Vec<_>>(),
+            [datetime_from_utc("2024/1/15 02:00:00")]
+        );
+        assert_eq!(
+            rows(&from_ip(&mut builder, "2024/1/15 00:41:00", "10.0.0.1")),
+            [row(
+                "42/10.0.0.1",
+                "2024/1/15 00:00:00",
+                [1.0, 1.0, 1.0, 0.0]
+            )]
+        );
+        assert!(from_ip(&mut builder, "2024/1/15 01:31:00", "10.0.0.2").is_empty());
+        assert_eq!(builder.dropped, 1, "01:00 is due and not the last closed");
+        let (written, lines) = logged(|| from_ip(&mut builder, "2024/1/15 03:20:00", EXTERNAL));
+        assert!(written.is_empty());
+        let warnings = containing(&lines, refused);
+        assert_eq!(warnings.len(), 1, "{lines:?}");
+        assert!(warnings[0].contains("refused=1"), "{warnings:?}");
+        assert!(
+            warnings[0].contains(&format!(
+                "window_start={}",
+                datetime_from_utc("2024/1/15 02:00:00")
+            )),
+            "{warnings:?}"
+        );
+
+        // A new request starts with an empty accepted set, which the replay
+        // refills.
+        let mut builder = single(&policy, 0).unwrap();
+        builder.max_series = 2;
+        from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.3");
+        from_ip(&mut builder, "2024/1/15 00:06:00", "10.0.0.4");
+        from_ip(&mut builder, "2024/1/15 00:07:00", "10.0.0.1");
+        let written = from_ip(&mut builder, "2024/1/15 01:20:00", EXTERNAL);
+        let ids: Vec<&str> = written.iter().map(|s| s.time_series_id.as_str()).collect();
+        assert_eq!(ids, ["42/10.0.0.3", "42/10.0.0.4"]);
+    }
+
+    #[test]
+    fn grouping_by_owned_network_is_rejected() {
+        let mut policy = by_source(&["10.0.0.1"]);
+        policy.group_by_unit = GroupByUnit::OwnedNetwork;
+        assert!(single(&policy, 0).is_err());
+    }
+
     // time-handling code against a stable baseline. They prefer integer Unix
     // timestamps and literal expected values over runtime-derived ones.
     // =========================================================================
@@ -2482,16 +3308,18 @@ mod tests {
 
         #[test]
         fn time_series_bincode_serialization_ignores_start_time() {
-            // The `start_secs` field is `#[serde(skip)]`, so the bincode payload
-            // must be byte-identical for two TimeSeries that differ only in
-            // their start time.
+            // The `policy_id` and `start_secs` fields are `#[serde(skip)]`, so
+            // the bincode payload must be byte-identical for two TimeSeries
+            // that differ only in them.
             let series_a = TimeSeries {
                 time_series_id: "42".to_string(),
+                policy_id: 42,
                 start_secs: TS_EPOCH,
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
             let series_b = TimeSeries {
                 time_series_id: "42".to_string(),
+                policy_id: 7,
                 start_secs: TS_9999_12_31_235959Z,
                 series: vec![1.0, 2.0, 3.0, 4.0],
             };
@@ -2501,23 +3329,25 @@ mod tests {
 
             assert_eq!(
                 bytes_a, bytes_b,
-                "TimeSeries bincode bytes must not depend on the `start_secs` field",
+                "TimeSeries bincode bytes must not depend on the skipped fields",
             );
         }
 
         #[test]
         fn time_series_bincode_round_trip_preserves_observable_fields() {
             // The id and series payload must round-trip byte-for-byte. The
-            // `start_secs` field is skipped on the wire and is not part of the
-            // external contract.
+            // `policy_id` and `start_secs` fields are skipped on the wire and
+            // are not part of the external contract.
             let original = TimeSeries {
-                time_series_id: "policy-1".to_string(),
+                time_series_id: "1/10.0.0.1".to_string(),
+                policy_id: 1,
                 start_secs: TS_2023_11_14_221320Z,
                 series: vec![0.0, 1.5, -2.25, 3.125],
             };
             let bytes = bincode::serialize(&original).expect("bincode serialize");
             let decoded: TimeSeries = bincode::deserialize(&bytes).expect("bincode deserialize");
-            assert_eq!(decoded.time_series_id, "policy-1");
+            assert_eq!(decoded.time_series_id, "1/10.0.0.1");
+            assert_eq!(decoded.policy_id, u32::default());
             assert_eq!(decoded.series, vec![0.0, 1.5, -2.25, 3.125]);
             assert_eq!(decoded.start_secs, i64::default());
         }

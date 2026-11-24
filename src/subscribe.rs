@@ -166,8 +166,9 @@ async fn drain_connection_generation(
     Ok(())
 }
 
-// A hashmap for data transfer to an already created asynchronous task
-static INGEST_CHANNEL: LazyLock<RwLock<HashMap<String, Sender<TimeSeries>>>> =
+// The ingest queue of each policy's sender, by policy id. Every series of a
+// policy is written on that one sender's stream.
+static INGEST_CHANNEL: LazyLock<RwLock<HashMap<u32, Sender<TimeSeries>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Returns the Giganto stream kind that carries the raw events of `kind`.
@@ -609,7 +610,7 @@ async fn ingest_connection_control(
                             // instead of spawning another sender task.
                             let Some(policy_token) = policy_token_for_series(
                                 &policy_handle,
-                                &series.time_series_id,
+                                series.policy_id,
                             )
                             .await else {
                                 continue;
@@ -1239,7 +1240,9 @@ fn warn_if_stalled(windows: &WindowBuilder, id: u32, expected: usize) {
 /// dispatcher binds to the request, builds the policy's windows from the events
 /// of all its streams, closes them as its streams pass them, and writes them.
 /// It reacts to per-policy deletion (`policy_token`), to the Publish
-/// connection being replaced (`connection_token`) and to global cancellation.
+/// connection being replaced (`connection_token`) and to global cancellation,
+/// and follows changes of the policy's internal network from the next window
+/// boundary on.
 ///
 /// Shutdown, deletion and a replaced connection stop every stream and drop the
 /// windows not yet closed without writing them: they are not complete, and the
@@ -1263,6 +1266,7 @@ async fn run_policy(
         policy,
         token: policy_token,
         start,
+        mut networks,
     } = state;
     let id = policy.id;
     let record_type = stream_record(policy.raw_event_kind)?;
@@ -1282,6 +1286,7 @@ async fn run_policy(
         );
         stall.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut withdrawn = false;
+        let mut networks_open = true;
         let mut first = 0;
         loop {
             tokio::select! {
@@ -1301,6 +1306,18 @@ async fn run_policy(
                 // Before the frames, so that streams that keep delivering
                 // frames cannot postpone the warning about the others.
                 _ = stall.tick() => warn_if_stalled(&windows, id, expected),
+                // Before the frames, so that a changed network takes effect
+                // from the boundary its arrival sets.
+                changed = networks.changed(), if networks_open => {
+                    if changed.is_err() {
+                        // The policy was removed; its token stops the runner.
+                        networks_open = false;
+                        continue;
+                    }
+                    let changed = networks.borrow_and_update().clone();
+                    info!(policy_id = id, "Policy {id} received a changed internal network");
+                    windows.change_networks(changed);
+                }
                 recv = streams.recv(), if !withdrawn && frames.len() < expected => {
                     let Some(recv) = recv else {
                         withdrawn = true;
@@ -1372,11 +1389,7 @@ async fn write_window(send_channel: &Sender<TimeSeries>, series: TimeSeries) -> 
 async fn queue_to_ingest_sender(series: TimeSeries) -> Result<(), TimeSeries> {
     // Clone the sender out of the lock to avoid holding the RwLock read
     // guard across an await point.
-    let cached_sender = INGEST_CHANNEL
-        .read()
-        .await
-        .get(&series.time_series_id)
-        .cloned();
+    let cached_sender = INGEST_CHANNEL.read().await.get(&series.policy_id).cloned();
     let Some(sender) = cached_sender else {
         return Err(series);
     };
@@ -1386,16 +1399,13 @@ async fn queue_to_ingest_sender(series: TimeSeries) -> Result<(), TimeSeries> {
         .map_err(|async_channel::SendError(series)| series)
 }
 
-/// Installs a new queue as the ingest sender of `time_series_id`,
+/// Installs a new queue as the ingest sender of policy `policy_id`,
 /// replacing a closed one. The ingest control installs it before it takes the
 /// next window, so that window finds it.
-async fn register_ingest_queue(time_series_id: &str) -> Receiver<TimeSeries> {
+async fn register_ingest_queue(policy_id: u32) -> Receiver<TimeSeries> {
     let (send_channel, recv_channel) =
         async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
-    INGEST_CHANNEL
-        .write()
-        .await
-        .insert(time_series_id.to_owned(), send_channel);
+    INGEST_CHANNEL.write().await.insert(policy_id, send_channel);
     recv_channel
 }
 
@@ -1414,17 +1424,16 @@ pub(crate) async fn clear_ingest_channel() {
     INGEST_CHANNEL.write().await.clear();
 }
 
-/// Resolves the current `CancellationToken` for a dequeued series by its
-/// policy id. Returns `None` when the id is malformed or when the policy
-/// is no longer active, signalling the caller to drop the series instead
-/// of spawning a sender task for an inactive policy.
+/// Resolves the current `CancellationToken` for a dequeued series by the id
+/// of the policy it belongs to. Returns `None` when the policy is no longer
+/// active, signalling the caller to drop the series instead of spawning a
+/// sender task for an inactive policy.
 async fn policy_token_for_series(
     policy_handle: &PolicyHandle,
-    time_series_id: &str,
+    policy_id: u32,
 ) -> Option<CancellationToken> {
-    let id = time_series_id.parse::<u32>().ok()?;
     policy_handle
-        .get_policy_with_token(id)
+        .get_policy_with_token(policy_id)
         .await
         .map(|(_, token)| token)
 }
@@ -1441,8 +1450,8 @@ async fn spawn_time_series_sender(
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
 ) {
-    let time_series_id = series.time_series_id.clone();
-    let recv_channel = register_ingest_queue(&time_series_id).await;
+    let policy_id = series.policy_id;
+    let recv_channel = register_ingest_queue(policy_id).await;
     let error_notify = connection_notify.clone();
     let task_coordinator = coordinator.clone();
     let connection_tasks = connection_lifecycle.tasks.clone();
@@ -1459,7 +1468,7 @@ async fn spawn_time_series_sender(
         )
         .await
         {
-            warn!(%time_series_id, "Time-series sender failed: {e:#}");
+            warn!(policy_id, "Time-series sender failed: {e:#}");
             error_notify.notify_waiters();
         }
     });
@@ -1479,7 +1488,7 @@ async fn send_time_series(
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
-    let time_series_id = series.time_series_id.clone();
+    let policy_id = series.policy_id;
 
     let result = async {
         let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else {
@@ -1496,7 +1505,7 @@ async fn send_time_series(
             .tasks
             .track_future(receive_time_series_timestamp(
                 series_receiver,
-                time_series_id.clone(),
+                policy_id,
                 policy_token.clone(),
                 connection_lifecycle.token.clone(),
                 policy_handle,
@@ -1530,15 +1539,12 @@ async fn send_time_series(
                     break;
                 }
                 () = policy_token.cancelled() => {
-                    info!(
-                        %time_series_id,
-                        "send_time_series stopping; policy deleted"
-                    );
+                    info!(policy_id, "send_time_series stopping; policy deleted");
                     break;
                 }
                 () = connection_lifecycle.token.cancelled() => {
                     info!(
-                        %time_series_id,
+                        policy_id,
                         "send_time_series stopping; ingest connection replaced"
                     );
                     break;
@@ -1566,10 +1572,10 @@ async fn send_time_series(
     // reconnect).
     recv_channel.close();
     let mut map = INGEST_CHANNEL.write().await;
-    if let Some(existing) = map.get(&time_series_id)
+    if let Some(existing) = map.get(&policy_id)
         && existing.is_closed()
     {
-        map.remove(&time_series_id);
+        map.remove(&policy_id);
     }
     drop(map);
 
@@ -1594,18 +1600,16 @@ async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -
     Ok(())
 }
 
+/// Records each ACK of the ingest stream of policy `policy_id` against that
+/// policy's checkpoint.
 async fn receive_time_series_timestamp(
     mut series_receiver: RecvStream,
-    time_series_id: String,
+    policy_id: u32,
     policy_token: CancellationToken,
     connection_token: CancellationToken,
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
 ) {
-    let Ok(policy_id) = time_series_id.parse() else {
-        warn!(%time_series_id, "Invalid policy id in ACK receiver");
-        return;
-    };
     loop {
         let result = tokio::select! {
             biased;
@@ -1613,14 +1617,14 @@ async fn receive_time_series_timestamp(
                 // Policy deletion: exit immediately without draining.
                 // The policy actor ignores ACKs for inactive policies.
                 info!(
-                    %time_series_id,
+                    policy_id,
                     "receive_time_series_timestamp stopping; policy deleted"
                 );
                 return;
             }
             () = connection_token.cancelled() => {
                 info!(
-                    %time_series_id,
+                    policy_id,
                     "receive_time_series_timestamp stopping; ingest connection replaced"
                 );
                 return;
@@ -1634,10 +1638,7 @@ async fn receive_time_series_timestamp(
                     .await
                     .is_err()
                 {
-                    warn!(
-                        %time_series_id,
-                        "Policy actor closed while recording an ACK"
-                    );
+                    warn!(policy_id, "Policy actor closed while recording an ACK");
                     return;
                 }
             }
@@ -1645,10 +1646,7 @@ async fn receive_time_series_timestamp(
                 break;
             }
             Err(e) => {
-                warn!(
-                    %time_series_id,
-                    "receive_time_series_timestamp error: {e}"
-                );
+                warn!(policy_id, "receive_time_series_timestamp error: {e}");
                 connection_notify.notify_waiters();
                 break;
             }
