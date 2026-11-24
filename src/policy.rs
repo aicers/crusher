@@ -6,7 +6,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use review_protocol::types::{CounterpartScope, TimeSeriesGenerationPolicy};
+use review_protocol::types::{
+    CounterpartScope, GroupByUnit, HostNetworkGroup, TimeSeriesGenerationPolicy,
+};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
@@ -40,6 +42,20 @@ enum PolicyCommand {
 struct PolicyEntry {
     policy: TimeSeriesGenerationPolicy,
     token: CancellationToken,
+    /// The policy's internal network, which its runner follows without a
+    /// restart.
+    networks: watch::Sender<HostNetworkGroup>,
+}
+
+impl PolicyEntry {
+    fn new(policy: TimeSeriesGenerationPolicy) -> Self {
+        let (networks, _) = watch::channel(policy.internal_networks.clone());
+        Self {
+            policy,
+            token: CancellationToken::new(),
+            networks,
+        }
+    }
 }
 
 /// A consistent view of the policy, its cancellation signal and resume position.
@@ -48,6 +64,9 @@ pub(crate) struct StreamPolicy {
     pub(crate) policy: TimeSeriesGenerationPolicy,
     pub(crate) token: CancellationToken,
     pub(crate) start: i64,
+    /// Changes of the policy's internal network after this view was taken.
+    /// `policy.internal_networks` is the network it starts with.
+    pub(crate) networks: watch::Receiver<HostNetworkGroup>,
 }
 
 /// Commands and ACKs share one owner. Dropping the last handle lets that owner
@@ -217,6 +236,7 @@ async fn run_actor(
                     start: start_timestamp(timestamps.get(&id.to_string()).copied()),
                     policy: entry.policy.clone(),
                     token: entry.token.clone(),
+                    networks: entry.networks.subscribe(),
                 });
                 let _ = reply.send(Ok(state));
             }
@@ -245,7 +265,9 @@ struct ReplaceOutcome {
 /// policy that returns resumes from its last written window instead of
 /// rebuilding windows whose raw events may be gone. An ID whose content changed
 /// is restarted from the beginning, because the old checkpoint describes the
-/// old content's windows.
+/// old content's windows. An ID whose content is the same keeps running with
+/// the policy as received, and its runner is handed a changed internal
+/// network.
 fn replace_policies(
     active: &mut HashMap<u32, PolicyEntry>,
     timestamps: &mut HashMap<String, i64>,
@@ -293,14 +315,18 @@ fn replace_policies(
     for (id, policy) in received {
         match active.entry(id) {
             Entry::Vacant(entry) => {
-                entry.insert(PolicyEntry {
-                    policy,
-                    token: CancellationToken::new(),
-                });
+                entry.insert(PolicyEntry::new(policy));
                 outcome.changed = true;
             }
             Entry::Occupied(mut entry) => {
                 if same_content(&entry.get().policy, &policy) {
+                    let entry = entry.get_mut();
+                    if entry.policy.internal_networks != policy.internal_networks {
+                        entry
+                            .networks
+                            .send_replace(policy.internal_networks.clone());
+                    }
+                    entry.policy = policy;
                     continue;
                 }
                 warn!(
@@ -308,10 +334,7 @@ fn replace_policies(
                      checkpoint"
                 );
                 entry.get().token.cancel();
-                entry.insert(PolicyEntry {
-                    policy,
-                    token: CancellationToken::new(),
-                });
+                entry.insert(PolicyEntry::new(policy));
                 if timestamps.remove(&id.to_string()).is_some() {
                     outcome.checkpoint_removed = true;
                 }
@@ -324,22 +347,29 @@ fn replace_policies(
 
 /// Returns why the policy cannot be run, or `None` if it can.
 ///
-/// Only an ungrouped policy over at least one sensor and every counterpart is
-/// generated yet, and only of a network kind with a measure defined on it. Any
-/// other policy is treated as absent from the list: it is not started, a
-/// running one is stopped, and its checkpoint is kept.
+/// Only a policy over at least one sensor, of a network kind with a measure
+/// defined on it, is generated, and only an ungrouped one over every
+/// counterpart or one grouped by single IP. Any other policy is treated as
+/// absent from the list: it is not started, a running one is stopped, and its
+/// checkpoint is kept.
 fn skip_reason(policy: &TimeSeriesGenerationPolicy) -> Option<String> {
-    if let Some(role) = policy.group_by {
-        return Some(format!("grouping by {role:?} is not supported yet"));
+    match policy.group_by {
+        Some(_) if policy.group_by_unit != GroupByUnit::Ip => {
+            return Some(format!(
+                "grouping by {:?} is not supported yet",
+                policy.group_by_unit
+            ));
+        }
+        None if policy.counterpart_scope != CounterpartScope::Any => {
+            return Some(format!(
+                "counterpart scope {:?} needs a group side",
+                policy.counterpart_scope
+            ));
+        }
+        _ => {}
     }
     if policy.sensors.is_empty() {
         return Some("no sensor is assigned".to_string());
-    }
-    if policy.counterpart_scope != CounterpartScope::Any {
-        return Some(format!(
-            "counterpart scope {:?} is not supported yet",
-            policy.counterpart_scope
-        ));
     }
     crate::subscribe::check_generation_spec(policy)
         .err()
@@ -446,7 +476,10 @@ mod tests {
 
     /// Changes that make a policy one this generator does not run.
     const UNSUPPORTED: [Change; 7] = [
-        ("group_by", |p| p.group_by = Some(EndpointRole::Source)),
+        ("owned network", |p| {
+            p.group_by = Some(EndpointRole::Source);
+            p.group_by_unit = GroupByUnit::OwnedNetwork;
+        }),
         ("internal scope", |p| {
             p.counterpart_scope = CounterpartScope::Internal;
         }),
@@ -630,45 +663,73 @@ mod tests {
         .await;
     }
 
+    /// Spec changes that leave an ungrouped policy runnable.
+    const UNGROUPED_CHANGES: [Change; 11] = [
+        ("group_by none to Source", |p| {
+            p.group_by = Some(EndpointRole::Source);
+        }),
+        ("raw_event_kind", |p| p.raw_event_kind = RawEventKind::Dns),
+        ("measure", |p| {
+            p.measure = Measure::Sum(ConnField::OrigBytes);
+        }),
+        ("group_by_unit", |p| {
+            p.group_by_unit = GroupByUnit::OwnedNetwork;
+        }),
+        ("slot_size", |p| p.slot_size = Duration::from_secs(30)),
+        ("window_size", |p| p.window_size = Duration::from_hours(24)),
+        ("utc_offset", |p| p.utc_offset = 32_400),
+        ("src_ip", |p| p.src_ip = Some("10.0.0.1".parse().unwrap())),
+        ("dst_ip", |p| p.dst_ip = Some("10.0.0.2".parse().unwrap())),
+        ("sensors", |p| p.sensors = vec!["other".into()]),
+        ("time_series_type", |p| {
+            p.time_series_type = Some(TimeSeriesTypeRef {
+                id: "conn_count".into(),
+                version: 1,
+            });
+        }),
+    ];
+
+    /// Spec changes that leave a policy grouped by source runnable.
+    const GROUPED_CHANGES: [Change; 3] = [
+        ("group_by Source to Destination", |p| {
+            p.group_by = Some(EndpointRole::Destination);
+        }),
+        ("group_by Source to none", |p| p.group_by = None),
+        ("counterpart_scope Any to Internal", |p| {
+            p.counterpart_scope = CounterpartScope::Internal;
+        }),
+    ];
+
     #[tokio::test]
     async fn changed_content_restarts_policy_without_its_checkpoint() {
-        // Every spec field whose change leaves the policy runnable. `group_by`
-        // and `counterpart_scope` have no other runnable value; changing them
-        // skips the policy, as `change_to_unsupported_policy_*` tests.
-        let changes: [Change; 10] = [
-            ("raw_event_kind", |p| p.raw_event_kind = RawEventKind::Dns),
-            ("measure", |p| {
-                p.measure = Measure::Sum(ConnField::OrigBytes);
-            }),
-            ("group_by_unit", |p| {
-                p.group_by_unit = GroupByUnit::OwnedNetwork;
-            }),
-            ("slot_size", |p| p.slot_size = Duration::from_secs(30)),
-            ("window_size", |p| p.window_size = Duration::from_hours(24)),
-            ("utc_offset", |p| p.utc_offset = 32_400),
-            ("src_ip", |p| p.src_ip = Some("10.0.0.1".parse().unwrap())),
-            ("dst_ip", |p| p.dst_ip = Some("10.0.0.2".parse().unwrap())),
-            ("sensors", |p| p.sensors = vec!["other".into()]),
-            ("time_series_type", |p| {
-                p.time_series_type = Some(TimeSeriesTypeRef {
-                    id: "conn_count".into(),
-                    version: 1,
-                });
-            }),
-        ];
+        // Every spec field whose change leaves the policy runnable, from an
+        // ungrouped or a grouped base policy. A non-`Any` scope runs only on a
+        // grouped policy, and `OwnedNetwork` only on an ungrouped one; the
+        // other changes skip the policy, as `change_to_unsupported_policy_*`
+        // tests.
+        let changes = UNGROUPED_CHANGES
+            .iter()
+            .map(|change| (false, change))
+            .chain(GROUPED_CHANGES.iter().map(|change| (true, change)));
         run_test(async {
-            for (field, change) in changes {
+            for (grouped, (field, change)) in changes {
                 let h = Harness::new(r#"{"42":100,"7":200}"#).await;
+                let mut original = policy(42);
+                if grouped {
+                    original.group_by = Some(EndpointRole::Source);
+                }
+                assert_eq!(skip_reason(&original), None, "{field}: the base runs");
                 h.handle
-                    .replace_policies(vec![policy(42), policy(7)])
+                    .replace_policies(vec![original.clone(), policy(7)])
                     .await
                     .unwrap();
                 let old = h.handle.get_policy_token(42).await.unwrap();
                 let kept = h.handle.get_policy_token(7).await.unwrap();
                 let mut snapshot = h.handle.subscribe();
                 snapshot.borrow_and_update();
-                let mut replacement = policy(42);
+                let mut replacement = original;
                 change(&mut replacement);
+                assert_eq!(skip_reason(&replacement), None, "{field}: the change runs");
                 h.handle
                     .replace_policies(vec![replacement, policy(7)])
                     .await
@@ -739,6 +800,52 @@ mod tests {
         .await;
     }
 
+    /// A running policy's view follows a changed internal network, and a
+    /// view taken afterwards starts with it, so a new request applies it from
+    /// the checkpoint window on. A resend of the same network is no change.
+    #[tokio::test]
+    async fn internal_networks_change_reaches_the_runner_and_later_requests() {
+        run_test(async {
+            let h = Harness::new(r#"{"42":100}"#).await;
+            let mut grouped = policy(42);
+            grouped.group_by = Some(EndpointRole::Source);
+            h.handle
+                .replace_policies(vec![grouped.clone()])
+                .await
+                .unwrap();
+            let mut running = h.handle.stream_policy(42).await.unwrap().unwrap();
+            assert!(!running.networks.has_changed().unwrap());
+
+            let networks = HostNetworkGroup {
+                hosts: vec!["10.0.0.1".parse().unwrap()],
+                networks: Vec::new(),
+                ip_ranges: Vec::new(),
+            };
+            let mut changed = grouped.clone();
+            changed.internal_networks = networks.clone();
+            h.handle
+                .replace_policies(vec![changed.clone()])
+                .await
+                .unwrap();
+            assert!(running.networks.has_changed().unwrap());
+            assert_eq!(*running.networks.borrow_and_update(), networks);
+            assert!(!running.token.is_cancelled());
+
+            let later = h.handle.stream_policy(42).await.unwrap().unwrap();
+            assert_eq!(later.policy.internal_networks, networks);
+            assert_eq!(later.start, 100);
+            assert!(!later.networks.has_changed().unwrap());
+
+            h.handle.replace_policies(vec![changed]).await.unwrap();
+            assert!(
+                !running.networks.has_changed().unwrap(),
+                "the same network is not sent again"
+            );
+            h.finish().await;
+        })
+        .await;
+    }
+
     #[test]
     fn unsupported_policy_is_skipped_with_a_warning_naming_it() {
         for (what, change) in UNSUPPORTED {
@@ -784,9 +891,9 @@ mod tests {
         assert_eq!(
             reasons,
             [
-                "grouping by Source is not supported yet",
-                "counterpart scope Internal is not supported yet",
-                "counterpart scope External is not supported yet",
+                "grouping by OwnedNetwork is not supported yet",
+                "counterpart scope Internal needs a group side",
+                "counterpart scope External needs a group side",
                 "no sensor is assigned",
                 "ProcessCreate is not a network raw event kind",
                 "Netflow5 is not a network raw event kind",
@@ -797,6 +904,18 @@ mod tests {
         let mut two_sensors = policy(42);
         two_sensors.sensors.push("other".into());
         assert_eq!(skip_reason(&two_sensors), None, "a sensor bundle runs");
+        for group_by in [EndpointRole::Source, EndpointRole::Destination] {
+            for scope in [
+                CounterpartScope::Any,
+                CounterpartScope::Internal,
+                CounterpartScope::External,
+            ] {
+                let mut grouped = policy(42);
+                grouped.group_by = Some(group_by);
+                grouped.counterpart_scope = scope;
+                assert_eq!(skip_reason(&grouped), None, "{group_by:?} {scope:?} runs");
+            }
+        }
     }
 
     #[tokio::test]

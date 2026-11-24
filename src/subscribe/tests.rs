@@ -683,10 +683,17 @@ async fn handle_ingest_stream(
         let Ok(batch) = bincode::deserialize::<Vec<(i64, Vec<u8>)>>(&buf) else {
             continue;
         };
+        // The policy id is the part of the series id before `/`.
         let policy_id = batch
             .first()
             .and_then(|(_, payload)| bincode::deserialize::<TimeSeries>(payload).ok())
-            .and_then(|series| series.time_series_id.parse::<u32>().ok())
+            .and_then(|series| {
+                let id = series
+                    .time_series_id
+                    .split_once('/')
+                    .map_or(series.time_series_id.as_str(), |(id, _)| id);
+                id.parse::<u32>().ok()
+            })
             .unwrap_or(0);
         for (timestamp, payload) in batch {
             if let Some(series_notify) = &series_notify
@@ -1737,6 +1744,7 @@ async fn ingest_control_queues_consecutive_writes_on_one_sender() {
         series_send
             .try_send(TimeSeries {
                 time_series_id: DEFAULT_POLICY_ID.to_string(),
+                policy_id: DEFAULT_POLICY_ID,
                 start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
                 series: vec![value],
             })
@@ -1811,6 +1819,7 @@ async fn shutdown_drain_writes_series_queued_in_the_ingest_control() {
         series_send
             .try_send(TimeSeries {
                 time_series_id: DEFAULT_POLICY_ID.to_string(),
+                policy_id: DEFAULT_POLICY_ID,
                 start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
                 series: vec![value],
             })
@@ -1878,6 +1887,7 @@ async fn shutdown_drain_keeps_corrections_behind_the_window_they_replace() {
     let next_start_secs = (BASE_WINDOW_START_NANOS + DAY_NANOS) / 1_000_000_000;
     let window = |start_secs, value| TimeSeries {
         time_series_id: DEFAULT_POLICY_ID.to_string(),
+        policy_id: DEFAULT_POLICY_ID,
         start_secs,
         series: vec![value],
     };
@@ -1904,7 +1914,7 @@ async fn shutdown_drain_keeps_corrections_behind_the_window_they_replace() {
             endpoint
         }
     });
-    wait_for_ingest_channel(&DEFAULT_POLICY_ID.to_string(), true)
+    wait_for_ingest_channel(DEFAULT_POLICY_ID, true)
         .await
         .expect("the original write starts the policy's sender");
 
@@ -1977,19 +1987,21 @@ async fn cancellation_drains_queued_time_series() {
         .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
         .await
         .unwrap();
-    let policy_id = DEFAULT_POLICY_ID.to_string();
+    let policy_id = DEFAULT_POLICY_ID;
     let first = TimeSeries {
-        time_series_id: policy_id.clone(),
+        time_series_id: policy_id.to_string(),
+        policy_id,
         start_secs: 1,
         series: vec![1.0],
     };
     let second = TimeSeries {
-        time_series_id: policy_id.clone(),
+        time_series_id: policy_id.to_string(),
+        policy_id,
         start_secs: 2,
         series: vec![2.0],
     };
 
-    let recv_channel = register_ingest_queue(&policy_id).await;
+    let recv_channel = register_ingest_queue(policy_id).await;
     let sender_task = coordinator.tracker().spawn(send_time_series(
         Arc::new(connection),
         first,
@@ -2006,7 +2018,7 @@ async fn cancellation_drains_queued_time_series() {
         .expect("first ACK arrives")
         .expect("ACK channel remains open");
     assert_eq!(first_ack, DEFAULT_POLICY_ID);
-    wait_for_ingest_channel(&policy_id, true)
+    wait_for_ingest_channel(policy_id, true)
         .await
         .expect("per-policy queue is registered");
 
@@ -2313,6 +2325,63 @@ async fn silent_source_window_is_written_by_the_timer() {
     drop(review);
     drop(policy_handle);
     cleanup_test_resources(coordinator, client_handle, servers.handles).await;
+}
+
+/// A grouped policy writes its IP's row under `P/IP` on one ingest stream,
+/// keyed by its policy id, and the ACK of that stream moves its checkpoint.
+#[serial]
+#[tokio::test]
+async fn grouped_policy_writes_ip_rows_and_its_ack_moves_its_checkpoint() {
+    INGEST_CHANNEL.write().await.clear();
+    let servers = start_window_servers(one_window_then_next());
+    let coordinator = CancellationCoordinator::new();
+    let (mut review, actor_task, path, _dir, policy_handle) =
+        setup_request_client(None, &coordinator).await;
+    let mut policy = new_policy(DEFAULT_POLICY_ID);
+    policy.group_by = Some(review_protocol::types::EndpointRole::Source);
+    // `gen_conn` is from 192.168.4.76 to itself.
+    policy.internal_networks = HostNetworkGroup {
+        hosts: Vec::new(),
+        networks: vec!["192.168.4.0/24".parse().unwrap()],
+        ip_ranges: Vec::new(),
+    };
+    policy.counterpart_scope = CounterpartScope::Internal;
+    review
+        .time_series_generation_policy_list(std::slice::from_ref(&policy))
+        .await
+        .unwrap();
+    let client_handle = spawn_subscribe_client(
+        &cert_key(),
+        actor_task,
+        servers.ingest_addr,
+        servers.publish_addr,
+        policy_handle.clone(),
+        coordinator.clone(),
+    );
+
+    let (timestamp, series) = next_written_window(&servers.series).await;
+    assert_eq!(timestamp, BASE_WINDOW_START_NANOS);
+    assert_eq!(series.time_series_id, "1/192.168.4.76");
+    assert_eq!(series.series.iter().sum::<f64>(), 3.0);
+    let map = timeout(TEST_TIMEOUT, wait_for_policy_ids(&path, &[policy.id], true))
+        .await
+        .expect("the grouped window is acknowledged");
+    assert_eq!(
+        map,
+        HashMap::from([(policy.id.to_string(), BASE_WINDOW_START_NANOS)]),
+        "the checkpoint is the policy's"
+    );
+    let queues: Vec<u32> = INGEST_CHANNEL.read().await.keys().copied().collect();
+    assert_eq!(
+        queues,
+        [policy.id],
+        "one ingest queue, keyed by the policy id"
+    );
+
+    drop(review);
+    drop(policy_handle);
+    cleanup_test_resources(coordinator, client_handle, servers.handles).await;
+    INGEST_CHANNEL.write().await.clear();
 }
 
 /// Runs [`new_policy`] over a generator stream carrying `frames` and returns
@@ -2862,8 +2931,7 @@ async fn delete_policy_tears_down_ingest_channel_entry() {
     // `INGEST_CHANNEL` is populated after the first `send_time_series`
     // opens its bi-di stream and installs its sender. Wait for it so
     // the delete below has something to tear down.
-    let key = policy.id.to_string();
-    wait_for_ingest_channel(&key, true)
+    wait_for_ingest_channel(policy.id, true)
         .await
         .expect("INGEST_CHANNEL entry must appear after first ACK");
 
@@ -2874,17 +2942,17 @@ async fn delete_policy_tears_down_ingest_channel_entry() {
         .unwrap();
     let _ = harness.wait_for_timestamp_removed(&[policy.id]).await;
 
-    wait_for_ingest_channel(&key, false)
+    wait_for_ingest_channel(policy.id, false)
         .await
         .expect("INGEST_CHANNEL entry must be cleared when the policy is deleted");
 
     harness.cleanup().await;
 }
 
-async fn wait_for_ingest_channel(key: &str, should_exist: bool) -> Result<(), ()> {
+async fn wait_for_ingest_channel(policy_id: u32, should_exist: bool) -> Result<(), ()> {
     timeout(Duration::from_secs(5), async {
         loop {
-            let present = INGEST_CHANNEL.read().await.contains_key(key);
+            let present = INGEST_CHANNEL.read().await.contains_key(&policy_id);
             if present == should_exist {
                 return;
             }
@@ -3520,9 +3588,10 @@ mod policy_lifecycle {
         .await;
     }
 
-    /// Only an ungrouped policy of a network kind over every counterpart is
-    /// requested, once, for its kind and its sensor; every other policy in the
-    /// same list is skipped and requests nothing.
+    /// Only a policy of a network kind, ungrouped over every counterpart or
+    /// grouped by single IP, is requested, once, for its kind and its sensor;
+    /// every other policy in the same list, among them grouped policies by
+    /// `OwnedNetwork`, is skipped and requests nothing.
     #[tokio::test]
     async fn only_runnable_policy_is_requested_for_its_kind_and_sensor() {
         run_test(async {
@@ -3533,7 +3602,9 @@ mod policy_lifecycle {
             runnable.raw_event_kind = PolicyRawEventKind::Dns;
             let mut skipped: Vec<TimeSeriesGenerationPolicy> = (1..=7).map(new_policy).collect();
             skipped[0].group_by = Some(review_protocol::types::EndpointRole::Source);
+            skipped[0].group_by_unit = GroupByUnit::OwnedNetwork;
             skipped[1].group_by = Some(review_protocol::types::EndpointRole::Destination);
+            skipped[1].group_by_unit = GroupByUnit::OwnedNetwork;
             skipped[2].counterpart_scope = CounterpartScope::Internal;
             skipped[3].counterpart_scope = CounterpartScope::External;
             skipped[4].sensors.clear();

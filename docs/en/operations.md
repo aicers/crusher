@@ -103,6 +103,53 @@ Crusher cannot check:
 - No communication is seen by more than one of the sensors. A communication
   that two sensors both see is counted twice.
 
+## Per-IP Series
+
+A policy grouped by source or destination writes one series per IP of the
+customer's internal network instead of one summed series. The windows of all
+of its IPs follow the rules above together:
+
+- A policy grouped by source splits by the event's source address, a policy
+  grouped by destination by its destination address. The series of an IP has
+  the ID `P/IP`, the policy ID and the IP as written in the usual notation:
+  `42/10.100.0.5` or `42/2001:db8::1`. An IPv4 address and the IPv4-mapped
+  IPv6 address of it are different IPs. A grouped policy writes nothing under
+  its own ID `P`; an ungrouped policy writes its single series under `P`.
+- An event counts only if the IP on the grouping side is in the policy's
+  internal network: it is one of its hosts, or lies in one of its networks or
+  ranges. An event with an external IP on that side writes no series, but
+  still moves its stream past a window, so it can get a window written.
+- The policy's counterpart scope filters on the other endpoint: internal
+  counts only events whose other endpoint is in the internal network too,
+  external only those whose other endpoint is outside it, and any counts both.
+  An ungrouped policy must count every counterpart; one with another scope is
+  skipped with a warning naming the policy ID, as is a policy grouped by
+  customer network, which Crusher does not support yet.
+- The events of every sensor of the policy for the same IP add into the same
+  series. When a window is written, the rows of all its IPs are written
+  together, in ascending order of their series IDs, so a quiet IP's window is
+  written when the policy's window closes, not when that IP next appears. An
+  event that arrives after its window was written corrects that IP's row, or
+  adds a row for an IP that had none in the window.
+- A change to the policy's internal network alone does not restart the policy
+  or discard its resume position. The new network applies from the window
+  after the one containing the latest event the policy has received; earlier
+  windows keep the network they had, and their rows stay as written. An IP
+  added to the network is counted from that window on, and an IP removed from
+  it gets no window from that window on. When the policy's streams are
+  requested again, after a restart or a reconnect, the current network
+  applies to every window from where the policy resumes.
+- A grouped policy whose internal network is empty counts no events. Crusher
+  logs a warning with the policy ID for each of its windows that is due while
+  the network is empty, from the window of the first event the policy receives
+  on. The policy keeps running.
+- A grouped policy keeps a series for at most 10,000 IPs at a time. The IPs
+  are taken in the order their events arrive and are kept for as long as the
+  policy runs, however quiet. Events of further IPs are not counted. When a
+  window is due in which such IPs were refused, Crusher logs a warning with
+  the policy ID and the number of refused IPs. When the policy's streams are
+  requested again, the IPs are taken anew from the replayed events.
+
 ## Items to Check After Startup
 
 - Verify that the process does not terminate immediately
