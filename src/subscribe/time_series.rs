@@ -61,9 +61,10 @@ pub(super) struct TimeSeries {
 pub(super) struct IngestFrame {
     policy_id: u32,
     rows: Vec<TimeSeries>,
-    /// The policy token of the run that wrote the frame, cancelled once that
-    /// run's request is replaced or its policy deleted. `None` for a frame no
-    /// run wrote.
+    /// The token of the request whose run wrote the frame: a child of the
+    /// policy token, so cancelled once the request is replaced or its policy
+    /// deleted, and cancelled by an ingest sender that drops a frame of it.
+    /// `None` for a frame no run wrote.
     run: Option<CancellationToken>,
 }
 
@@ -83,7 +84,8 @@ impl IngestFrame {
         self.rows
     }
 
-    /// Returns the frame as written by the run whose policy token is `run`.
+    /// Returns the frame as written by the run of the request whose token is
+    /// `run`.
     #[must_use]
     pub(super) fn of_run(mut self, run: &CancellationToken) -> Self {
         self.run = Some(run.clone());
@@ -96,6 +98,15 @@ impl IngestFrame {
         self.run
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
+    }
+
+    /// Stops the run that wrote the frame, as the frame is dropped unwritten.
+    /// Every later frame of that run is then dropped too: a marker written
+    /// without a row it counts would claim a row Giganto never stored.
+    pub(super) fn stop_run(&self) {
+        if let Some(run) = &self.run {
+            run.cancel();
+        }
     }
 
     /// Returns a frame of `row` followed by `then`, both of one policy.

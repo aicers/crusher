@@ -145,6 +145,13 @@ enum IngestBehavior {
         received: Arc<Notify>,
         pending: Arc<AtomicBool>,
     },
+    /// Stores the first frame received on any connection only once `release`
+    /// is notified, and notifies `received` on its receipt.
+    HoldFirstStore {
+        received: Arc<Notify>,
+        release: Arc<Notify>,
+        pending: Arc<AtomicBool>,
+    },
 }
 
 struct FakeGigantoServer {
@@ -724,6 +731,16 @@ async fn handle_ingest_stream(
         {
             received.notify_one();
             sleep(*delay).await;
+        }
+        if let IngestBehavior::HoldFirstStore {
+            received,
+            release,
+            pending,
+        } = &behavior
+            && pending.swap(false, Ordering::SeqCst)
+        {
+            received.notify_one();
+            release.notified().await;
         }
         // The policy id is the part of the series id before `/`.
         let policy_id = batch
@@ -2201,20 +2218,25 @@ async fn replacement_timeout_keeps_the_old_senders_writes_before_the_new_ones() 
         .expect("the changed policy is active");
 
     // The next run's first row starts a sender that waits for the old one,
-    // times out and signals a reconnect; the row it held is lost with it.
+    // times out and signals a reconnect; the row it held is lost with it,
+    // and its request stops.
+    let lost = new_run.child_token();
     let failed = connection_notify.notified();
     tokio::pin!(failed);
     failed.as_mut().enable();
     series_send
-        .try_send(frame(ip_row.clone(), 0.5, &new_run))
+        .try_send(frame(ip_row.clone(), 0.5, &lost))
         .unwrap();
     timeout(TEST_TIMEOUT, failed)
         .await
         .expect("the replacing sender times out and signals a reconnect");
+    assert!(lost.is_cancelled(), "the request that lost its row stops");
+    assert!(!new_run.is_cancelled(), "the policy stays active");
 
-    // The run's rows as it writes them again on the new connection.
+    // The rows of the policy's next request, written on the new connection.
+    let rewrite = new_run.child_token();
     for (id, value) in [(ip_row.clone(), 1.0), (DEFAULT_POLICY_ID.to_string(), 2.0)] {
-        series_send.try_send(frame(id, value, &new_run)).unwrap();
+        series_send.try_send(frame(id, value, &rewrite)).unwrap();
     }
 
     let mut writes = Vec::new();
@@ -2241,6 +2263,206 @@ async fn replacement_timeout_keeps_the_old_senders_writes_before_the_new_ones() 
     drop(policy_handle);
     assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
     actor_task.await.unwrap().unwrap();
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
+/// A request's two IP rows and their marker are queued, through queues of
+/// the production capacity, behind a sender that waits for a replaced
+/// request's frame Giganto holds unstored: the first row is the sender's
+/// own, the second is in its queue, and the marker is blocked on that queue.
+/// The sender times out and drops both rows. The marker, which the closing
+/// queue hands back to the ingest control, is dropped with them, and is not
+/// written by another sender once the old frame is stored, with the
+/// connection still up: a marker visible without the rows it counts would
+/// claim rows Giganto never stored. The request stops, and only the next
+/// request's rows and marker follow the old frame.
+#[serial]
+#[tokio::test]
+async fn failed_sender_drops_the_rest_of_its_request() {
+    const OTHER_POLICY_ID: u32 = DEFAULT_POLICY_ID + 1;
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::HoldFirstStore {
+            received: received.clone(),
+            release: release.clone(),
+            pending: Arc::new(AtomicBool::new(true)),
+        })
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+    policy_handle
+        .replace_policies(vec![
+            new_policy(DEFAULT_POLICY_ID),
+            new_policy(OTHER_POLICY_ID),
+        ])
+        .await
+        .unwrap();
+    let old_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the policy is active");
+    let other_run = policy_handle
+        .get_policy_token(OTHER_POLICY_ID)
+        .await
+        .expect("the other policy is active");
+
+    let start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
+    let frame = |policy_id: u32, id: &str, value, run: &CancellationToken| {
+        IngestFrame::from(TimeSeries {
+            time_series_id: id.to_string(),
+            policy_id,
+            start_secs,
+            series: vec![value],
+        })
+        .of_run(run)
+    };
+    let ip_a = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
+    let ip_b = format!("{DEFAULT_POLICY_ID}/10.0.0.2");
+    let marker = DEFAULT_POLICY_ID.to_string();
+    let other = OTHER_POLICY_ID.to_string();
+    let (series_send, series_recv) = async_channel::bounded(TIME_SERIES_CHANNEL_SIZE);
+    series_send
+        .send(frame(DEFAULT_POLICY_ID, &ip_a, 9.0, &old_run.child_token()))
+        .await
+        .unwrap();
+    let connection_notify = Arc::new(Notify::new());
+    let control = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        let connection_notify = connection_notify.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                connection_notify,
+                coordinator,
+            )
+            .await
+            .expect("ingest control exits cleanly");
+            endpoint
+        }
+    });
+    timeout(TEST_TIMEOUT, received.notified())
+        .await
+        .expect("Giganto receives the old run's row");
+
+    let changed = TimeSeriesGenerationPolicy {
+        slot_size: Duration::from_secs(5 * SECS_PER_MINUTE),
+        ..new_policy(DEFAULT_POLICY_ID)
+    };
+    policy_handle
+        .replace_policies(vec![changed, new_policy(OTHER_POLICY_ID)])
+        .await
+        .unwrap();
+    assert!(old_run.is_cancelled(), "the change restarts the policy");
+    assert!(!other_run.is_cancelled(), "the other policy is unchanged");
+    let new_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the changed policy is active");
+
+    // The request's rows and marker, all queued before the sender times out,
+    // and then another policy's row, which the ingest control takes only
+    // once it has routed the marker.
+    let lost = new_run.child_token();
+    let failed = connection_notify.notified();
+    tokio::pin!(failed);
+    failed.as_mut().enable();
+    let producer = tokio::spawn({
+        let series_send = series_send.clone();
+        let frames = [
+            frame(DEFAULT_POLICY_ID, &ip_a, 1.0, &lost),
+            frame(DEFAULT_POLICY_ID, &ip_b, 1.0, &lost),
+            frame(DEFAULT_POLICY_ID, &marker, 2.0, &lost),
+            frame(OTHER_POLICY_ID, &other, 7.0, &other_run.child_token()),
+        ];
+        async move {
+            for frame in frames {
+                series_send.send(frame).await.unwrap();
+            }
+        }
+    });
+    timeout(TEST_TIMEOUT, failed)
+        .await
+        .expect("the replacing sender times out and signals a reconnect");
+    let (_, series) = timeout(TEST_TIMEOUT, stored.recv())
+        .await
+        .expect("the other policy's row is stored")
+        .unwrap();
+    assert_eq!(
+        (series.time_series_id, series.series),
+        (other.clone(), vec![7.0]),
+        "the other policy's row, routed after the marker, is stored first"
+    );
+    producer
+        .await
+        .expect("every frame is handed to the ingest control");
+    assert!(lost.is_cancelled(), "the request that lost its rows stops");
+    assert!(!new_run.is_cancelled(), "the policy stays active");
+
+    // Giganto stores the old run's row with the connection up, and the
+    // reconnect signal follows, as the stopped request's runner gives it.
+    release.notify_one();
+    let (_, series) = timeout(TEST_TIMEOUT, stored.recv())
+        .await
+        .expect("the old run's row is stored")
+        .unwrap();
+    assert_eq!(
+        (series.time_series_id, series.series),
+        (ip_a.clone(), vec![9.0])
+    );
+    connection_notify.notify_one();
+
+    // The rows of the policy's next request, written on the new connection.
+    let rewrite = new_run.child_token();
+    for (id, value) in [(&ip_a, 1.0), (&ip_b, 1.0), (&marker, 2.0)] {
+        series_send
+            .send(frame(DEFAULT_POLICY_ID, id, value, &rewrite))
+            .await
+            .unwrap();
+    }
+    let mut writes = Vec::new();
+    for _ in 0..3 {
+        let (_, series) = timeout(RECONNECT_TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("the next request's rows and marker are stored")
+            .unwrap();
+        writes.push((series.time_series_id, series.series));
+    }
+    assert_eq!(
+        writes,
+        [(ip_a, vec![1.0]), (ip_b, vec![1.0]), (marker, vec![2.0]),],
+        "no marker of the stopped request is stored, and the next request's \
+         marker follows both rows it counts"
+    );
+
+    coordinator.request_cancellation("failed sender request test");
+    drop(series_send);
+    let endpoint = control.await.expect("ingest control joins");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    assert!(
+        stored.try_recv().is_err(),
+        "nothing else is stored, the stopped request's marker included"
+    );
     endpoint.close(0u32.into(), &[]);
     shutdown.notify_one();
     ingest_handle.await.expect("ingest server joins");
@@ -4528,6 +4750,7 @@ mod policy_lifecycle {
                 connection_token.clone(),
                 coordinator.clone(),
                 CloseTimer::default(),
+                Arc::new(Notify::new()),
             ));
             // Join this worker itself, not an assumed total number of unrelated tasks.
             // Neither policy nor connection cancellation can account for its exit.
@@ -4553,6 +4776,89 @@ mod policy_lifecycle {
             assert!(!read_time_data_map(&path).contains_key("42"));
             assert!(handle.get_policy(42).await.is_none());
             coordinator.request_cancellation("EOF deletion test complete");
+            endpoint.close(0u32.into(), &[]);
+            shutdown.notify_one();
+            join_test_task("Giganto Publish server", server).await;
+            drop(review);
+            drop(handle);
+            join_test_task("policy actor", actor).await.unwrap();
+            assert!(coordinator.wait_for_drain(TEST_TIMEOUT).await);
+        })
+        .await;
+    }
+
+    /// An ingest sender that drops a frame of a request stops that request.
+    /// The request's runner then stops writing and signals a reconnect, whose
+    /// request of the policy rewrites its windows with a new generation, while
+    /// the policy itself stays active.
+    #[serial]
+    #[tokio::test]
+    async fn runner_of_a_stopped_request_stops_and_signals_a_reconnect() {
+        run_test(async {
+            let coordinator = CancellationCoordinator::new();
+            let (mut review, actor, _path, _dir, handle) =
+                setup_request_client(None, &coordinator).await;
+            review
+                .time_series_generation_policy_list(&[new_policy(42)])
+                .await
+                .unwrap();
+            let state = handle.stream_policy(42).await.unwrap().unwrap();
+            let shutdown = Arc::new(Notify::new());
+            let mut fake = FakeGigantoServer::new_publish().with_held_streams();
+            fake.publish_repeat_delay = Duration::ZERO;
+            let (addr, server) = fake.start_publish(shutdown.clone());
+            let endpoint = client::config(&cert_key()).unwrap();
+            let (connection, mut send) =
+                publish_connect(&endpoint, addr, HOST, REQUIRED_GIGANTO_VERSION)
+                    .await
+                    .unwrap();
+            process_network_stream(&mut send, &state, RequestStreamRecord::Conn)
+                .await
+                .unwrap();
+            let mut recv = connection.accept_uni().await.unwrap();
+            assert_eq!(
+                receive_time_series_generator_stream_start_message(&mut recv)
+                    .await
+                    .unwrap(),
+                42
+            );
+            let policy_token = state.token.clone();
+            let connection_token = CancellationToken::new();
+            let connection_notify = Arc::new(Notify::new());
+            let reconnect = connection_notify.notified();
+            tokio::pin!(reconnect);
+            reconnect.as_mut().enable();
+            let (sender, receiver) = async_channel::unbounded();
+            let (stream_send, stream_recv) = mpsc::unbounded_channel();
+            stream_send.send(recv).unwrap();
+            let worker = coordinator.tracker().spawn(run_policy(
+                state,
+                stream_recv,
+                sender,
+                connection_token.clone(),
+                coordinator.clone(),
+                CloseTimer::default(),
+                connection_notify.clone(),
+            ));
+
+            let written = timeout(TEST_TIMEOUT, receiver.recv())
+                .await
+                .expect("the runner writes its window")
+                .unwrap();
+            assert!(!written.run_stopped());
+            // As an ingest sender does with a frame it drops.
+            written.stop_run();
+            timeout(TEST_TIMEOUT, reconnect)
+                .await
+                .expect("the runner signals a reconnect");
+            join_test_task("runner of the stopped request", worker)
+                .await
+                .unwrap();
+            assert!(!policy_token.is_cancelled(), "the policy stays active");
+            assert!(!connection_token.is_cancelled());
+            assert!(handle.get_policy(42).await.is_some());
+
+            coordinator.request_cancellation("stopped request test complete");
             endpoint.close(0u32.into(), &[]);
             shutdown.notify_one();
             join_test_task("Giganto Publish server", server).await;

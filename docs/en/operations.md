@@ -178,6 +178,10 @@ An ungrouped policy writes no marker and no generation.
   old connection is already lost, or is lost during the wait, Crusher cannot
   learn whether the Data Store stored what it received there, and reconnects
   without waiting further.
+- If Crusher cannot send one of a run's rows or markers, for example because
+  that wait timed out, it sends nothing more of that run, so that no marker is
+  stored without a row it counts. It then requests the policy's streams again,
+  and the new run rewrites from the checkpoint with a new generation.
 - Crusher fixes a new generation each time it requests the policy's streams:
   at startup, when the policy changes or returns to the policy list, and when
   it reconnects to the Data Store. The generation is the clock at the request
