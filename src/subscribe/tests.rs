@@ -2000,10 +2000,11 @@ async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
 }
 
 /// A reconnect replaces the ingest connection while Giganto has received a
-/// policy's frame on it but not yet stored it. The policy's next writes, on
-/// the new connection, are stored only after that frame: an old-generation
-/// row stored after the new run's row and marker would replace the row the
-/// marker counts.
+/// policy's frame on it but not yet stored it, and holds it, with the
+/// connection up, for several of the reconnect's warning intervals. The
+/// policy's next writes, on the new connection, are stored only after that
+/// frame: an old-generation row stored after the new run's row and marker
+/// would replace the row the marker counts.
 #[serial]
 #[tokio::test]
 async fn reconnect_stores_the_old_connections_writes_before_the_new_ones() {
@@ -2014,7 +2015,7 @@ async fn reconnect_stores_the_old_connections_writes_before_the_new_ones() {
     let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
         .with_series_notify(stored_send)
         .with_ingest_behavior(IngestBehavior::DelayFirstStore {
-            delay: Duration::from_millis(500),
+            delay: STORE_BEFORE_RECONNECT_WARN_INTERVAL * 5,
             received: received.clone(),
             pending: Arc::new(AtomicBool::new(true)),
         })

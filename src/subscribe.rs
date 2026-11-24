@@ -58,10 +58,16 @@ const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a policy's new ingest sender waits for Giganto to store what the
-/// sender it replaces wrote before giving up on the connection, and how long
-/// a reconnect waits for Giganto to store what the senders on the connection
-/// it replaces wrote.
+/// sender it replaces wrote before giving up on the connection.
 const PREVIOUS_STREAM_STORE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a reconnect warns while it still waits for Giganto to store what
+/// the senders on the connection it replaces wrote. Shorter in tests, which
+/// hold that storing for several intervals.
+const STORE_BEFORE_RECONNECT_WARN_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(10)
+};
 
 /// The fewest inbound streams a Publish connection lets Giganto have open at
 /// once: quinn's default, which applied before crusher raised it.
@@ -1540,9 +1546,11 @@ async fn register_ingest_queue(policy_id: u32, run: CancellationToken) -> QueueR
 /// marker counts. Giganto finishes its side of a stream only after storing
 /// every frame of it, which is what the senders' `stored` tokens wait for.
 ///
-/// The wait ends early when `connection` closes, since Giganto can then tell
-/// nothing more about the frames it received on it, at shutdown, and after
-/// [`PREVIOUS_STREAM_STORE_TIMEOUT`].
+/// The wait has no deadline while `connection` is up: giving up would let an
+/// old-generation frame Giganto still holds be stored after the next run's
+/// rows. It warns every [`STORE_BEFORE_RECONNECT_WARN_INTERVAL`] instead, and
+/// ends early only when `connection` closes, since Giganto can then tell
+/// nothing more about the frames it received on it, and at shutdown.
 async fn store_before_reconnect(connection: &Connection, coordinator: &CancellationCoordinator) {
     let pending: Vec<CancellationToken> = {
         let map = INGEST_CHANNEL.read().await;
@@ -1563,17 +1571,28 @@ async fn store_before_reconnect(connection: &Connection, coordinator: &Cancellat
             stored.cancelled().await;
         }
     };
-    tokio::select! {
-        biased;
-        () = coordinator.cancelled() => {}
-        () = all_stored => {}
-        error = connection.closed() => warn!(
-            "Ingest connection closed before Giganto stored every time series written on it: {error}"
-        ),
-        () = sleep(PREVIOUS_STREAM_STORE_TIMEOUT) => warn!(
-            "Giganto did not store every time series written on the replaced ingest connection within {} seconds",
-            PREVIOUS_STREAM_STORE_TIMEOUT.as_secs(),
-        ),
+    tokio::pin!(all_stored);
+    let closed = connection.closed();
+    tokio::pin!(closed);
+    let mut waited = Duration::ZERO;
+    loop {
+        tokio::select! {
+            biased;
+            () = coordinator.cancelled() => return,
+            () = &mut all_stored => return,
+            error = &mut closed => {
+                warn!(
+                    "Ingest connection closed before Giganto stored every time series written on it: {error}"
+                );
+                return;
+            }
+            () = sleep(STORE_BEFORE_RECONNECT_WARN_INTERVAL) => {
+                waited = waited.saturating_add(STORE_BEFORE_RECONNECT_WARN_INTERVAL);
+                warn!(
+                    "Giganto has not stored every time series written on the ingest connection being replaced after {waited:?}; still waiting before reconnecting"
+                );
+            }
+        }
     }
 }
 

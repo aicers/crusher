@@ -172,10 +172,11 @@ An ungrouped policy writes no marker and no generation.
   Store has stored every row the earlier run sent, so that no earlier row is
   stored after them. If that takes longer than 10 seconds, Crusher reconnects
   to the Data Store. Before it reconnects to the Data Store, Crusher likewise
-  finishes what it sent on the old connection and waits up to 10 seconds for
-  the Data Store to store it. If the old connection is already lost, Crusher
-  cannot learn whether the Data Store stored what it received there, and
-  reconnects without waiting.
+  finishes what it sent on the old connection and waits, with no time limit,
+  until the Data Store has stored it, logging a warning every 10 seconds
+  while it waits. If the old connection is already lost, or is lost during
+  the wait, Crusher cannot learn whether the Data Store stored what it
+  received there, and reconnects without waiting further.
 - Crusher fixes a new generation each time it requests the policy's streams:
   at startup, when the policy changes or returns to the policy list, and when
   it reconnects to the Data Store. The generation is the clock at the request

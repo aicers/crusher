@@ -286,7 +286,8 @@ pub(super) struct WindowBuilder {
     first_event_window: Option<i64>,
     /// The start of the earliest window not yet warned about as due. A grouped
     /// window can be due long before it closes, so this runs ahead of
-    /// [`Self::current`].
+    /// [`Self::current`]. A grouped policy's does not move until
+    /// [`Self::first_event_window`] is known.
     warned: i64,
     /// The IPs a grouped policy keeps a series for in this request.
     accepted: HashSet<IpAddr>,
@@ -871,14 +872,18 @@ impl WindowBuilder {
                 refused.len()
             );
         }
-        let warned = self.warned;
-        self.warned = warned.max(due);
         if self.policy.group_by.is_none() {
+            self.warned = self.warned.max(due);
             return;
         }
+        // The first event may still belong to any window not yet closed,
+        // including one already due, and the warnings count from its window
+        // on: no window is warned about, nor passed over, until it is known.
         let Some(first) = self.first_event_window else {
             return;
         };
+        let warned = self.warned;
+        self.warned = warned.max(due);
         let mut start = warned.max(first);
         while start < due {
             let (next_boundary, network) = self.network_segment(start);
@@ -3787,6 +3792,49 @@ mod tests {
                 marker("2024/1/15 00:00:00", 1),
             ]
         );
+    }
+
+    /// Without a checkpoint, idle time after an empty replay with an empty
+    /// internal network warns about no window, and does not skip one either:
+    /// the window of the first event, already due when it arrives, is warned
+    /// about once and closes with `[0, generation]` once an event passes it.
+    #[test]
+    fn unresumed_empty_network_warns_for_the_first_event_window_after_idle() {
+        let mut builder = single(&by_source(&[]), 0).unwrap();
+        let origin = Instant::now();
+        let wall = datetime_from_utc("2024/1/15 01:20:00");
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), wall);
+        let warning = "Policy 42 has no internal network";
+        assert!(builder.replay_end(0, origin));
+
+        let (written, lines) = logged(|| {
+            let mut written = builder.close_rows(&at(60));
+            written.extend(builder.close_rows(&at(120)));
+            written
+        });
+        assert!(written.is_empty(), "{written:?}");
+        assert!(containing(&lines, warning).is_empty(), "{lines:?}");
+
+        let (written, lines) = logged(|| {
+            let mut written = deliver(&mut builder, 0, "2024/1/15 00:30:00", "10.0.0.1", &at(180));
+            written.extend(rows(&builder.close_rows(&at(240))));
+            written
+        });
+        assert!(written.is_empty(), "due by the idle rule only: {written:?}");
+        let warnings = containing(&lines, warning);
+        assert_eq!(warnings.len(), 1, "00:00 once: {lines:?}");
+        assert!(
+            warnings[0].contains(&format!(
+                "window_start={}",
+                datetime_from_utc("2024/1/15 00:00:00")
+            )),
+            "{warnings:?}"
+        );
+
+        let (written, lines) =
+            logged(|| deliver(&mut builder, 0, "2024/1/15 01:20:00", "10.0.0.1", &at(300)));
+        assert_eq!(written, [marker("2024/1/15 00:00:00", 0)]);
+        assert!(containing(&lines, warning).is_empty(), "{lines:?}");
     }
 
     /// Each run writes its rows with its own generation. A run resumed from
