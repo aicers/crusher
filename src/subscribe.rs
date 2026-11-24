@@ -58,6 +58,10 @@ const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The fewest inbound streams a Publish connection lets Giganto have open at
+/// once: quinn's default, which applied before crusher raised it.
+const MIN_INBOUND_STREAMS: u64 = 100;
+
 /// How long a stream must have received no event after its replay end before
 /// it passes a window by the wall clock. A stream passes by the wall clock
 /// only after its replay end, so a replay that pauses never cuts a window it
@@ -764,6 +768,7 @@ async fn publish_connection_control(
                         Ok(StreamRecoveryAction::Reconnect)
                     }
                     result = send_policy_requests(
+                        &conn,
                         &mut send,
                         &policy_handle,
                         &requests,
@@ -898,13 +903,21 @@ impl PolicyRunners {
 /// once every inbound stream of those requests has arrived. Until then a
 /// stream for its ID could answer either request, so the connection is
 /// replaced instead.
+///
+/// Giganto answers each request with a stream that stays open, so before
+/// writing a policy's requests the connection lets Giganto open as many
+/// streams at once as have been requested on it so far. The count only grows,
+/// since a stream of an earlier request may still be open, and it never
+/// exceeds what Giganto opens here: one stream per request.
 async fn send_policy_requests(
+    conn: &Connection,
     send: &mut SendStream,
     policy_handle: &PolicyHandle,
     requests: &PublishRequests,
     runners: &PolicyRunners,
 ) -> Result<StreamRecoveryAction> {
     let mut policy_ids = policy_handle.subscribe();
+    let mut requested: u64 = 0;
     loop {
         let snapshot = policy_ids.borrow_and_update().clone();
         requests
@@ -944,6 +957,9 @@ async fn send_policy_requests(
                     continue;
                 }
             };
+            requested = requested
+                .saturating_add(u64::try_from(state.policy.sensors.len()).unwrap_or(u64::MAX));
+            allow_inbound_streams(conn, requested);
             // Record the request and start its runner before writing it so
             // that its streams cannot arrive before the dispatcher can bind
             // them.
@@ -968,6 +984,13 @@ async fn send_policy_requests(
             .await
             .context("Policy snapshot channel closed")?;
     }
+}
+
+/// Lets Giganto have `requested` inbound streams open at once on `conn`, and
+/// no fewer than [`MIN_INBOUND_STREAMS`].
+fn allow_inbound_streams(conn: &Connection, requested: u64) {
+    let limit = VarInt::from_u64(requested.max(MIN_INBOUND_STREAMS)).unwrap_or(VarInt::MAX);
+    conn.set_max_concurrent_uni_streams(limit);
 }
 
 async fn ingest_connect(
@@ -1275,6 +1298,9 @@ async fn run_policy(
                     info!("Runner for policy {id} stopping; publish connection replaced");
                     return Ok(());
                 }
+                // Before the frames, so that streams that keep delivering
+                // frames cannot postpone the warning about the others.
+                _ = stall.tick() => warn_if_stalled(&windows, id, expected),
                 recv = streams.recv(), if !withdrawn && frames.len() < expected => {
                     let Some(recv) = recv else {
                         withdrawn = true;
@@ -1318,7 +1344,6 @@ async fn run_policy(
                         write_window(&sender, series).await?;
                     }
                 }
-                _ = stall.tick() => warn_if_stalled(&windows, id, expected),
             }
         }
     }

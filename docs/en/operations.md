@@ -71,9 +71,14 @@ every sensor of the policy has passed the window's end:
   still replaying, Crusher logs a warning every 10 minutes with the policy ID,
   the number of streams not yet opened, and the number of opened streams still
   replaying.
-- A stream whose events run more than a window ahead of the window being
-  built, such as one replaying faster than the others, pauses until the others
-  catch up. None of its events are lost.
+- Crusher builds the earliest window not yet written and the one after it at
+  the same time. A stream that delivers an event further ahead, such as one
+  replaying faster than the others, pauses until the others catch up. None of
+  its events are lost. With windows shorter than 900 seconds, an event no more
+  than 900 seconds past the end of the earliest window is counted at once
+  instead of pausing its stream, since that stream has not yet passed that
+  window. Up to 2 + 900 / window length (rounded down) windows are then built
+  at once: 17 with 60-second windows.
 - An event that arrives after its window was written, such as one in a late
   Sensor batch, corrects that window: Crusher writes it once more, replacing
   the earlier write. An event older than the last written window is dropped,

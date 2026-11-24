@@ -646,3 +646,71 @@ async fn changed_policy_is_requested_again_once_every_stream_arrived() {
     );
     bundle.finish().await;
 }
+
+/// Giganto keeps every requested stream open, so a policy with more sensors
+/// than quinn's default limit of inbound streams still has every stream open
+/// at once, and its window closes once all of them have passed it.
+#[serial]
+#[tokio::test]
+async fn every_stream_of_a_policy_over_the_default_stream_limit_opens() {
+    const SENSORS: usize = 120;
+    let mut policy = new_policy(POLICY_ID);
+    policy.sensors = (0..SENSORS).map(|sensor| format!("s{sensor}")).collect();
+    let bundle = Bundle::start(policy, None, event_time_only()).await;
+    let (connection, _) = bundle.requests(SENSORS).await;
+    let mut streams = Vec::with_capacity(SENSORS);
+    for _ in 0..SENSORS {
+        streams.push(
+            timeout(TEST_TIMEOUT, GigantoStream::open(&connection, POLICY_ID))
+                .await
+                .expect("crusher lets Giganto open every requested stream"),
+        );
+    }
+    for stream in &mut streams {
+        stream.event(BASE_TS_NANOS).await;
+        stream.event(past_grace(0)).await;
+    }
+    let window = bundle.next_window().await;
+    assert_eq!(window.start_secs, window_start_secs(0));
+    assert_eq!(window.series.iter().sum::<f64>(), 120.0);
+    bundle.finish().await;
+}
+
+/// A stream that keeps delivering replayed events does not keep the policy from
+/// warning about its stream that has not opened.
+///
+/// On this `current_thread` runtime a stream's reader refills its frame only
+/// while the runner waits, so frames alone cannot starve the warning here; on a
+/// multi-threaded runtime they could, and the runner polls the warning timer
+/// before the frames for that reason.
+#[serial]
+#[tokio::test]
+async fn stall_warning_is_logged_while_another_stream_keeps_replaying() {
+    const STALL: Duration = Duration::from_millis(100);
+    const BURST: Duration = Duration::from_millis(500);
+    let logs = LogCapture::start();
+    let bundle = Bundle::start(
+        bundle_policy(),
+        Some(BASE_WINDOW_START_NANOS),
+        event_time_only().with_stall_warning(STALL),
+    )
+    .await;
+    let (connection, _) = bundle.requests(2).await;
+    let mut replaying = GigantoStream::open(&connection, POLICY_ID).await;
+    let unopened = "Policy 1 holds its windows open: 1 of its 2 streams have not opened and 1 \
+                    opened streams are still replaying";
+    let burst_end = Instant::now() + BURST;
+    let mut sent = 0;
+    while Instant::now() < burst_end {
+        replaying.event(BASE_TS_NANOS + sent).await;
+        sent += 1;
+    }
+    assert!(
+        logs.count(unopened) >= 2,
+        "warned each period while {sent} events were replayed"
+    );
+    bundle
+        .assert_no_window("a stream that has not opened holds the window open")
+        .await;
+    bundle.finish().await;
+}

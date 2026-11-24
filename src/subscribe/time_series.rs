@@ -287,9 +287,10 @@ impl WindowBuilder {
     /// one not yet due or the one after it. An event further ahead pauses the
     /// stream (see [`Self::is_paused`]) until enough windows have closed,
     /// unless the stream has not yet passed the earliest window, in which case
-    /// it is counted at once. An event rejected by the policy's address filter
-    /// is never counted, and an event older than the earliest window, other
-    /// than one in the last closed window, is dropped.
+    /// it is counted at once (see [`Self::counts_now`]). An event rejected by
+    /// the policy's address filter is never counted, and an event older than
+    /// the earliest window, other than one in the last closed window, is
+    /// dropped.
     ///
     /// Call [`Self::receive`] and [`Self::close_due`] for the event first.
     ///
@@ -411,6 +412,14 @@ impl WindowBuilder {
     /// `window_start`, not older than the earliest window, is counted now
     /// rather than held: its window is the earliest one or the next, or the
     /// event has not passed the earliest window's end plus the grace.
+    ///
+    /// The second case arises only for windows shorter than the grace. A
+    /// stream holding such an event would not have passed the earliest window
+    /// by its events, so the window could close only by the wall clock, which
+    /// a replaying stream never reaches: holding it could deadlock the policy.
+    /// The windows open at once are therefore those starting at or before the
+    /// earliest window's end plus the grace: two when a window is longer than
+    /// the grace, and `2 + grace / window_size` (rounded down) otherwise.
     fn counts_now(&self, window_start: i64, timestamp: i64) -> bool {
         let next = self.current.saturating_add(self.window_size_secs);
         window_start <= next
