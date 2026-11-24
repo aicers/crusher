@@ -1852,11 +1852,16 @@ async fn ingest_control_queues_consecutive_writes_on_one_sender() {
 }
 
 /// A restarting policy change cancels the token of the policy's sender, which
-/// may still be blocked writing with its queue installed. The next run's IP
-/// row and marker then go out together on a sender of the new run, not into
-/// that queue, whose sender would drop the row once it saw its token, leaving
-/// the marker to be stored without it. A frame the stopped run still wrote is
+/// may still be writing with its queue installed. The next run's IP row and
+/// marker then go out together on a sender of the new run, not into that
+/// queue, whose sender would drop the row once it saw its token, leaving the
+/// marker to be stored without it. A frame the stopped run still wrote is
 /// dropped rather than written between them.
+///
+/// The old sender's write is on its own QUIC stream, which Giganto reads
+/// late here. The new sender writes only once Giganto has stored it, so the
+/// old run's row is not stored after the new run's row and marker, where it
+/// would replace the row the marker counts.
 #[serial]
 #[tokio::test]
 async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
@@ -1865,6 +1870,7 @@ async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
     let shutdown = Arc::new(Notify::new());
     let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
         .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::DelayFirstStream(Duration::from_millis(500)))
         .start_ingest(shutdown.clone());
     let endpoint = client::config(&cert_key()).expect("client endpoint");
     let coordinator = CancellationCoordinator::new();
@@ -1881,18 +1887,6 @@ async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
         .get_policy_token(DEFAULT_POLICY_ID)
         .await
         .expect("the policy is active");
-    // The old run's sender, blocked: nothing takes from its queue.
-    let old_queue = register_ingest_queue(DEFAULT_POLICY_ID, old_run.clone()).await;
-    let changed = TimeSeriesGenerationPolicy {
-        slot_size: Duration::from_secs(5 * SECS_PER_MINUTE),
-        ..new_policy(DEFAULT_POLICY_ID)
-    };
-    policy_handle.replace_policies(vec![changed]).await.unwrap();
-    assert!(old_run.is_cancelled(), "the change restarts the policy");
-    let new_run = policy_handle
-        .get_policy_token(DEFAULT_POLICY_ID)
-        .await
-        .expect("the changed policy is active");
 
     let start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
     let frame = |id: String, value, run: &CancellationToken| {
@@ -1904,15 +1898,11 @@ async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
         })
         .of_run(run)
     };
-    let (series_send, series_recv) = async_channel::unbounded();
     let ip_row = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
-    for (id, value, run) in [
-        (ip_row.clone(), 1.0, &new_run),
-        (ip_row.clone(), 9.0, &old_run),
-        (DEFAULT_POLICY_ID.to_string(), 2.0, &new_run),
-    ] {
-        series_send.try_send(frame(id, value, run)).unwrap();
-    }
+    let (series_send, series_recv) = async_channel::unbounded();
+    series_send
+        .try_send(frame(ip_row.clone(), 9.0, &old_run))
+        .unwrap();
     let control = tokio::spawn({
         let coordinator = coordinator.clone();
         let policy_handle = policy_handle.clone();
@@ -1932,28 +1922,48 @@ async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
             endpoint
         }
     });
+    // The old run's row starts its sender, which writes it on the first
+    // stream: Giganto reads that stream only after a delay.
+    wait_for_ingest_channel(DEFAULT_POLICY_ID, true)
+        .await
+        .expect("the old run's row starts the policy's sender");
+
+    let changed = TimeSeriesGenerationPolicy {
+        slot_size: Duration::from_secs(5 * SECS_PER_MINUTE),
+        ..new_policy(DEFAULT_POLICY_ID)
+    };
+    policy_handle.replace_policies(vec![changed]).await.unwrap();
+    assert!(old_run.is_cancelled(), "the change restarts the policy");
+    let new_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the changed policy is active");
+    for (id, value, run) in [
+        (ip_row.clone(), 1.0, &new_run),
+        (ip_row.clone(), 9.5, &old_run),
+        (DEFAULT_POLICY_ID.to_string(), 2.0, &new_run),
+    ] {
+        series_send.try_send(frame(id, value, run)).unwrap();
+    }
 
     let mut writes = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         let (_, series) = timeout(TEST_TIMEOUT, stored.recv())
             .await
-            .expect("the new run's row and marker are stored")
+            .expect("the old run's row and the new run's row and marker are stored")
             .unwrap();
         writes.push((series.time_series_id, series.series));
     }
     assert_eq!(
         writes,
         [
+            (ip_row.clone(), vec![9.0]),
             (ip_row, vec![1.0]),
             (DEFAULT_POLICY_ID.to_string(), vec![2.0]),
         ],
-        "the row precedes its marker, and the stopped run's frame is dropped"
+        "the old run's write is stored first, the row precedes its marker, \
+         and the stopped run's later frame is dropped"
     );
-    assert!(
-        old_queue.is_closed(),
-        "the replaced queue lets nothing more in"
-    );
-    assert!(old_queue.is_empty(), "no frame entered the replaced queue");
 
     coordinator.request_cancellation("replaced request test");
     drop(series_send);
@@ -1961,6 +1971,10 @@ async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
     drop(policy_handle);
     assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
     actor_task.await.unwrap().unwrap();
+    assert!(
+        stored.try_recv().is_err(),
+        "nothing else is stored, the stopped run's frame included"
+    );
     endpoint.close(0u32.into(), &[]);
     shutdown.notify_one();
     ingest_handle.await.expect("ingest server joins");

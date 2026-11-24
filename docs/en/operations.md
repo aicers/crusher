@@ -166,7 +166,12 @@ An ungrouped policy writes no marker and no generation.
   holds two values: the number of IP rows of the window, and the generation.
   The Data Store stores a policy's rows in the order Crusher sends them, so
   once the marker is visible, every IP row before it is visible too. A reader
-  takes only the IP rows of the marker's generation.
+  takes only the IP rows of the marker's generation. When Crusher requests
+  the policy's streams again on the same connection, or the policy returns
+  after it was deleted, Crusher writes the new run's rows only once the Data
+  Store has stored every row the earlier run sent, so that no earlier row is
+  stored after them. If that takes longer than 10 seconds, Crusher reconnects
+  to the Data Store.
 - Crusher fixes a new generation each time it requests the policy's streams:
   at startup, when the policy changes or returns to the policy list, and when
   it reconnects to the Data Store. The generation is the clock at the request
