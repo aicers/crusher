@@ -159,8 +159,9 @@ struct FakeGigantoServer {
     server_address: SocketAddr,
     ingest_notify: Option<async_channel::Sender<u32>>,
     series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
-    /// Reports the rows of each ingest frame together, in the order stored.
-    frame_notify: Option<async_channel::Sender<Vec<(i64, TimeSeries)>>>,
+    /// Reports the rows of each ingest frame together, in the order stored,
+    /// with the data stream that carried it.
+    frame_notify: Option<FrameNotify>,
     peer_cert_notify: Option<async_channel::Sender<PeerCertEvent>>,
     publish_timestamps: Vec<i64>,
     /// Keeps each default stream open after its events, as Giganto does,
@@ -264,8 +265,12 @@ impl FakeGigantoServer {
         self
     }
 
-    fn with_frame_notify(mut self, notify: async_channel::Sender<Vec<(i64, TimeSeries)>>) -> Self {
-        self.frame_notify = Some(notify);
+    fn with_frame_notify(
+        mut self,
+        frames: async_channel::Sender<ReceivedFrame>,
+        streams: Arc<AtomicUsize>,
+    ) -> Self {
+        self.frame_notify = Some(FrameNotify { frames, streams });
         self
     }
 
@@ -370,13 +375,29 @@ impl FakeGigantoServer {
     }
 }
 
+/// The rows of a stored ingest frame, each with its timestamp, after the
+/// number of the data ingest stream that carried it.
+type ReceivedFrame = (usize, Vec<(i64, TimeSeries)>);
+
+/// Where the fake ingest server reports the frames it stores, and how it
+/// numbers the data ingest streams that carry them.
+#[derive(Clone)]
+struct FrameNotify {
+    /// The rows of each stored frame together, with its stream number.
+    frames: async_channel::Sender<ReceivedFrame>,
+    /// The data ingest streams accepted so far over every connection of the
+    /// server, which is also the number the next one takes. The handshake
+    /// stream of a connection is not counted.
+    streams: Arc<AtomicUsize>,
+}
+
 /// Where the fake ingest server reports what it stores.
 #[derive(Clone, Default)]
 struct IngestNotify {
     /// Each stored row, with its timestamp.
     series: Option<async_channel::Sender<(i64, TimeSeries)>>,
     /// The rows of each stored frame together.
-    frames: Option<async_channel::Sender<Vec<(i64, TimeSeries)>>>,
+    frames: Option<FrameNotify>,
 }
 
 async fn handle_ingest_connection(
@@ -400,6 +421,10 @@ async fn handle_ingest_connection(
 
     let mut first_stream = true;
     while let Ok((send, recv)) = connection.accept_bi().await {
+        let stream = series_notify
+            .frames
+            .as_ref()
+            .map_or(0, |frames| frames.streams.fetch_add(1, Ordering::SeqCst));
         let notify = notify.clone();
         let series_notify = series_notify.clone();
         let (delay, behavior) = match &behavior {
@@ -412,7 +437,7 @@ async fn handle_ingest_connection(
         first_stream = false;
         tokio::spawn(async move {
             sleep(delay).await;
-            handle_ingest_stream(send, recv, notify, series_notify, behavior).await;
+            handle_ingest_stream(send, recv, stream, notify, series_notify, behavior).await;
         });
     }
 }
@@ -690,6 +715,7 @@ async fn handle_hold_until_signal_publish(
 async fn handle_ingest_stream(
     mut send: SendStream,
     mut recv: RecvStream,
+    stream: usize,
     notify: Option<async_channel::Sender<u32>>,
     series_notify: IngestNotify,
     behavior: IngestBehavior,
@@ -754,7 +780,7 @@ async fn handle_ingest_stream(
                 id.parse::<u32>().ok()
             })
             .unwrap_or(0);
-        if let Some(frames) = &series_notify.frames {
+        if let Some(frame_notify) = &series_notify.frames {
             let rows = batch
                 .iter()
                 .filter_map(|(timestamp, payload)| {
@@ -764,7 +790,7 @@ async fn handle_ingest_stream(
                     ))
                 })
                 .collect();
-            let _ = frames.send(rows).await;
+            let _ = frame_notify.frames.send((stream, rows)).await;
         }
         for (timestamp, payload) in batch {
             if let Some(series_notify) = &series_notify.series
@@ -3594,9 +3620,12 @@ async fn restart_writes_the_window_open_at_shutdown_and_no_zero_row() {
 
 /// Servers whose Publish side answers every request with a stream carrying
 /// `frames` and keeps it open, and whose Ingest side reports the rows of each
-/// stored ingest frame together, as `(series id, timestamp, data)`.
+/// stored ingest frame together, as `(series id, timestamp, data)`, with the
+/// number of the data ingest stream that carried it.
 struct FrameServers {
-    frames: async_channel::Receiver<Vec<(i64, TimeSeries)>>,
+    frames: async_channel::Receiver<ReceivedFrame>,
+    /// The data ingest streams the Ingest side has accepted.
+    streams: Arc<AtomicUsize>,
     handles: TestServerHandlers,
     ingest_addr: SocketAddr,
     publish_addr: SocketAddr,
@@ -3607,7 +3636,9 @@ type StoredRow = (String, i64, Vec<f64>);
 impl FrameServers {
     fn start(frames: Vec<GeneratorFrame>) -> Self {
         let (frame_send, frame_recv) = async_channel::unbounded();
-        let ingest_server = FakeGigantoServer::new_ingest().with_frame_notify(frame_send);
+        let streams = Arc::new(AtomicUsize::new(0));
+        let ingest_server =
+            FakeGigantoServer::new_ingest().with_frame_notify(frame_send, streams.clone());
         let publish_server = FakeGigantoServer::new_publish()
             .with_publish_behavior(PublishBehavior::Records(frames.into()));
         let ingest_shutdown = Arc::new(Notify::new());
@@ -3616,6 +3647,7 @@ impl FrameServers {
         let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
         Self {
             frames: frame_recv,
+            streams,
             handles: TestServerHandlers {
                 ingest_shutdown,
                 publish_shutdown,
@@ -3629,13 +3661,26 @@ impl FrameServers {
 
     /// Returns the rows of the next stored ingest frame.
     async fn next(&self) -> Vec<StoredRow> {
-        timeout(TEST_TIMEOUT, self.frames.recv())
+        self.next_with_stream().await.1
+    }
+
+    /// Returns the number of the data ingest stream that carried the next
+    /// stored ingest frame, with the frame's rows.
+    async fn next_with_stream(&self) -> (usize, Vec<StoredRow>) {
+        let (stream, rows) = timeout(TEST_TIMEOUT, self.frames.recv())
             .await
             .expect("a frame is stored before the test deadline")
-            .expect("the frame channel stays open")
+            .expect("the frame channel stays open");
+        let rows = rows
             .into_iter()
             .map(|(timestamp, row)| (row.time_series_id, timestamp, row.series))
-            .collect()
+            .collect();
+        (stream, rows)
+    }
+
+    /// Returns how many data ingest streams the Ingest side has accepted.
+    fn data_streams(&self) -> usize {
+        self.streams.load(Ordering::SeqCst)
     }
 }
 
@@ -3807,6 +3852,59 @@ async fn grouped_corrections_after_the_marker_arrive_in_one_frame() {
         ],
         "a late row in a window without IP rows, with the marker"
     );
+    drop(run.stop().await);
+}
+
+/// The IP rows of a grouped window are written in ascending series-id byte
+/// order whatever order their raw events arrived in, then the marker, then a
+/// later correction in a frame of its own, all on one data ingest stream of
+/// the one ingest queue the policy has.
+#[serial]
+#[tokio::test]
+async fn grouped_ip_rows_share_one_ingest_stream_in_series_id_order() {
+    let w0 = BASE_WINDOW_START_NANOS;
+    let run = GroupedRun::start(
+        None,
+        vec![
+            conn_from(BASE_TS_NANOS, "192.168.4.9"),
+            conn_from(BASE_TS_NANOS + 1, "192.168.4.10"),
+            conn_from(BASE_TS_NANOS + 2, "192.168.4.9"),
+            // Passes w0, which closes.
+            conn_from(BASE_TS_NANOS + DAY_NANOS, EXTERNAL_IP),
+            // Late, counted in w0.
+            conn_from(BASE_TS_NANOS + 3, "192.168.4.10"),
+        ],
+    )
+    .await;
+
+    let (stream, first) = run.servers.next_with_stream().await;
+    let generation = stored_generation(&run.path);
+    let mut closed = first;
+    while closed.len() < 3 {
+        let (next_stream, rows) = run.servers.next_with_stream().await;
+        assert_eq!(next_stream, stream, "every frame on one data stream");
+        closed.extend(rows);
+    }
+    assert_eq!(
+        closed,
+        [
+            base_slot_row("1/192.168.4.10", w0, 1.0, generation),
+            base_slot_row("1/192.168.4.9", w0, 2.0, generation),
+            stored_marker(w0, 2.0, generation),
+        ],
+        "the IP rows in series-id byte order, then the marker, and nothing more"
+    );
+
+    let (correction_stream, correction) = run.servers.next_with_stream().await;
+    assert_eq!(correction_stream, stream, "every frame on one data stream");
+    assert_eq!(
+        correction,
+        [base_slot_row("1/192.168.4.10", w0, 2.0, generation)],
+        "the correction alone in its frame"
+    );
+    assert_eq!(run.servers.data_streams(), 1, "one data ingest stream");
+    let queues: Vec<u32> = INGEST_CHANNEL.read().await.keys().copied().collect();
+    assert_eq!(queues, [DEFAULT_POLICY_ID], "one ingest queue per policy");
     drop(run.stop().await);
 }
 
