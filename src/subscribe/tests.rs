@@ -39,6 +39,7 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, timeout};
 
+use super::time_series::TimeSeries;
 use super::*;
 use crate::cancellation::{CancellationCoordinator, CancellationPhase};
 use crate::client::{Certs, SharedTlsBytes, TlsBytes};
@@ -143,6 +144,8 @@ struct FakeGigantoServer {
     server_address: SocketAddr,
     ingest_notify: Option<async_channel::Sender<u32>>,
     series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
+    /// Reports the rows of each ingest frame together, in the order stored.
+    frame_notify: Option<async_channel::Sender<Vec<(i64, TimeSeries)>>>,
     peer_cert_notify: Option<async_channel::Sender<PeerCertEvent>>,
     publish_timestamps: Vec<i64>,
     /// Keeps each default stream open after its events, as Giganto does,
@@ -169,6 +172,7 @@ impl FakeGigantoServer {
             server_address,
             ingest_notify: None,
             series_notify: None,
+            frame_notify: None,
             peer_cert_notify: None,
             publish_timestamps: Vec::new(),
             publish_hold_streams: false,
@@ -185,6 +189,7 @@ impl FakeGigantoServer {
             server_address,
             ingest_notify: None,
             series_notify: None,
+            frame_notify: None,
             peer_cert_notify: None,
             publish_timestamps: Vec::new(),
             publish_hold_streams: false,
@@ -202,6 +207,7 @@ impl FakeGigantoServer {
             server_address,
             ingest_notify: None,
             series_notify: None,
+            frame_notify: None,
             peer_cert_notify: None,
             publish_timestamps: one_window_then_next(),
             publish_hold_streams: false,
@@ -218,6 +224,7 @@ impl FakeGigantoServer {
             server_address,
             ingest_notify: None,
             series_notify: None,
+            frame_notify: None,
             peer_cert_notify: None,
             publish_timestamps: one_window_then_next(),
             publish_hold_streams: false,
@@ -239,6 +246,11 @@ impl FakeGigantoServer {
 
     fn with_series_notify(mut self, notify: async_channel::Sender<(i64, TimeSeries)>) -> Self {
         self.series_notify = Some(notify);
+        self
+    }
+
+    fn with_frame_notify(mut self, notify: async_channel::Sender<Vec<(i64, TimeSeries)>>) -> Self {
+        self.frame_notify = Some(notify);
         self
     }
 
@@ -266,7 +278,10 @@ impl FakeGigantoServer {
         let endpoint = Endpoint::server(self.server_config, self.server_address).expect("endpoint");
         let local_addr = endpoint.local_addr().expect("local_addr");
         let ingest_notify = self.ingest_notify.clone();
-        let series_notify = self.series_notify.clone();
+        let notifies = IngestNotify {
+            series: self.series_notify.clone(),
+            frames: self.frame_notify.clone(),
+        };
         let peer_cert_notify = self.peer_cert_notify.clone();
         let behavior = self.ingest_behavior;
         let handle = tokio::spawn(async move {
@@ -274,7 +289,7 @@ impl FakeGigantoServer {
                 tokio::select! {
                     Some(conn) = endpoint.accept() => {
                         let notify = ingest_notify.clone();
-                        let series_notify = series_notify.clone();
+                        let notifies = notifies.clone();
                         let peer_cert_notify = peer_cert_notify.clone();
                         let behavior = behavior.clone();
                         tokio::spawn(async move {
@@ -282,7 +297,7 @@ impl FakeGigantoServer {
                                 handle_ingest_connection(
                                     connection,
                                     notify,
-                                    series_notify,
+                                    notifies,
                                     peer_cert_notify,
                                     behavior,
                                 )
@@ -340,10 +355,19 @@ impl FakeGigantoServer {
     }
 }
 
+/// Where the fake ingest server reports what it stores.
+#[derive(Clone, Default)]
+struct IngestNotify {
+    /// Each stored row, with its timestamp.
+    series: Option<async_channel::Sender<(i64, TimeSeries)>>,
+    /// The rows of each stored frame together.
+    frames: Option<async_channel::Sender<Vec<(i64, TimeSeries)>>>,
+}
+
 async fn handle_ingest_connection(
     connection: Connection,
     notify: Option<async_channel::Sender<u32>>,
-    series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
+    series_notify: IngestNotify,
     peer_cert_notify: Option<async_channel::Sender<PeerCertEvent>>,
     behavior: IngestBehavior,
 ) {
@@ -652,7 +676,7 @@ async fn handle_ingest_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     notify: Option<async_channel::Sender<u32>>,
-    series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
+    series_notify: IngestNotify,
     behavior: IngestBehavior,
 ) {
     let mut header_buf = [0_u8; 4];
@@ -695,8 +719,20 @@ async fn handle_ingest_stream(
                 id.parse::<u32>().ok()
             })
             .unwrap_or(0);
+        if let Some(frames) = &series_notify.frames {
+            let rows = batch
+                .iter()
+                .filter_map(|(timestamp, payload)| {
+                    Some((
+                        *timestamp,
+                        bincode::deserialize::<TimeSeries>(payload).ok()?,
+                    ))
+                })
+                .collect();
+            let _ = frames.send(rows).await;
+        }
         for (timestamp, payload) in batch {
-            if let Some(series_notify) = &series_notify
+            if let Some(series_notify) = &series_notify.series
                 && let Ok(series) = bincode::deserialize::<TimeSeries>(&payload)
             {
                 let _ = series_notify.send((timestamp, series)).await;
@@ -1024,12 +1060,35 @@ async fn cleanup_server_resources(server_handles: TestServerHandlers) {
     );
 }
 
+/// Returns the `timestamp` of each policy in the checkpoint file that has
+/// one.
 fn read_time_data_map(last_time_series_path: &Path) -> HashMap<String, i64> {
+    read_checkpoints(last_time_series_path)
+        .into_iter()
+        .filter_map(|(id, (timestamp, _))| Some((id, timestamp?)))
+        .collect()
+}
+
+/// Returns the `timestamp` and the `generation` of each policy in the
+/// checkpoint file.
+fn read_checkpoints(last_time_series_path: &Path) -> HashMap<String, (Option<i64>, Option<u64>)> {
     let content = fs::read_to_string(last_time_series_path).unwrap_or_default();
     if content.trim().is_empty() {
         return HashMap::new();
     }
-    serde_json::from_str::<HashMap<String, i64>>(&content).expect("Failed to parse time_data.json")
+    let file: HashMap<String, serde_json::Map<String, serde_json::Value>> =
+        serde_json::from_str(&content).expect("Failed to parse time_data.json");
+    file.into_iter()
+        .map(|(id, fields)| {
+            let timestamp = fields
+                .get("timestamp")
+                .map(|value| value.as_i64().expect("the timestamp is an i64"));
+            let generation = fields
+                .get("generation")
+                .map(|value| value.as_u64().expect("the generation is a u64"));
+            (id, (timestamp, generation))
+        })
+        .collect()
 }
 
 fn config_server() -> ServerConfig {
@@ -1742,12 +1801,12 @@ async fn ingest_control_queues_consecutive_writes_on_one_sender() {
     let (series_send, series_recv) = async_channel::unbounded();
     for value in [1.0, 2.0] {
         series_send
-            .try_send(TimeSeries {
+            .try_send(IngestFrame::from(TimeSeries {
                 time_series_id: DEFAULT_POLICY_ID.to_string(),
                 policy_id: DEFAULT_POLICY_ID,
                 start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
                 series: vec![value],
-            })
+            }))
             .unwrap();
     }
     let control = tokio::spawn({
@@ -1817,12 +1876,12 @@ async fn shutdown_drain_writes_series_queued_in_the_ingest_control() {
     let (series_send, series_recv) = async_channel::unbounded();
     for value in [1.0, 2.0] {
         series_send
-            .try_send(TimeSeries {
+            .try_send(IngestFrame::from(TimeSeries {
                 time_series_id: DEFAULT_POLICY_ID.to_string(),
                 policy_id: DEFAULT_POLICY_ID,
                 start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
                 series: vec![value],
-            })
+            }))
             .unwrap();
     }
     drop(series_send);
@@ -1885,11 +1944,13 @@ async fn shutdown_drain_keeps_corrections_behind_the_window_they_replace() {
 
     let window_start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
     let next_start_secs = (BASE_WINDOW_START_NANOS + DAY_NANOS) / 1_000_000_000;
-    let window = |start_secs, value| TimeSeries {
-        time_series_id: DEFAULT_POLICY_ID.to_string(),
-        policy_id: DEFAULT_POLICY_ID,
-        start_secs,
-        series: vec![value],
+    let window = |start_secs, value| {
+        IngestFrame::from(TimeSeries {
+            time_series_id: DEFAULT_POLICY_ID.to_string(),
+            policy_id: DEFAULT_POLICY_ID,
+            start_secs,
+            series: vec![value],
+        })
     };
     let (series_send, series_recv) = async_channel::unbounded();
     series_send
@@ -1988,18 +2049,18 @@ async fn cancellation_drains_queued_time_series() {
         .await
         .unwrap();
     let policy_id = DEFAULT_POLICY_ID;
-    let first = TimeSeries {
+    let first = IngestFrame::from(TimeSeries {
         time_series_id: policy_id.to_string(),
         policy_id,
         start_secs: 1,
         series: vec![1.0],
-    };
-    let second = TimeSeries {
+    });
+    let second = IngestFrame::from(TimeSeries {
         time_series_id: policy_id.to_string(),
         policy_id,
         start_secs: 2,
         series: vec![2.0],
-    };
+    });
 
     let recv_channel = register_ingest_queue(policy_id).await;
     let sender_task = coordinator.tracker().spawn(send_time_series(
@@ -2362,10 +2423,20 @@ async fn grouped_policy_writes_ip_rows_and_its_ack_moves_its_checkpoint() {
     let (timestamp, series) = next_written_window(&servers.series).await;
     assert_eq!(timestamp, BASE_WINDOW_START_NANOS);
     assert_eq!(series.time_series_id, "1/192.168.4.76");
-    assert_eq!(series.series.iter().sum::<f64>(), 3.0);
+    let (generation, slots) = series.series.split_last().unwrap();
+    assert_eq!(slots.iter().sum::<f64>(), 3.0);
+    let (timestamp, marker) = next_written_window(&servers.series).await;
+    assert_eq!(timestamp, BASE_WINDOW_START_NANOS);
+    assert_eq!(marker.time_series_id, "1", "the marker follows the IP row");
+    assert_eq!(marker.series, [1.0, *generation]);
     let map = timeout(TEST_TIMEOUT, wait_for_policy_ids(&path, &[policy.id], true))
         .await
         .expect("the grouped window is acknowledged");
+    assert_eq!(
+        stored_generation(&path),
+        *generation,
+        "the rows carry the generation stored for the request"
+    );
     assert_eq!(
         map,
         HashMap::from([(policy.id.to_string(), BASE_WINDOW_START_NANOS)]),
@@ -2671,6 +2742,303 @@ async fn restart_writes_the_window_open_at_shutdown_and_no_zero_row() {
             "no all-zero window is written: {series:?}"
         );
     }
+    drop(dir);
+}
+
+/// Servers whose Publish side answers every request with a stream carrying
+/// `frames` and keeps it open, and whose Ingest side reports the rows of each
+/// stored ingest frame together, as `(series id, timestamp, data)`.
+struct FrameServers {
+    frames: async_channel::Receiver<Vec<(i64, TimeSeries)>>,
+    handles: TestServerHandlers,
+    ingest_addr: SocketAddr,
+    publish_addr: SocketAddr,
+}
+
+type StoredRow = (String, i64, Vec<f64>);
+
+impl FrameServers {
+    fn start(frames: Vec<GeneratorFrame>) -> Self {
+        let (frame_send, frame_recv) = async_channel::unbounded();
+        let ingest_server = FakeGigantoServer::new_ingest().with_frame_notify(frame_send);
+        let publish_server = FakeGigantoServer::new_publish()
+            .with_publish_behavior(PublishBehavior::Records(frames.into()));
+        let ingest_shutdown = Arc::new(Notify::new());
+        let publish_shutdown = Arc::new(Notify::new());
+        let (ingest_addr, ingest_handle) = ingest_server.start_ingest(ingest_shutdown.clone());
+        let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
+        Self {
+            frames: frame_recv,
+            handles: TestServerHandlers {
+                ingest_shutdown,
+                publish_shutdown,
+                ingest_handle,
+                publish_handle,
+            },
+            ingest_addr,
+            publish_addr,
+        }
+    }
+
+    /// Returns the rows of the next stored ingest frame.
+    async fn next(&self) -> Vec<StoredRow> {
+        timeout(TEST_TIMEOUT, self.frames.recv())
+            .await
+            .expect("a frame is stored before the test deadline")
+            .expect("the frame channel stays open")
+            .into_iter()
+            .map(|(timestamp, row)| (row.time_series_id, timestamp, row.series))
+            .collect()
+    }
+}
+
+/// A raw Conn event from `orig` to an external IP at `timestamp`.
+fn conn_from(timestamp: i64, orig: &str) -> GeneratorFrame {
+    let conn = Conn {
+        orig_addr: orig.parse().unwrap(),
+        resp_addr: "8.8.8.8".parse().unwrap(),
+        ..gen_conn()
+    };
+    GeneratorFrame::Event(timestamp, bincode::serialize(&conn).unwrap())
+}
+
+const IP_A: &str = "192.168.4.76";
+const IP_B: &str = "192.168.4.77";
+const EXTERNAL_IP: &str = "8.8.8.8";
+
+/// [`new_policy`] grouped by source over `192.168.4.0/24`.
+fn grouped_policy() -> TimeSeriesGenerationPolicy {
+    let mut policy = new_policy(DEFAULT_POLICY_ID);
+    policy.group_by = Some(review_protocol::types::EndpointRole::Source);
+    policy.internal_networks = HostNetworkGroup {
+        hosts: Vec::new(),
+        networks: vec!["192.168.4.0/24".parse().unwrap()],
+        ip_ranges: Vec::new(),
+    };
+    policy
+}
+
+/// A 1-day IP row of [`new_policy`] whose only event is in the slot of
+/// [`BASE_TS_NANOS`] (88), as stored: its slots, then `generation`.
+fn base_slot_row(id: &str, window_start: i64, count: f64, generation: f64) -> StoredRow {
+    let mut data = vec![0.0; 96];
+    data[88] = count;
+    data.push(generation);
+    (id.to_owned(), window_start, data)
+}
+
+/// The marker of the window starting at `window_start`, as stored.
+fn stored_marker(window_start: i64, rows: f64, generation: f64) -> StoredRow {
+    (
+        DEFAULT_POLICY_ID.to_string(),
+        window_start,
+        vec![rows, generation],
+    )
+}
+
+/// Returns the generation the checkpoint file holds for the default policy.
+#[allow(clippy::cast_precision_loss)] // Generations are below 2^53.
+fn stored_generation(path: &Path) -> f64 {
+    read_checkpoints(path)[&DEFAULT_POLICY_ID.to_string()]
+        .1
+        .expect("a grouped request stores its generation") as f64
+}
+
+/// Runs [`grouped_policy`] over [`FrameServers`] carrying `frames`, with its
+/// checkpoint file at `path` if given, and windows closing by event time
+/// only.
+struct GroupedRun {
+    coordinator: CancellationCoordinator,
+    review: crate::request::Client,
+    policy_handle: PolicyHandle,
+    client_handle: tokio::task::JoinHandle<()>,
+    servers: FrameServers,
+    path: PathBuf,
+    dir: TempDir,
+}
+
+impl GroupedRun {
+    async fn start(path: Option<&Path>, frames: Vec<GeneratorFrame>) -> Self {
+        const NEVER: Duration = Duration::from_secs(3600);
+        INGEST_CHANNEL.write().await.clear();
+        let servers = FrameServers::start(frames);
+        let coordinator = CancellationCoordinator::new();
+        let (mut review, actor_task, path, dir, policy_handle) =
+            setup_request_client(path, &coordinator).await;
+        review
+            .time_series_generation_policy_list(&[grouped_policy()])
+            .await
+            .unwrap();
+        let client_handle = spawn_subscribe_client_with_timer(
+            &cert_key(),
+            actor_task,
+            servers.ingest_addr,
+            servers.publish_addr,
+            policy_handle.clone(),
+            coordinator.clone(),
+            CloseTimer::new(|| i64::MIN, NEVER, NEVER),
+        );
+        Self {
+            coordinator,
+            review,
+            policy_handle,
+            client_handle,
+            servers,
+            path,
+            dir,
+        }
+    }
+
+    /// Stops the run and returns the directory it was given or created.
+    async fn stop(self) -> TempDir {
+        drop(self.review);
+        drop(self.policy_handle);
+        cleanup_test_resources(self.coordinator, self.client_handle, self.servers.handles).await;
+        self.dir
+    }
+}
+
+/// A grouped close writes each IP row, ending with the run's generation, in
+/// its own frame and then the marker. After the marker, a new IP's row and
+/// the marker counting it arrive in one frame, and an existing IP's
+/// correction alone. A window without IP rows closes with `[0, generation]`
+/// once an event passes it, and a late event there writes its row and
+/// `[1, generation]` in one frame.
+#[serial]
+#[tokio::test]
+async fn grouped_corrections_after_the_marker_arrive_in_one_frame() {
+    let w0 = BASE_WINDOW_START_NANOS;
+    let w1 = BASE_WINDOW_START_NANOS + DAY_NANOS;
+    let run = GroupedRun::start(
+        None,
+        vec![
+            conn_from(BASE_TS_NANOS, IP_A),
+            // Passes w0, which closes; w1 counts nothing.
+            conn_from(BASE_TS_NANOS + DAY_NANOS, EXTERNAL_IP),
+            conn_from(BASE_TS_NANOS + 1, IP_B),
+            conn_from(BASE_TS_NANOS + 2, IP_A),
+            // Passes w1, which closes without IP rows.
+            conn_from(BASE_TS_NANOS + 2 * DAY_NANOS, EXTERNAL_IP),
+            conn_from(BASE_TS_NANOS + DAY_NANOS + 1, IP_A),
+        ],
+    )
+    .await;
+    let first = run.servers.next().await;
+    let generation = stored_generation(&run.path);
+    assert_eq!(
+        first,
+        [base_slot_row("1/192.168.4.76", w0, 1.0, generation)],
+        "the generation stored for the request"
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [stored_marker(w0, 1.0, generation)]
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [
+            base_slot_row("1/192.168.4.77", w0, 1.0, generation),
+            stored_marker(w0, 2.0, generation),
+        ],
+        "a new IP's row and the marker in one frame"
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [base_slot_row("1/192.168.4.76", w0, 2.0, generation)],
+        "a correction alone"
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [stored_marker(w1, 0.0, generation)],
+        "a window without IP rows"
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [
+            base_slot_row("1/192.168.4.76", w1, 1.0, generation),
+            stored_marker(w1, 1.0, generation),
+        ],
+        "a late row in a window without IP rows, with the marker"
+    );
+    drop(run.stop().await);
+}
+
+/// After a stop following the ACK of window T, a restart requests from T
+/// with a greater generation, which is on disk before its first row, and
+/// rewrites T and the later windows with it, IP rows before each marker. No
+/// window before T is written again.
+#[serial]
+#[tokio::test]
+async fn grouped_restart_rewrites_from_the_checkpoint_with_a_new_generation() {
+    let w0 = BASE_WINDOW_START_NANOS;
+    let w1 = BASE_WINDOW_START_NANOS + DAY_NANOS;
+    let run = GroupedRun::start(
+        None,
+        vec![
+            conn_from(BASE_TS_NANOS, IP_A),
+            conn_from(BASE_TS_NANOS + 1, IP_B),
+            conn_from(BASE_TS_NANOS + DAY_NANOS, IP_A),
+        ],
+    )
+    .await;
+    let mut written = Vec::new();
+    for _ in 0..3 {
+        written.extend(run.servers.next().await);
+    }
+    let first = stored_generation(&run.path);
+    assert_eq!(
+        written,
+        [
+            base_slot_row("1/192.168.4.76", w0, 1.0, first),
+            base_slot_row("1/192.168.4.77", w0, 1.0, first),
+            stored_marker(w0, 2.0, first),
+        ]
+    );
+    let checkpoint = timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Some(timestamp) =
+                read_time_data_map(&run.path).get(&DEFAULT_POLICY_ID.to_string())
+            {
+                return *timestamp;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the window is acknowledged");
+    assert_eq!(checkpoint, w0);
+    let path = run.path.clone();
+    let dir = run.stop().await;
+
+    let run = GroupedRun::start(
+        Some(&path),
+        vec![
+            // Before the checkpoint: not part of the resumed request.
+            conn_from(BASE_TS_NANOS - DAY_NANOS, IP_B),
+            conn_from(BASE_TS_NANOS, IP_A),
+            conn_from(BASE_TS_NANOS + DAY_NANOS, IP_A),
+            conn_from(BASE_TS_NANOS + 2 * DAY_NANOS, EXTERNAL_IP),
+        ],
+    )
+    .await;
+    let first_frame = run.servers.next().await;
+    let second = stored_generation(&path);
+    assert!(second > first, "{second} > {first}");
+    let mut written = first_frame;
+    for _ in 0..3 {
+        written.extend(run.servers.next().await);
+    }
+    assert_eq!(
+        written,
+        [
+            base_slot_row("1/192.168.4.76", w0, 1.0, second),
+            stored_marker(w0, 1.0, second),
+            base_slot_row("1/192.168.4.76", w1, 1.0, second),
+            stored_marker(w1, 1.0, second),
+        ],
+        "T is rewritten with the IPs of this run, then the later window"
+    );
+    drop(run.stop().await);
     drop(dir);
 }
 
@@ -3773,7 +4141,10 @@ mod policy_lifecycle {
             assert!(!connection_token.is_cancelled());
             assert!(!coordinator.is_cancelled());
             assert!(connection.close_reason().is_none());
-            assert_eq!(receiver.recv().await.unwrap().time_series_id, "42");
+            assert_eq!(
+                receiver.recv().await.unwrap().rows()[0].time_series_id,
+                "42"
+            );
             // Seed an acknowledged checkpoint after natural worker completion.
             handle.record_ack(42, 123).await.unwrap();
             let _ = handle.stream_policy(42).await.unwrap();

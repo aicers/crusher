@@ -1584,7 +1584,11 @@ log_path = "/tmp/crusher.log"
         );
         let dir = tempfile::tempdir().unwrap();
         let checkpoint = dir.path().join("time_data.json");
-        fs::write(&checkpoint, r#"{"1":100,"2":200}"#).unwrap();
+        fs::write(
+            &checkpoint,
+            r#"{"1":{"timestamp":100},"2":{"timestamp":200}}"#,
+        )
+        .unwrap();
         let (policy_handle, incoming, actor) = spawn_incoming_handler(
             manager.addr,
             &dir,
@@ -1600,11 +1604,11 @@ log_path = "/tmp/crusher.log"
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(sorted_policy_ids(&policy_handle), [1, 2]);
         assert!(policy_handle.get_policy_token(1).await.is_some());
-        let saved: std::collections::HashMap<String, i64> =
+        let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(&checkpoint).unwrap()).unwrap();
         assert_eq!(
             saved,
-            std::collections::HashMap::from([("1".into(), 100), ("2".into(), 200)])
+            serde_json::json!({"1": {"timestamp": 100}, "2": {"timestamp": 200}})
         );
 
         // The failed pull does not block pushes, and the pull is retried

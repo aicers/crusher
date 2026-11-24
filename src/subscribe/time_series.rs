@@ -54,6 +54,61 @@ pub(super) struct TimeSeries {
     pub(super) series: Vec<f64>,
 }
 
+/// The rows one time-series ingest frame carries: Giganto stores them
+/// together, in order, with one write. Never empty.
+#[derive(Clone, Debug)]
+pub(super) struct IngestFrame {
+    policy_id: u32,
+    rows: Vec<TimeSeries>,
+}
+
+impl IngestFrame {
+    /// Returns the policy whose ingest stream writes the frame.
+    pub(super) fn policy_id(&self) -> u32 {
+        self.policy_id
+    }
+
+    /// Returns the rows of the frame, in the order Giganto stores them.
+    pub(super) fn rows(&self) -> &[TimeSeries] {
+        &self.rows
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_rows(self) -> Vec<TimeSeries> {
+        self.rows
+    }
+
+    /// Returns a frame of `row` followed by `then`, both of one policy.
+    fn pair(row: TimeSeries, then: TimeSeries) -> Self {
+        Self {
+            policy_id: row.policy_id,
+            rows: vec![row, then],
+        }
+    }
+}
+
+impl From<TimeSeries> for IngestFrame {
+    fn from(row: TimeSeries) -> Self {
+        Self {
+            policy_id: row.policy_id,
+            rows: vec![row],
+        }
+    }
+}
+
+/// How one run of a policy starts: where its request resumes and the write
+/// generation its rows carry.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RunStart {
+    /// The request start, in nanoseconds.
+    pub(super) start: i64,
+    /// Whether `start` is the policy's checkpoint.
+    pub(super) resumed: bool,
+    /// The run's write generation. A grouped policy needs one; an ungrouped
+    /// one ignores it.
+    pub(super) generation: Option<u64>,
+}
+
 /// The time a policy runner reads when it decides which windows are due.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PassClock {
@@ -124,12 +179,21 @@ struct HeldEvent {
     value: f64,
 }
 
-/// A window that has counted at least one event: the values of each of its
-/// value keys.
+/// A window that has counted at least one event, or a grouped policy's closed
+/// window without any: the values of each of its value keys.
 #[derive(Debug)]
 struct Window {
     start_secs: i64,
     values: BTreeMap<String, Vec<f64>>,
+}
+
+impl Window {
+    fn empty(start_secs: i64) -> Self {
+        Self {
+            start_secs,
+            values: BTreeMap::new(),
+        }
+    }
 }
 
 impl Window {
@@ -154,20 +218,27 @@ enum Value {
 /// Builds one policy's windows from the events of all of its generator
 /// streams, one per sensor, and decides when each window is closed.
 ///
-/// All windows share one boundary grid. A window exists only once an event is
-/// counted in it, so a window without events is never written. A window is
-/// due once every stream has passed it, either by event time or, after its
-/// replay end, by being quiet while the wall clock is past the window's end
-/// plus [`CLOSE_GRACE_SECS`]; windows become due in time order. The last
-/// closed window is kept so that an event arriving after its window closed can
-/// still be counted there, and the window written again under the same key.
+/// All windows share one boundary grid. A window is due once every stream has
+/// passed it, either by event time or, after its replay end, by being quiet
+/// while the wall clock is past the window's end plus [`CLOSE_GRACE_SECS`];
+/// windows become due in time order. The last closed window is kept so that an
+/// event arriving after its window closed can still be counted there, and the
+/// window written again under the same key.
 ///
 /// An ungrouped policy counts every event in one series, keyed by the policy
-/// id. A grouped policy counts an event in the series of the IP at its group
-/// side, keyed `P/IP`, if that IP is in the internal network in effect for the
+/// id. A window exists only once an event is counted in it, so a window
+/// without events is never written.
+///
+/// A grouped policy counts an event in the series of the IP at its group side,
+/// keyed `P/IP`, if that IP is in the internal network in effect for the
 /// event's window and the other endpoint is in the policy's counterpart scope.
 /// Every value shares the policy's windows, which close for all values at
-/// once.
+/// once. Each IP row ends with the run's write generation, and after the IP
+/// rows of a window comes its marker under `P`: the number of IP rows and the
+/// generation. A grouped policy closes every window from the request's
+/// checkpoint on, or without one from the window of the first event received,
+/// even one without IP rows, which gets the marker `[0, generation]`; but such
+/// a window closes only once a stream has also passed it by event time.
 pub(super) struct WindowBuilder {
     policy: TimeSeriesGenerationPolicy,
     policy_id: String,
@@ -199,11 +270,21 @@ pub(super) struct WindowBuilder {
     max_series: usize,
     /// The IPs refused for the cap, by the window whose close reports them.
     refused: BTreeMap<i64, HashSet<IpAddr>>,
+    /// A grouped policy's write generation, carried by every row of this run.
+    /// `None` for an ungrouped policy.
+    generation: Option<u64>,
+    /// For a grouped policy, the start of the first window that is closed
+    /// even without IP rows: the checkpoint's window for a resumed request,
+    /// else the window of the first event received. `None` until known.
+    marked_from: Option<i64>,
+    /// The IP rows of the last closed window corrected or added after its
+    /// marker since the previous close, by series id.
+    corrected: HashSet<String>,
 }
 
 impl WindowBuilder {
     /// Creates a builder for `streams` generator streams of `policy`, all
-    /// requested from `request_start` (nanoseconds).
+    /// requested from `run.start` (nanoseconds).
     ///
     /// # Errors
     ///
@@ -217,11 +298,13 @@ impl WindowBuilder {
     /// - `streams` is zero.
     /// - The window of the request start overflows.
     /// - The policy groups by a unit other than a single IP.
+    /// - The policy is grouped and `run` has no generation.
     pub(super) fn try_new(
         policy: &TimeSeriesGenerationPolicy,
-        request_start: i64,
+        run: RunStart,
         streams: usize,
     ) -> Result<Self> {
+        let request_start = run.start;
         let slot_size_secs = policy.slot_size.as_secs();
         let window_size_secs = policy.window_size.as_secs();
         if slot_size_secs == 0 {
@@ -242,6 +325,12 @@ impl WindowBuilder {
         if policy.group_by.is_some() && policy.group_by_unit != GroupByUnit::Ip {
             bail!("grouping by {:?} is not supported", policy.group_by_unit);
         }
+        let generation = match (policy.group_by, run.generation) {
+            (None, _) => None,
+            (Some(_), Some(generation)) => Some(generation),
+            (Some(_), None) => bail!("a grouped policy's run needs a write generation"),
+        };
+        let current = start_time(policy, request_start.div_euclid(SECOND_TO_NANO))?;
 
         Ok(Self {
             policy: policy.clone(),
@@ -253,7 +342,7 @@ impl WindowBuilder {
             streams: std::iter::repeat_with(StreamState::default)
                 .take(streams)
                 .collect(),
-            current: start_time(policy, request_start.div_euclid(SECOND_TO_NANO))?,
+            current,
             open: BTreeMap::new(),
             last_closed: None,
             dropped: 0,
@@ -263,6 +352,9 @@ impl WindowBuilder {
             accepted: HashSet::new(),
             max_series: MAX_SERIES_PER_POLICY,
             refused: BTreeMap::new(),
+            generation,
+            marked_from: (generation.is_some() && run.resumed).then_some(current),
+            corrected: HashSet::new(),
         })
     }
 
@@ -314,6 +406,9 @@ impl WindowBuilder {
         if self.first_event_window.is_none() {
             self.first_event_window =
                 start_time(&self.policy, timestamp.div_euclid(SECOND_TO_NANO)).ok();
+            if self.generation.is_some() && self.marked_from.is_none() {
+                self.marked_from = self.first_event_window;
+            }
         }
         let Some(stream) = self.streams.get_mut(index) else {
             return;
@@ -366,8 +461,9 @@ impl WindowBuilder {
     }
 
     /// Counts an event that stream `index` received at `timestamp`
-    /// (nanoseconds), and returns the series to write again, if the event was
-    /// counted in the last closed window.
+    /// (nanoseconds), and returns the frame to write, if the event was counted
+    /// in the last closed window: the corrected row, or for a grouped policy's
+    /// IP without a row there, its new row followed by the window's marker.
     ///
     /// The checks run in order. An event rejected by the policy's address
     /// filter, or, for a grouped policy, whose group-side IP is not in the
@@ -393,7 +489,7 @@ impl WindowBuilder {
         index: usize,
         timestamp: i64,
         event: &Event,
-    ) -> Result<Option<TimeSeries>> {
+    ) -> Result<Option<IngestFrame>> {
         let time_secs = timestamp.div_euclid(SECOND_TO_NANO);
         let window_start = start_time(&self.policy, time_secs)?;
         let Some(value) = self.counted_value(event, window_start) else {
@@ -409,7 +505,8 @@ impl WindowBuilder {
             .is_some_and(|last| last.start_secs == window_start);
         if !in_last_closed && window_start < self.current {
             // Older than the last closed window, or a window that was never
-            // written because it had no events when it became due.
+            // written because it had no events when it became due and a
+            // grouped policy closes no window there.
             self.drop_event();
             return Ok(None);
         }
@@ -422,8 +519,10 @@ impl WindowBuilder {
         let slots = self.slots;
 
         if let Some(last) = self.last_closed.as_mut().filter(|_| in_last_closed) {
+            let added = !last.values.contains_key(key.as_ref());
             count_in(last, &key, slots, slot_size_secs, time_secs, measured)?;
-            return Ok(last.series(self.policy.id, &key));
+            let key = key.into_owned();
+            return Ok(self.correction(&key, added));
         }
         if self.counts_now(window_start, timestamp) {
             count_open(
@@ -522,35 +621,97 @@ impl WindowBuilder {
     }
 
     /// Closes the windows that every stream has passed by `clock`, in time
-    /// order, and returns those to write: every value's series of one window
-    /// together, in ascending byte order of their series ids. A due window
-    /// without events is not written. Held events whose window may now be
-    /// counted are counted, and their streams resume.
+    /// order, and returns the frames to write: every value's series of one
+    /// window, in ascending byte order of their series ids, each in its own
+    /// frame. Held events whose window may now be counted are counted, and
+    /// their streams resume.
+    ///
+    /// An ungrouped policy writes no due window without events. A grouped
+    /// policy follows the IP rows of each window with its marker, and closes a
+    /// due window without IP rows from [`Self::marked_from`] on with the
+    /// marker `[0, generation]`, but only once a stream has passed it by event
+    /// time; until then it and every later window stay open.
     ///
     /// A grouped policy warns for each due window in which it refused IPs for
     /// the cap, and for each due window, from the one of the first event any
     /// stream received on, whose internal network is empty.
-    pub(super) fn close_due(&mut self, clock: &PassClock) -> Vec<TimeSeries> {
+    pub(super) fn close_due(&mut self, clock: &PassClock) -> Vec<IngestFrame> {
         let mut written = Vec::new();
         loop {
-            let target = self
+            let due = self
                 .streams
                 .iter()
                 .map(|stream| self.pass_limit(stream, clock))
                 .min()
                 .unwrap_or(i64::MIN);
+            let target = self.closable_until(due);
             if target <= self.current {
                 break;
             }
             self.warn_due(target);
             let later = self.open.split_off(&target);
-            for (_, window) in std::mem::replace(&mut self.open, later) {
-                written.extend(self.close(window));
+            let closing = std::mem::replace(&mut self.open, later);
+            if self.generation.is_some() {
+                self.close_grouped(closing, target, &mut written);
+            } else {
+                for (_, window) in closing {
+                    written.extend(self.close(window));
+                }
             }
             self.current = target;
             self.release_held();
         }
         written
+    }
+
+    /// Returns how far a grouped policy closes windows when every window
+    /// before `due` is due: up to the first window from [`Self::marked_from`]
+    /// on that has no IP rows and that no stream has passed by event time, or
+    /// `due` if there is none. An ungrouped policy closes up to `due`.
+    fn closable_until(&self, due: i64) -> i64 {
+        if self.generation.is_none() {
+            return due;
+        }
+        let Some(marked_from) = self.marked_from else {
+            return due;
+        };
+        let passed_by_events = self
+            .streams
+            .iter()
+            .map(|stream| self.events_pass_limit(stream))
+            .max()
+            .unwrap_or(i64::MIN);
+        let mut start = self.current.max(marked_from).max(passed_by_events);
+        while start < due && self.open.contains_key(&start) {
+            start = start.saturating_add(self.window_size_secs);
+        }
+        start.min(due)
+    }
+
+    /// Closes the windows of a grouped policy from the earliest not yet due up
+    /// to `target`: those in `closing`, which have IP rows, and every other
+    /// one from [`Self::marked_from`] on, in time order.
+    fn close_grouped(
+        &mut self,
+        closing: BTreeMap<i64, Window>,
+        target: i64,
+        written: &mut Vec<IngestFrame>,
+    ) {
+        let mut next_empty = self
+            .marked_from
+            .map_or(target, |marked_from| marked_from.max(self.current));
+        for (start, window) in closing {
+            while next_empty < start {
+                written.extend(self.close(Window::empty(next_empty)));
+                next_empty = next_empty.saturating_add(self.window_size_secs);
+            }
+            written.extend(self.close(window));
+            next_empty = next_empty.max(start.saturating_add(self.window_size_secs));
+        }
+        while next_empty < target {
+            written.extend(self.close(Window::empty(next_empty)));
+            next_empty = next_empty.saturating_add(self.window_size_secs);
+        }
     }
 
     /// Returns the start of the earliest window `stream` has not passed.
@@ -563,18 +724,32 @@ impl WindowBuilder {
         let limit = if bound == i64::MIN {
             i64::MIN
         } else {
-            // A window is passed when its end plus the grace is below the
-            // bound, so the earliest one not passed is the one containing
-            // the bound minus the grace minus one nanosecond.
-            let last_passed_end = bound
-                .saturating_sub(CLOSE_GRACE_SECS.saturating_mul(SECOND_TO_NANO))
-                .saturating_sub(1);
-            start_time(&self.policy, last_passed_end.div_euclid(SECOND_TO_NANO)).unwrap_or(i64::MIN)
+            self.limit_below(bound)
         };
         match &stream.held {
             Some(held) => limit.min(held.window_start.saturating_sub(self.window_size_secs)),
             None => limit,
         }
+    }
+
+    /// Returns the start of the earliest window `stream` has not passed by
+    /// the events it received, whether or not it has ended.
+    fn events_pass_limit(&self, stream: &StreamState) -> i64 {
+        stream
+            .watermark
+            .map_or(i64::MIN, |watermark| self.limit_below(watermark))
+    }
+
+    /// Returns the start of the earliest window whose end plus the grace is
+    /// not below `bound` (nanoseconds).
+    fn limit_below(&self, bound: i64) -> i64 {
+        // A window is passed when its end plus the grace is below the bound,
+        // so the earliest one not passed is the one containing the bound
+        // minus the grace minus one nanosecond.
+        let last_passed_end = bound
+            .saturating_sub(CLOSE_GRACE_SECS.saturating_mul(SECOND_TO_NANO))
+            .saturating_sub(1);
+        start_time(&self.policy, last_passed_end.div_euclid(SECOND_TO_NANO)).unwrap_or(i64::MIN)
     }
 
     /// Returns whether an event at `timestamp` in the window starting at
@@ -689,8 +864,9 @@ impl WindowBuilder {
         }
     }
 
-    /// Makes `window` the last closed one and returns its series for writing.
-    fn close(&mut self, window: Window) -> Vec<TimeSeries> {
+    /// Makes `window` the last closed one and returns its frames for
+    /// writing: one per row, and for a grouped policy then its marker.
+    fn close(&mut self, window: Window) -> Vec<IngestFrame> {
         if self.dropped > 0 {
             warn!(
                 policy_id = %self.policy_id,
@@ -699,14 +875,76 @@ impl WindowBuilder {
             );
             self.dropped = 0;
         }
-        let series = window
+        if !self.corrected.is_empty() {
+            warn!(
+                policy_id = %self.policy_id,
+                corrected = self.corrected.len(),
+                "Policy {} corrected or added {} IP rows of a window after its marker",
+                self.policy_id,
+                self.corrected.len()
+            );
+            self.corrected.clear();
+        }
+        let mut frames: Vec<IngestFrame> = window
             .values
             .keys()
-            .filter_map(|key| window.series(self.policy.id, key))
+            .filter_map(|key| self.row(&window, key))
+            .map(IngestFrame::from)
             .collect();
+        frames.extend(self.marker(&window).map(IngestFrame::from));
         self.last_closed = Some(window);
-        series
+        frames
     }
+
+    /// Returns the frame that writes the `key` row of the last closed window
+    /// again after an event was counted there: the row alone, or for a
+    /// grouped policy's row `added` after the marker, the row and the
+    /// window's new marker.
+    fn correction(&mut self, key: &str, added: bool) -> Option<IngestFrame> {
+        let last = self.last_closed.as_ref()?;
+        let row = self.row(last, key)?;
+        let marker = self.marker(last).filter(|_| added);
+        if self.generation.is_some() {
+            self.corrected.insert(key.to_owned());
+        }
+        Some(match marker {
+            Some(marker) => IngestFrame::pair(row, marker),
+            None => IngestFrame::from(row),
+        })
+    }
+
+    /// Returns the `key` row of `window`: its values, which for a grouped
+    /// policy are followed by the run's generation.
+    fn row(&self, window: &Window, key: &str) -> Option<TimeSeries> {
+        let mut row = window.series(self.policy.id, key)?;
+        if let Some(generation) = self.generation {
+            row.series.push(generation_value(generation));
+        }
+        Some(row)
+    }
+
+    /// Returns a grouped policy's marker of `window`, under the policy id:
+    /// the number of its IP rows and the run's generation. `None` for an
+    /// ungrouped policy.
+    fn marker(&self, window: &Window) -> Option<TimeSeries> {
+        let generation = self.generation?;
+        // At most `max_series` IPs have a row.
+        let rows = u32::try_from(window.values.len()).unwrap_or(u32::MAX);
+        Some(TimeSeries {
+            time_series_id: self.policy_id.clone(),
+            policy_id: self.policy.id,
+            start_secs: window.start_secs,
+            series: vec![f64::from(rows), generation_value(generation)],
+        })
+    }
+}
+
+/// Returns `generation` as a time-series element.
+// No `From` converts a `u64` to an `f64`. The conversion is exact: the
+// policy actor never fixes a generation of 2^53 or more.
+#[allow(clippy::cast_precision_loss)]
+fn generation_value(generation: u64) -> f64 {
+    generation as f64
 }
 
 /// Returns the key of the series `value` adds to, given the policy's id: the
@@ -1725,9 +1963,22 @@ mod tests {
         secs * SECOND_TO_NANO
     }
 
+    /// The write generation of the runs of grouped policies in these tests.
+    const GENERATION: u64 = 1_764_000_000_000;
+
+    /// The run of `policy` requested from `request_start`, which is its
+    /// checkpoint unless it is 0, with [`GENERATION`] if it is grouped.
+    fn run_from(policy: &TimeSeriesGenerationPolicy, request_start: i64) -> RunStart {
+        RunStart {
+            start: request_start,
+            resumed: request_start != 0,
+            generation: policy.group_by.map(|_| GENERATION),
+        }
+    }
+
     /// A builder for `policy` over one stream, which has opened.
     fn single(policy: &TimeSeriesGenerationPolicy, request_start: i64) -> Result<WindowBuilder> {
-        let mut builder = WindowBuilder::try_new(policy, request_start, 1)?;
+        let mut builder = WindowBuilder::try_new(policy, run_from(policy, request_start), 1)?;
         builder.open_stream().expect("the stream opens");
         Ok(builder)
     }
@@ -1741,29 +1992,54 @@ mod tests {
         }
     }
 
+    /// Returns the rows of `frames`, in order.
+    fn flatten(frames: Vec<IngestFrame>) -> Vec<TimeSeries> {
+        frames
+            .into_iter()
+            .flat_map(IngestFrame::into_rows)
+            .collect()
+    }
+
     /// Delivers events to a builder as the policy runner does.
     trait Feed {
-        /// Delivers an event on stream 0 and returns the windows written.
+        /// Delivers an event on stream 0 and returns the rows written.
         fn feed(&mut self, timestamp: i64, event: &Event) -> Result<Vec<TimeSeries>> {
             self.feed_on(0, timestamp, event)
         }
 
-        /// Delivers an event on `stream` and returns the windows written.
-        fn feed_on(
-            &mut self,
-            stream: usize,
-            timestamp: i64,
-            event: &Event,
-        ) -> Result<Vec<TimeSeries>>;
-    }
-
-    impl Feed for WindowBuilder {
+        /// Delivers an event on `stream` and returns the rows written.
         fn feed_on(
             &mut self,
             stream: usize,
             timestamp: i64,
             event: &Event,
         ) -> Result<Vec<TimeSeries>> {
+            Ok(flatten(self.frames_on(stream, timestamp, event)?))
+        }
+
+        /// Closes the windows due by `clock` and returns the rows written.
+        fn close_rows(&mut self, clock: &PassClock) -> Vec<TimeSeries>;
+
+        /// Delivers an event on `stream` and returns the frames written.
+        fn frames_on(
+            &mut self,
+            stream: usize,
+            timestamp: i64,
+            event: &Event,
+        ) -> Result<Vec<IngestFrame>>;
+    }
+
+    impl Feed for WindowBuilder {
+        fn close_rows(&mut self, clock: &PassClock) -> Vec<TimeSeries> {
+            flatten(self.close_due(clock))
+        }
+
+        fn frames_on(
+            &mut self,
+            stream: usize,
+            timestamp: i64,
+            event: &Event,
+        ) -> Result<Vec<IngestFrame>> {
             self.receive(stream, timestamp, Instant::now());
             let mut written = self.close_due(&event_time_only());
             written.extend(self.add(stream, timestamp, event)?);
@@ -1986,19 +2262,19 @@ mod tests {
 
         // Before its replay end a stream never passes by the wall clock,
         // however long it is quiet.
-        assert!(builder.close_due(&at(86_400, end + 86_400)).is_empty());
+        assert!(builder.close_rows(&at(86_400, end + 86_400)).is_empty());
 
         assert!(builder.replay_end(0, origin));
         assert_eq!(CLOSE_GRACE_SECS, 900);
         assert!(
-            builder.close_due(&at(29, end + 10_000)).is_empty(),
+            builder.close_rows(&at(29, end + 10_000)).is_empty(),
             "idle 29 s"
         );
         assert!(
-            builder.close_due(&at(30, end + 899)).is_empty(),
+            builder.close_rows(&at(30, end + 899)).is_empty(),
             "end + 899 s"
         );
-        let written = builder.close_due(&at(30, end + 900));
+        let written = builder.close_rows(&at(30, end + 900));
         assert_eq!(
             starts_and_values(&written),
             [(
@@ -2009,7 +2285,7 @@ mod tests {
         );
         assert!(builder.open.is_empty());
         assert!(
-            builder.close_due(&at(60, end + 10_000)).is_empty(),
+            builder.close_rows(&at(60, end + 10_000)).is_empty(),
             "written once"
         );
 
@@ -2045,8 +2321,8 @@ mod tests {
         builder
             .add(0, event, &Event::Conn(create_test_conn()))
             .unwrap();
-        assert!(builder.close_due(&at(49)).is_empty(), "idle since 20 s");
-        assert_eq!(builder.close_due(&at(50)).len(), 1);
+        assert!(builder.close_rows(&at(49)).is_empty(), "idle since 20 s");
+        assert_eq!(builder.close_rows(&at(50)).len(), 1);
     }
 
     #[test]
@@ -2065,7 +2341,7 @@ mod tests {
         );
         assert_eq!(builder.stall_counts(), (0, 0));
         assert_eq!(
-            builder.close_due(&at(30)).len(),
+            builder.close_rows(&at(30)).len(),
             1,
             "the idle start is still the first replay end"
         );
@@ -2079,7 +2355,7 @@ mod tests {
     /// both opened.
     fn pair(policy: &TimeSeriesGenerationPolicy) -> WindowBuilder {
         let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
-        let mut builder = WindowBuilder::try_new(policy, start, 2).unwrap();
+        let mut builder = WindowBuilder::try_new(policy, run_from(policy, start), 2).unwrap();
         assert_eq!(builder.open_stream(), Some(0));
         assert_eq!(builder.open_stream(), Some(1));
         builder
@@ -2140,7 +2416,7 @@ mod tests {
         let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
         let end = datetime_from_utc("2024/1/15 01:00:00");
         let origin = Instant::now();
-        let mut builder = WindowBuilder::try_new(&policy, start, 2).unwrap();
+        let mut builder = WindowBuilder::try_new(&policy, run_from(&policy, start), 2).unwrap();
         assert_eq!(builder.stall_counts(), (2, 0));
         assert_eq!(builder.open_stream(), Some(0));
         assert_eq!(builder.stall_counts(), (1, 1));
@@ -2151,7 +2427,7 @@ mod tests {
         // Stream 0 is past 00:00 by event time and by the wall clock.
         assert!(add_on(&mut builder, 0, "2024/1/15 01:20:00").is_empty());
         let far = clock_at(origin, Duration::from_hours(24), end + 86_400);
-        assert!(builder.close_due(&far).is_empty());
+        assert!(builder.close_rows(&far).is_empty());
 
         // The late stream opens and replays: its events of 00:00 count there.
         assert_eq!(builder.open_stream(), Some(1));
@@ -2180,15 +2456,15 @@ mod tests {
         // Stream 1 has not reached its replay end: an hour quiet with the wall
         // clock a day past the window's end does not pass it.
         let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), end + 86_400);
-        assert!(builder.close_due(&at(3600)).is_empty());
+        assert!(builder.close_rows(&at(3600)).is_empty());
         assert_eq!(builder.stall_counts(), (0, 1));
 
         // Its replay continues into the same window, then ends.
         assert!(add_on(&mut builder, 1, "2024/1/15 00:40:00").is_empty());
         assert!(builder.replay_end(1, origin + Duration::from_secs(3600)));
         assert_eq!(builder.stall_counts(), (0, 0));
-        assert!(builder.close_due(&at(3629)).is_empty());
-        let written = builder.close_due(&at(3630));
+        assert!(builder.close_rows(&at(3629)).is_empty());
+        let written = builder.close_rows(&at(3630));
         assert_eq!(
             starts_and_values(&written),
             [(
@@ -2208,8 +2484,8 @@ mod tests {
         assert!(builder.replay_end(1, origin + Duration::from_secs(100)));
 
         let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), end + 900);
-        assert!(builder.close_due(&at(129)).is_empty());
-        assert_eq!(builder.close_due(&at(130)).len(), 1);
+        assert!(builder.close_rows(&at(129)).is_empty());
+        assert_eq!(builder.close_rows(&at(130)).len(), 1);
     }
 
     #[test]
@@ -2268,9 +2544,9 @@ mod tests {
         assert!(builder.replay_end(1, origin));
 
         let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), end + 900);
-        assert!(builder.close_due(&at(29)).is_empty());
+        assert!(builder.close_rows(&at(29)).is_empty());
         assert!(builder.is_paused(0));
-        let written = builder.close_due(&at(30));
+        let written = builder.close_rows(&at(30));
         assert_eq!(
             starts_and_values(&written),
             [(
@@ -2303,7 +2579,7 @@ mod tests {
             Duration::from_secs(60),
             datetime_from_utc("2024/1/16 00:00:00"),
         );
-        let written = builder.close_due(&far);
+        let written = builder.close_rows(&far);
         assert_eq!(
             starts_and_values(&written),
             [
@@ -2355,7 +2631,7 @@ mod tests {
         let origin = Instant::now();
         assert!(builder.replay_end(0, origin));
         assert!(builder.replay_end(1, origin));
-        written.extend(builder.close_due(&clock_at(
+        written.extend(builder.close_rows(&clock_at(
             origin,
             Duration::from_secs(60),
             datetime_from_utc("2024/1/16 00:00:00"),
@@ -2406,7 +2682,7 @@ mod tests {
         assert!(add_on(&mut builder, 0, "2024/1/15 01:20:00").is_empty());
         assert!(builder.replay_end(0, origin));
         let far = clock_at(origin, Duration::from_secs(3600), end + 86_400);
-        assert!(builder.close_due(&far).is_empty());
+        assert!(builder.close_rows(&far).is_empty());
     }
 
     #[test]
@@ -2572,8 +2848,22 @@ mod tests {
             .collect()
     }
 
+    /// Returns the IP row `id` of the window starting at `datetime`: its four
+    /// slot values followed by [`GENERATION`].
     fn row(id: &str, datetime: &str, values: [f64; 4]) -> (String, i64, Vec<f64>) {
-        (id.to_owned(), datetime_from_utc(datetime), values.to_vec())
+        let mut data = values.to_vec();
+        data.push(GENERATION as f64);
+        (id.to_owned(), datetime_from_utc(datetime), data)
+    }
+
+    /// Returns the marker of the window starting at `datetime` with `rows` IP
+    /// rows.
+    fn marker(datetime: &str, rows: u32) -> (String, i64, Vec<f64>) {
+        (
+            GROUPED_ID.to_string(),
+            datetime_from_utc(datetime),
+            vec![f64::from(rows), GENERATION as f64],
+        )
     }
 
     /// Runs `f` and returns its result with the lines it logged.
@@ -2640,7 +2930,10 @@ mod tests {
             let written = conn_on(&mut builder, 0, "2024/1/15 01:20:00", EXTERNAL, EXTERNAL);
             assert_eq!(
                 rows(&written),
-                [row(id, "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0])],
+                [
+                    row(id, "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+                    marker("2024/1/15 00:00:00", 1),
+                ],
                 "{side:?} {orig} → {resp}"
             );
             assert!(builder.open.is_empty(), "the external event opens nothing");
@@ -2795,6 +3088,7 @@ mod tests {
             [
                 row("42/10.0.0.1", "2024/1/15 00:00:00", [2.0, 0.0, 0.0, 0.0]),
                 row("42/10.0.0.2", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+                marker("2024/1/15 00:00:00", 2),
             ]
         );
     }
@@ -2815,8 +3109,9 @@ mod tests {
                 row("42/10.0.0.1", "2024/1/15 00:00:00", [0.0, 1.0, 0.0, 0.0]),
                 row("42/10.0.0.10", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
                 row("42/10.0.0.9", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+                marker("2024/1/15 00:00:00", 3),
             ],
-            "ascending byte order of the series ids"
+            "ascending byte order of the series ids, then the marker"
         );
         assert!(builder.open.values().all(|window| {
             window.values.keys().eq(["42/10.0.0.1"])
@@ -2824,48 +3119,155 @@ mod tests {
         }));
     }
 
+    /// Delivers a Conn event from `orig` to an external IP at `datetime` on
+    /// stream 0 and returns the rows of each frame written.
+    fn frames_from_ip(
+        builder: &mut WindowBuilder,
+        datetime: &str,
+        orig: &str,
+    ) -> Vec<Vec<(String, i64, Vec<f64>)>> {
+        builder
+            .frames_on(
+                0,
+                nanos(datetime_from_utc(datetime)),
+                &conn_between(orig, EXTERNAL),
+            )
+            .expect("add should succeed")
+            .iter()
+            .map(|frame| rows(frame.rows()))
+            .collect()
+    }
+
+    /// After the marker of the last closed window, an IP that has a row there
+    /// gets its corrected row alone, and an IP without one gets its new row
+    /// and the marker counting it in one frame, both with the run's
+    /// generation. The next close warns with the number of distinct rows
+    /// corrected or added; an older event is dropped.
     #[test]
     fn late_event_rewrites_or_adds_an_ip_row_and_an_older_one_is_dropped() {
         let mut builder = single(&by_source(&["10.0.0.1", "10.0.0.5", "10.0.0.9"]), 0).unwrap();
         from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
         from_ip(&mut builder, "2024/1/15 00:06:00", "10.0.0.9");
         assert_eq!(
-            from_ip(&mut builder, "2024/1/15 01:20:00", "10.0.0.1").len(),
-            2
+            frames_from_ip(&mut builder, "2024/1/15 01:20:00", "10.0.0.1"),
+            [
+                vec![row(
+                    "42/10.0.0.1",
+                    "2024/1/15 00:00:00",
+                    [1.0, 0.0, 0.0, 0.0]
+                )],
+                vec![row(
+                    "42/10.0.0.9",
+                    "2024/1/15 00:00:00",
+                    [1.0, 0.0, 0.0, 0.0]
+                )],
+                vec![marker("2024/1/15 00:00:00", 2)],
+            ],
+            "one row per frame at the close"
         );
 
-        let rewritten = from_ip(&mut builder, "2024/1/15 00:40:00", "10.0.0.9");
+        let rewritten = frames_from_ip(&mut builder, "2024/1/15 00:40:00", "10.0.0.9");
         assert_eq!(
-            rows(&rewritten),
-            [row(
+            rewritten,
+            [vec![row(
                 "42/10.0.0.9",
                 "2024/1/15 00:00:00",
                 [1.0, 0.0, 1.0, 0.0]
-            )]
+            )]],
+            "no marker for a corrected row"
         );
-        let added = from_ip(&mut builder, "2024/1/15 00:50:00", "10.0.0.5");
+        let rewritten = frames_from_ip(&mut builder, "2024/1/15 00:41:00", "10.0.0.9");
         assert_eq!(
-            rows(&added),
-            [row(
-                "42/10.0.0.5",
+            rewritten,
+            [vec![row(
+                "42/10.0.0.9",
                 "2024/1/15 00:00:00",
-                [0.0, 0.0, 0.0, 1.0]
-            )]
+                [1.0, 0.0, 2.0, 0.0]
+            )]]
+        );
+        let added = frames_from_ip(&mut builder, "2024/1/15 00:50:00", "10.0.0.5");
+        assert_eq!(
+            added,
+            [vec![
+                row("42/10.0.0.5", "2024/1/15 00:00:00", [0.0, 0.0, 0.0, 1.0]),
+                marker("2024/1/15 00:00:00", 3),
+            ]],
+            "the new row and the marker in one frame"
         );
         assert_eq!(builder.dropped, 0);
 
-        let written = from_ip(&mut builder, "2024/1/15 02:20:00", "10.0.0.1");
+        let (written, lines) = logged(|| from_ip(&mut builder, "2024/1/15 02:20:00", "10.0.0.1"));
         assert_eq!(
             rows(&written),
-            [row(
-                "42/10.0.0.1",
-                "2024/1/15 01:00:00",
-                [0.0, 1.0, 0.0, 0.0]
-            )]
+            [
+                row("42/10.0.0.1", "2024/1/15 01:00:00", [0.0, 1.0, 0.0, 0.0]),
+                marker("2024/1/15 01:00:00", 1),
+            ]
+        );
+        let warnings = containing(&lines, "after its marker");
+        assert_eq!(warnings.len(), 1, "{lines:?}");
+        assert!(warnings[0].contains("WARN"), "{warnings:?}");
+        assert!(warnings[0].contains("policy_id=42"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("corrected=2"),
+            "a row corrected twice counts once: {warnings:?}"
         );
         assert!(from_ip(&mut builder, "2024/1/15 00:30:00", "10.0.0.9").is_empty());
         assert!(from_ip(&mut builder, "2024/1/15 00:30:00", "10.0.0.6").is_empty());
         assert_eq!(builder.dropped, 1, "only the counted IP's event is dropped");
+
+        // Without corrections since the previous close, a close warns
+        // nothing about them.
+        let (_, lines) = logged(|| from_ip(&mut builder, "2024/1/15 03:20:00", "10.0.0.1"));
+        assert_eq!(containing(&lines, "after its marker").len(), 0, "{lines:?}");
+        assert_eq!(
+            containing(&lines, "Dropped late events").len(),
+            1,
+            "{lines:?}"
+        );
+    }
+
+    /// An ungrouped policy's late correction rewrites its row alone, with no
+    /// generation, and logs no correction warning.
+    #[test]
+    fn ungrouped_late_correction_writes_no_marker_and_warns_nothing() {
+        let mut builder = single(&create_simple_policy(900, 3600), 0).unwrap();
+        add_at(&mut builder, "2024/1/15 00:05:00");
+        let written = add_at(&mut builder, "2024/1/15 01:20:00");
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![1.0, 0.0, 0.0, 0.0]
+            )]
+        );
+        let frames = builder
+            .frames_on(
+                0,
+                nanos(datetime_from_utc("2024/1/15 00:40:00")),
+                &Event::Conn(create_test_conn()),
+            )
+            .unwrap();
+        let [frame] = frames.as_slice() else {
+            panic!("one frame: {frames:?}");
+        };
+        assert_eq!(
+            starts_and_values(frame.rows()),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![1.0, 0.0, 1.0, 0.0]
+            )]
+        );
+        assert_eq!(frame.rows()[0].time_series_id, "1");
+        let (written, lines) = logged(|| add_at(&mut builder, "2024/1/15 02:20:00"));
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 01:00:00"),
+                vec![0.0, 1.0, 0.0, 0.0]
+            )]
+        );
+        assert_eq!(containing(&lines, "after its marker").len(), 0, "{lines:?}");
     }
 
     #[test]
@@ -2893,7 +3295,9 @@ mod tests {
             rows(&written),
             [
                 row("42/10.0.0.1", "2024/1/15 00:00:00", [1.0, 0.0, 1.0, 0.0]),
+                marker("2024/1/15 00:00:00", 1),
                 row("42/10.0.0.2", "2024/1/15 01:00:00", [1.0, 0.0, 0.0, 0.0]),
+                marker("2024/1/15 01:00:00", 1),
             ]
         );
     }
@@ -2926,8 +3330,11 @@ mod tests {
             rows(&written),
             [
                 row("42/10.0.0.1", "2024/1/15 00:00:00", [1.0, 0.0, 1.0, 0.0]),
+                marker("2024/1/15 00:00:00", 1),
                 row("42/10.0.0.2", "2024/1/15 01:00:00", [1.0, 0.0, 1.0, 0.0]),
+                marker("2024/1/15 01:00:00", 1),
                 row("42/10.0.0.3", "2024/1/15 02:00:00", [1.0, 0.0, 0.0, 0.0]),
+                marker("2024/1/15 02:00:00", 1),
             ]
         );
     }
@@ -2942,24 +3349,31 @@ mod tests {
         let written = from_ip(&mut builder, "2024/1/15 01:20:00", EXTERNAL);
         assert_eq!(
             rows(&written),
-            [row(
-                "42/10.0.0.2",
-                "2024/1/15 00:00:00",
-                [1.0, 0.0, 0.0, 0.0]
-            )]
+            [
+                row("42/10.0.0.2", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+                marker("2024/1/15 00:00:00", 1),
+            ]
         );
     }
 
     #[test]
     fn empty_network_warns_at_each_due_window_from_the_first_event_on() {
-        // Requested from 0: the first close passes every window since 1970.
+        // Requested from 0: the first close passes every window since 1970,
+        // and those before the first event get no marker.
         let mut builder = single(&by_source(&[]), 0).unwrap();
         let (written, lines) = logged(|| {
             let mut written = from_ip(&mut builder, "2024/1/15 00:05:00", "10.0.0.1");
             written.extend(from_ip(&mut builder, "2024/1/15 03:20:00", "10.0.0.1"));
             written
         });
-        assert!(written.is_empty());
+        assert_eq!(
+            rows(&written),
+            [
+                marker("2024/1/15 00:00:00", 0),
+                marker("2024/1/15 01:00:00", 0),
+                marker("2024/1/15 02:00:00", 0),
+            ]
+        );
         assert!(builder.open.is_empty(), "no window opens");
         let warnings = containing(&lines, "Policy 42 has no internal network");
         assert_eq!(warnings.len(), 3, "00:00, 01:00 and 02:00: {lines:?}");
@@ -2989,11 +3403,12 @@ mod tests {
         let (written, lines) = logged(|| from_ip(&mut builder, "2024/1/15 03:20:00", "10.0.0.1"));
         assert_eq!(
             rows(&written),
-            [row(
-                "42/10.0.0.1",
-                "2024/1/15 00:00:00",
-                [1.0, 0.0, 0.0, 0.0]
-            )]
+            [
+                row("42/10.0.0.1", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+                marker("2024/1/15 00:00:00", 1),
+                marker("2024/1/15 01:00:00", 0),
+                marker("2024/1/15 02:00:00", 0),
+            ]
         );
         assert!(builder.open.is_empty(), "no new window opens");
         assert_eq!(
@@ -3028,6 +3443,7 @@ mod tests {
             [
                 row("42/10.0.0.1", "2024/1/15 00:00:00", [1.0, 1.0, 0.0, 0.0]),
                 row("42/10.0.0.2", "2024/1/15 00:00:00", [1.0, 0.0, 0.0, 0.0]),
+                marker("2024/1/15 00:00:00", 2),
             ],
             "the accepted IPs keep counting"
         );
@@ -3036,31 +3452,42 @@ mod tests {
         assert!(warnings[0].contains("refused=2"), "{warnings:?}");
         assert!(warnings[0].contains("policy_id=42"), "{warnings:?}");
 
-        // A window in which every event was refused holds no rows but warns.
+        // A window in which every event was refused holds no rows: it closes
+        // with an empty marker and warns.
         from_ip(&mut builder, "2024/1/15 01:30:00", "10.0.0.5");
         let (written, lines) = logged(|| from_ip(&mut builder, "2024/1/15 02:20:00", EXTERNAL));
-        assert!(written.is_empty());
+        assert_eq!(rows(&written), [marker("2024/1/15 01:00:00", 0)]);
         assert_eq!(containing(&lines, "refused=1").len(), 1, "{lines:?}");
 
-        // A window without rows is not closed, so 00:00 is still the last
-        // closed window. A refusal there is reported by the next close.
-        assert!(from_ip(&mut builder, "2024/1/15 00:40:00", "10.0.0.6").is_empty());
+        // 01:00 is now the last closed window. A refusal there is reported
+        // by the next close; an accepted IP's late event there writes its new
+        // row and the marker together; 00:00 drops its events.
+        assert!(from_ip(&mut builder, "2024/1/15 01:40:00", "10.0.0.6").is_empty());
         assert_eq!(
             builder.refused.keys().copied().collect::<Vec<_>>(),
             [datetime_from_utc("2024/1/15 02:00:00")]
         );
+        let frames = builder
+            .frames_on(
+                0,
+                nanos(datetime_from_utc("2024/1/15 01:41:00")),
+                &conn_between("10.0.0.1", EXTERNAL),
+            )
+            .unwrap();
+        let [frame] = frames.as_slice() else {
+            panic!("one frame: {frames:?}");
+        };
         assert_eq!(
-            rows(&from_ip(&mut builder, "2024/1/15 00:41:00", "10.0.0.1")),
-            [row(
-                "42/10.0.0.1",
-                "2024/1/15 00:00:00",
-                [1.0, 1.0, 1.0, 0.0]
-            )]
+            rows(frame.rows()),
+            [
+                row("42/10.0.0.1", "2024/1/15 01:00:00", [0.0, 0.0, 1.0, 0.0]),
+                marker("2024/1/15 01:00:00", 1),
+            ]
         );
-        assert!(from_ip(&mut builder, "2024/1/15 01:31:00", "10.0.0.2").is_empty());
-        assert_eq!(builder.dropped, 1, "01:00 is due and not the last closed");
+        assert!(from_ip(&mut builder, "2024/1/15 00:41:00", "10.0.0.2").is_empty());
+        assert_eq!(builder.dropped, 1, "00:00 is no longer the last closed");
         let (written, lines) = logged(|| from_ip(&mut builder, "2024/1/15 03:20:00", EXTERNAL));
-        assert!(written.is_empty());
+        assert_eq!(rows(&written), [marker("2024/1/15 02:00:00", 0)]);
         let warnings = containing(&lines, refused);
         assert_eq!(warnings.len(), 1, "{lines:?}");
         assert!(warnings[0].contains("refused=1"), "{warnings:?}");
@@ -3081,7 +3508,258 @@ mod tests {
         from_ip(&mut builder, "2024/1/15 00:07:00", "10.0.0.1");
         let written = from_ip(&mut builder, "2024/1/15 01:20:00", EXTERNAL);
         let ids: Vec<&str> = written.iter().map(|s| s.time_series_id.as_str()).collect();
-        assert_eq!(ids, ["42/10.0.0.3", "42/10.0.0.4"]);
+        assert_eq!(ids, ["42/10.0.0.3", "42/10.0.0.4", "42"]);
+    }
+
+    /// Delivers a Conn event from `orig` to an external IP at `datetime` on
+    /// `stream` as the policy runner does under `clock`, and returns the rows
+    /// written.
+    fn deliver(
+        builder: &mut WindowBuilder,
+        stream: usize,
+        datetime: &str,
+        orig: &str,
+        clock: &PassClock,
+    ) -> Vec<(String, i64, Vec<f64>)> {
+        let timestamp = nanos(datetime_from_utc(datetime));
+        builder.receive(stream, timestamp, clock.now);
+        let mut written = builder.close_due(clock);
+        written.extend(
+            builder
+                .add(stream, timestamp, &conn_between(orig, EXTERNAL))
+                .expect("add should succeed"),
+        );
+        rows(&flatten(written))
+    }
+
+    /// A grouped window without IP rows is due by the idle rule, but closes
+    /// only once its stream passes it by event time; until then a later
+    /// window with IP rows waits behind it. The event that passes them closes
+    /// them in order, each empty one with `[0, generation]`.
+    #[test]
+    fn empty_window_closes_only_once_a_stream_passes_it_by_event_time() {
+        let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
+        let mut builder = single(&by_source(&["10.0.0.1"]), start).unwrap();
+        let origin = Instant::now();
+        let far = datetime_from_utc("2024/1/17 00:00:00");
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), far);
+
+        // 00:00 counts nothing; 01:00 counts 10.0.0.1. Neither event passes
+        // 00:00 by event time.
+        assert_eq!(
+            deliver(&mut builder, 0, "2024/1/15 00:20:00", EXTERNAL, &at(0)).len(),
+            0
+        );
+        assert_eq!(
+            deliver(&mut builder, 0, "2024/1/15 01:05:00", "10.0.0.1", &at(0)).len(),
+            0
+        );
+        assert!(builder.replay_end(0, origin));
+        assert!(
+            builder.close_rows(&at(3600)).is_empty(),
+            "past the replay end, quiet and the wall clock past: not passed by event time"
+        );
+        assert_eq!(
+            builder.open.keys().copied().collect::<Vec<_>>(),
+            [datetime_from_utc("2024/1/15 01:00:00")],
+            "the window with IP rows waits"
+        );
+
+        let written = deliver(&mut builder, 0, "2024/1/15 03:20:00", EXTERNAL, &at(3600));
+        assert_eq!(
+            written,
+            [
+                marker("2024/1/15 00:00:00", 0),
+                row("42/10.0.0.1", "2024/1/15 01:00:00", [1.0, 0.0, 0.0, 0.0]),
+                marker("2024/1/15 01:00:00", 1),
+                marker("2024/1/15 02:00:00", 0),
+            ]
+        );
+        assert_eq!(
+            builder.last_closed.as_ref().map(|window| window.start_secs),
+            Some(datetime_from_utc("2024/1/15 02:00:00")),
+            "an empty window becomes the last closed window"
+        );
+        assert!(
+            builder.close_rows(&at(7200)).is_empty(),
+            "03:00 is due by the idle rule only"
+        );
+    }
+
+    /// With two streams, a window without IP rows stays open while both pass
+    /// it only by the idle rule, and closes once one of them passes it by
+    /// event time.
+    #[test]
+    fn empty_window_closes_once_one_of_two_streams_passes_it_by_event_time() {
+        let mut builder = pair(&by_source(&["10.0.0.1"]));
+        let origin = Instant::now();
+        let far = datetime_from_utc("2024/1/17 00:00:00");
+        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), far);
+        assert_eq!(
+            deliver(&mut builder, 0, "2024/1/15 00:20:00", EXTERNAL, &at(0)).len(),
+            0
+        );
+        assert_eq!(
+            deliver(&mut builder, 1, "2024/1/15 00:30:00", EXTERNAL, &at(0)).len(),
+            0
+        );
+        assert!(builder.replay_end(0, origin));
+        assert!(builder.replay_end(1, origin));
+        assert!(
+            builder.close_rows(&at(3600)).is_empty(),
+            "both streams pass it only by the idle rule"
+        );
+
+        let written = deliver(&mut builder, 0, "2024/1/15 01:20:00", EXTERNAL, &at(3600));
+        assert_eq!(written, [marker("2024/1/15 00:00:00", 0)]);
+    }
+
+    /// A late event counted in a closed window without IP rows writes its row
+    /// and the marker `[1, generation]` in one frame.
+    #[test]
+    fn late_event_in_an_empty_closed_window_writes_its_row_and_the_marker_together() {
+        let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
+        let mut builder = single(&by_source(&["10.0.0.1"]), start).unwrap();
+        assert_eq!(
+            rows(&from_ip(&mut builder, "2024/1/15 01:20:00", EXTERNAL)),
+            [marker("2024/1/15 00:00:00", 0)]
+        );
+        let frames = frames_from_ip(&mut builder, "2024/1/15 00:30:00", "10.0.0.1");
+        assert_eq!(
+            frames,
+            [vec![
+                row("42/10.0.0.1", "2024/1/15 00:00:00", [0.0, 0.0, 1.0, 0.0]),
+                marker("2024/1/15 00:00:00", 1),
+            ]]
+        );
+    }
+
+    /// A request resumed from its checkpoint closes every window from it on,
+    /// even before the first event; an empty internal network warns only from
+    /// the window of the first event on.
+    #[test]
+    fn resumed_empty_network_writes_markers_from_the_checkpoint_and_warns_from_the_first_event() {
+        let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
+        let mut builder = single(&by_source(&[]), start).unwrap();
+        let (written, lines) = logged(|| {
+            let mut written = from_ip(&mut builder, "2024/1/15 02:05:00", "10.0.0.1");
+            written.extend(from_ip(&mut builder, "2024/1/15 04:20:00", "10.0.0.1"));
+            written
+        });
+        assert_eq!(
+            rows(&written),
+            [
+                marker("2024/1/15 00:00:00", 0),
+                marker("2024/1/15 01:00:00", 0),
+                marker("2024/1/15 02:00:00", 0),
+                marker("2024/1/15 03:00:00", 0),
+            ]
+        );
+        let warnings = containing(&lines, "Policy 42 has no internal network");
+        assert_eq!(warnings.len(), 2, "02:00 and 03:00: {lines:?}");
+        for (warning, window) in warnings.iter().zip(["02:00", "03:00"]) {
+            let start = datetime_from_utc(&format!("2024/1/15 {window}:00"));
+            assert!(
+                warning.contains(&format!("window_start={start}")),
+                "{warning}"
+            );
+        }
+    }
+
+    /// Without a checkpoint, no marker is written for a window before the
+    /// one of the first event received, even one that event passes.
+    #[test]
+    fn unresumed_request_writes_no_marker_before_the_first_event() {
+        let mut builder = single(&by_source(&["10.0.0.1"]), 0).unwrap();
+        // Uncounted, so 05:00 has no IP rows, and it passes every window
+        // since 1970 up to 03:00.
+        let written = from_ip(&mut builder, "2024/1/15 05:20:00", EXTERNAL);
+        assert_eq!(written.len(), 0, "{written:?}");
+        let written = from_ip(&mut builder, "2024/1/15 06:20:00", EXTERNAL);
+        assert_eq!(rows(&written), [marker("2024/1/15 05:00:00", 0)]);
+    }
+
+    /// Each run writes its rows with its own generation. A run resumed from
+    /// the window written before rewrites it with the IPs its network counts
+    /// now, and with none of them only the marker `[0, generation]`.
+    #[test]
+    fn resumed_run_rewrites_its_checkpoint_window_with_its_generation() {
+        let window = "2024/1/15 00:00:00";
+        let run = |hosts: &[&str], generation: u64| {
+            let policy = by_source(hosts);
+            let run = RunStart {
+                start: nanos(datetime_from_utc(window)),
+                resumed: true,
+                generation: Some(generation),
+            };
+            let mut builder = WindowBuilder::try_new(&policy, run, 1).unwrap();
+            builder.open_stream().unwrap();
+            for ip in ["10.0.0.1", "10.0.0.2", "10.0.0.3"] {
+                from_ip(&mut builder, "2024/1/15 00:05:00", ip);
+            }
+            rows(&from_ip(&mut builder, "2024/1/15 01:20:00", EXTERNAL))
+        };
+        let with = |id: &str, generation: u64| {
+            (
+                id.to_owned(),
+                datetime_from_utc(window),
+                vec![1.0, 0.0, 0.0, 0.0, generation as f64],
+            )
+        };
+        let marker_of = |rows: u32, generation: u64| {
+            (
+                "42".to_owned(),
+                datetime_from_utc(window),
+                vec![f64::from(rows), generation as f64],
+            )
+        };
+
+        assert_eq!(
+            run(&["10.0.0.1", "10.0.0.2"], 100),
+            [
+                with("42/10.0.0.1", 100),
+                with("42/10.0.0.2", 100),
+                marker_of(2, 100)
+            ]
+        );
+        assert_eq!(
+            run(&["10.0.0.2", "10.0.0.3"], 101),
+            [
+                with("42/10.0.0.2", 101),
+                with("42/10.0.0.3", 101),
+                marker_of(2, 101)
+            ]
+        );
+        assert_eq!(run(&[], 102), [marker_of(0, 102)]);
+        // A rewrite stopped before its close is done again by the next run.
+        assert_eq!(run(&[], 103), [marker_of(0, 103)]);
+    }
+
+    #[test]
+    fn grouped_run_needs_a_generation_and_an_ungrouped_one_ignores_it() {
+        let run = RunStart {
+            start: 0,
+            resumed: false,
+            generation: None,
+        };
+        assert!(WindowBuilder::try_new(&by_source(&["10.0.0.1"]), run, 1).is_err());
+        let ungrouped = create_simple_policy(900, 3600);
+        let run = RunStart {
+            generation: Some(GENERATION),
+            ..run
+        };
+        let mut builder = WindowBuilder::try_new(&ungrouped, run, 1).unwrap();
+        builder.open_stream().unwrap();
+        add_at(&mut builder, "2024/1/15 00:05:00");
+        let written = add_at(&mut builder, "2024/1/15 01:20:00");
+        assert_eq!(
+            starts_and_values(&written),
+            [(
+                datetime_from_utc("2024/1/15 00:00:00"),
+                vec![1.0, 0.0, 0.0, 0.0]
+            )],
+            "no generation and no marker"
+        );
     }
 
     #[test]

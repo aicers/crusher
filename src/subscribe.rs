@@ -35,7 +35,7 @@ use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarIn
 use review_protocol::types::{
     ConnField, Measure, RawEventKind as PolicyRawEventKind, TimeSeriesGenerationPolicy,
 };
-use time_series::{PassClock, TimeSeries, WindowBuilder};
+use time_series::{IngestFrame, PassClock, RunStart, WindowBuilder};
 use tokio::{
     sync::{Notify, RwLock, mpsc},
     task::JoinSet,
@@ -166,9 +166,9 @@ async fn drain_connection_generation(
     Ok(())
 }
 
-// The ingest queue of each policy's sender, by policy id. Every series of a
+// The ingest queue of each policy's sender, by policy id. Every frame of a
 // policy is written on that one sender's stream.
-static INGEST_CHANNEL: LazyLock<RwLock<HashMap<u32, Sender<TimeSeries>>>> =
+static INGEST_CHANNEL: LazyLock<RwLock<HashMap<u32, Sender<IngestFrame>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Returns the Giganto stream kind that carries the raw events of `kind`.
@@ -412,7 +412,7 @@ impl Client {
         mut actor_task: tokio::task::JoinHandle<Result<()>>,
         coordinator: CancellationCoordinator,
     ) -> Result<()> {
-        let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
+        let (sender, receiver) = async_channel::bounded::<IngestFrame>(TIME_SERIES_CHANNEL_SIZE);
         let connection_notify = Arc::new(Notify::new());
         let mut connection_controls = Box::pin(async {
             tokio::try_join!(
@@ -548,7 +548,7 @@ impl Client {
 
 #[allow(clippy::too_many_arguments)]
 async fn ingest_connection_control(
-    series_recv: Receiver<TimeSeries>,
+    series_recv: Receiver<IngestFrame>,
     server_addr: SocketAddr,
     server_name: &str,
     endpoint: &Endpoint,
@@ -610,7 +610,7 @@ async fn ingest_connection_control(
                             // instead of spawning another sender task.
                             let Some(policy_token) = policy_token_for_series(
                                 &policy_handle,
-                                series.policy_id,
+                                series.policy_id(),
                             )
                             .await else {
                                 continue;
@@ -668,7 +668,7 @@ async fn ingest_connection_control(
 /// their queues, so a correction still in the outer queue follows the window
 /// it replaces on that window's stream.
 async fn drain_series_at_shutdown(
-    series_recv: &Receiver<TimeSeries>,
+    series_recv: &Receiver<IngestFrame>,
     coordinator: &CancellationCoordinator,
     connection: &Arc<Connection>,
     connection_lifecycle: &ConnectionLifecycle,
@@ -721,7 +721,7 @@ fn classify_stream_error(err: &anyhow::Error) -> Option<StreamRecoveryAction> {
 
 #[allow(clippy::too_many_arguments)]
 async fn publish_connection_control(
-    series_send: Sender<TimeSeries>,
+    series_send: Sender<IngestFrame>,
     server_addr: SocketAddr,
     server_name: &str,
     endpoint: &Endpoint,
@@ -860,7 +860,7 @@ impl PublishRequests {
 
 /// What a Publish connection starts each policy's runner with.
 struct PolicyRunners {
-    series: Sender<TimeSeries>,
+    series: Sender<IngestFrame>,
     lifecycle: ConnectionLifecycle,
     coordinator: CancellationCoordinator,
     close_timer: CloseTimer,
@@ -897,7 +897,10 @@ impl PolicyRunners {
 
 /// Watches current state rather than replaying queued add events. Each connection
 /// sends a policy's requests once, including requests still waiting for an
-/// inbound stream, and starts the policy's runner as it sends them.
+/// inbound stream, and starts the policy's runner as it sends them. Taking the
+/// policy's view for its requests fixes the write generation of a grouped
+/// policy's run, which is on disk before the requests are written; if that
+/// fails, nothing is requested and the error ends the Publish control.
 ///
 /// A policy whose token was cancelled after its requests went out (deleted,
 /// absent from a list, or replaced with new content) is requested again only
@@ -1157,7 +1160,7 @@ fn next_frame<'a>(
 }
 
 /// Applies a frame that stream `index` of `policy` received to its windows, and
-/// returns the windows to write, in order.
+/// returns the ingest frames to write, in order.
 fn take_frame(
     windows: &mut WindowBuilder,
     policy: &TimeSeriesGenerationPolicy,
@@ -1165,7 +1168,7 @@ fn take_frame(
     index: usize,
     frame: TimeSeriesGeneratorData,
     close_timer: &CloseTimer,
-) -> Vec<TimeSeries> {
+) -> Vec<IngestFrame> {
     let id = policy.id;
     match frame {
         TimeSeriesGeneratorData::ReplayEnd { .. } => {
@@ -1254,24 +1257,28 @@ fn warn_if_stalled(windows: &WindowBuilder, id: u32, expected: usize) {
 /// both of which observe genuine connection failures directly. Forcing a
 /// reconnect from a single stream's end would race-kill any sibling streams in
 /// flight.
+// One select loop over every source a runner reacts to keeps their priority
+// order visible in one place.
+#[allow(clippy::too_many_lines)]
 async fn run_policy(
     state: StreamPolicy,
     mut streams: mpsc::UnboundedReceiver<RecvStream>,
-    sender: Sender<TimeSeries>,
+    sender: Sender<IngestFrame>,
     connection_token: CancellationToken,
     coordinator: CancellationCoordinator,
     close_timer: CloseTimer,
 ) -> Result<()> {
+    let run = run_start(&state);
     let StreamPolicy {
         policy,
         token: policy_token,
-        start,
         mut networks,
+        ..
     } = state;
     let id = policy.id;
     let record_type = stream_record(policy.raw_event_kind)?;
     let expected = policy.sensors.len();
-    let mut windows = WindowBuilder::try_new(&policy, start, expected)?;
+    let mut windows = WindowBuilder::try_new(&policy, run, expected)?;
     let mut readers = JoinSet::new();
     // The frames of each opened stream, by stream index; `None` once ended.
     let mut frames: Vec<Option<mpsc::Receiver<TimeSeriesGeneratorData>>> =
@@ -1370,10 +1377,20 @@ async fn run_policy(
     result
 }
 
-/// Hands a window to the ingest control, which queues it to the policy's
-/// ingest sender. Windows never bypass the control: one written directly to a
-/// cached sender could overtake an earlier one still queued there.
-async fn write_window(send_channel: &Sender<TimeSeries>, series: TimeSeries) -> Result<()> {
+/// Returns how the run of the request `state` was taken for starts.
+fn run_start(state: &StreamPolicy) -> RunStart {
+    RunStart {
+        start: state.start,
+        resumed: state.resumed,
+        generation: state.generation,
+    }
+}
+
+/// Hands an ingest frame to the ingest control, which queues it to the
+/// policy's ingest sender. Frames never bypass the control: one written
+/// directly to a cached sender could overtake an earlier one still queued
+/// there.
+async fn write_window(send_channel: &Sender<IngestFrame>, series: IngestFrame) -> Result<()> {
     send_channel.send(series).await?;
     Ok(())
 }
@@ -1386,10 +1403,14 @@ async fn write_window(send_channel: &Sender<TimeSeries>, series: TimeSeries) -> 
 /// it, and queues it here before it takes the next. A corrected window thus
 /// follows the write it replaces on the same QUIC stream; a second sender
 /// would carry it on another stream, which Giganto could store first.
-async fn queue_to_ingest_sender(series: TimeSeries) -> Result<(), TimeSeries> {
+async fn queue_to_ingest_sender(series: IngestFrame) -> Result<(), IngestFrame> {
     // Clone the sender out of the lock to avoid holding the RwLock read
     // guard across an await point.
-    let cached_sender = INGEST_CHANNEL.read().await.get(&series.policy_id).cloned();
+    let cached_sender = INGEST_CHANNEL
+        .read()
+        .await
+        .get(&series.policy_id())
+        .cloned();
     let Some(sender) = cached_sender else {
         return Err(series);
     };
@@ -1402,9 +1423,9 @@ async fn queue_to_ingest_sender(series: TimeSeries) -> Result<(), TimeSeries> {
 /// Installs a new queue as the ingest sender of policy `policy_id`,
 /// replacing a closed one. The ingest control installs it before it takes the
 /// next window, so that window finds it.
-async fn register_ingest_queue(policy_id: u32) -> Receiver<TimeSeries> {
+async fn register_ingest_queue(policy_id: u32) -> Receiver<IngestFrame> {
     let (send_channel, recv_channel) =
-        async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
+        async_channel::bounded::<IngestFrame>(TIME_SERIES_CHANNEL_SIZE);
     INGEST_CHANNEL.write().await.insert(policy_id, send_channel);
     recv_channel
 }
@@ -1444,13 +1465,13 @@ async fn policy_token_for_series(
 async fn spawn_time_series_sender(
     coordinator: &CancellationCoordinator,
     connection: Arc<Connection>,
-    series: TimeSeries,
+    series: IngestFrame,
     policy_token: CancellationToken,
     connection_lifecycle: ConnectionLifecycle,
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
 ) {
-    let policy_id = series.policy_id;
+    let policy_id = series.policy_id();
     let recv_channel = register_ingest_queue(policy_id).await;
     let error_notify = connection_notify.clone();
     let task_coordinator = coordinator.clone();
@@ -1475,20 +1496,20 @@ async fn spawn_time_series_sender(
     coordinator.tracker().spawn(tracked);
 }
 
-/// Writes `series` and then every window queued to `recv_channel`, the queue
+/// Writes `series` and then every frame queued to `recv_channel`, the queue
 /// [`register_ingest_queue`] installed for the policy, on one QUIC stream.
 #[allow(clippy::too_many_arguments)]
 async fn send_time_series(
     connection: Arc<Connection>,
-    series: TimeSeries,
-    recv_channel: Receiver<TimeSeries>,
+    series: IngestFrame,
+    recv_channel: Receiver<IngestFrame>,
     policy_token: CancellationToken,
     connection_lifecycle: ConnectionLifecycle,
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
-    let policy_id = series.policy_id;
+    let policy_id = series.policy_id();
 
     let result = async {
         let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else {
@@ -1498,7 +1519,7 @@ async fn send_time_series(
         // First data transmission (record type + series data)
         send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
 
-        send_time_series_record(&mut series_sender, &series).await?;
+        send_ingest_frame(&mut series_sender, &series).await?;
 
         // Receive start time of giganto last saved time series.
         let receiver = connection_lifecycle
@@ -1529,7 +1550,7 @@ async fn send_time_series(
                             biased;
                             result = recv_channel.recv() => {
                                 let Ok(series) = result else { break };
-                                send_time_series_record(&mut series_sender, &series).await?;
+                                send_ingest_frame(&mut series_sender, &series).await?;
                             }
                             () = connection_lifecycle.token.cancelled() => break,
                             _ = connection.closed() => break,
@@ -1552,7 +1573,7 @@ async fn send_time_series(
                 result = recv_channel.recv() => {
                     match result {
                         Ok(series) => {
-                            send_time_series_record(&mut series_sender, &series).await?;
+                            send_ingest_frame(&mut series_sender, &series).await?;
                         }
                         Err(_) => break,
                     }
@@ -1582,16 +1603,21 @@ async fn send_time_series(
     result
 }
 
-async fn send_time_series_record(
-    series_sender: &mut SendStream,
-    series: &TimeSeries,
-) -> Result<()> {
-    let serde_series = bincode::serialize(series)?;
-    let timestamp_nanos = series
-        .start_secs
-        .checked_mul(time_series::SECOND_TO_NANO)
-        .unwrap_or(i64::MAX);
-    send_event_in_batch(series_sender, &[(timestamp_nanos, serde_series)]).await
+/// Sends every row of `frame`, keyed by its window start in nanoseconds, in
+/// one time-series ingest frame, which Giganto stores with one write.
+async fn send_ingest_frame(series_sender: &mut SendStream, frame: &IngestFrame) -> Result<()> {
+    let events = frame
+        .rows()
+        .iter()
+        .map(|row| {
+            let timestamp_nanos = row
+                .start_secs
+                .checked_mul(time_series::SECOND_TO_NANO)
+                .unwrap_or(i64::MAX);
+            Ok((timestamp_nanos, bincode::serialize(row)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    send_event_in_batch(series_sender, &events).await
 }
 
 async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -> Result<()> {

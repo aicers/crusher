@@ -7,7 +7,7 @@ use review_protocol::types::{ConnField, Measure, RawEventKind as PolicyRawEventK
 use tokio::time::{Duration, Instant};
 
 use super::{SECS_PER_MINUTE, new_policy};
-use crate::subscribe::time_series::{PassClock, SECOND_TO_NANO, WindowBuilder};
+use crate::subscribe::time_series::{PassClock, RunStart, SECOND_TO_NANO, WindowBuilder};
 use crate::subscribe::{
     Bootp, Conn, DceRpc, Dhcp, Dns, Event, Ftp, Http, Icmp, Kerberos, Ldap, MalformedDns, Mqtt,
     Nfs, Ntlm, Radius, Rdp, RequestStreamRecord, Smb, Smtp, Ssh, Tls, stream_record,
@@ -428,7 +428,12 @@ fn closed_window(
 ) -> Vec<f64> {
     const WINDOW_START: i64 = 1_700_000_000 / 3600 * 3600;
     let record = stream_record(policy.raw_event_kind).unwrap();
-    let mut builder = WindowBuilder::try_new(policy, 0, 1).unwrap();
+    let run = RunStart {
+        start: 0,
+        resumed: false,
+        generation: None,
+    };
+    let mut builder = WindowBuilder::try_new(policy, run, 1).unwrap();
     let stream = builder.open_stream().unwrap();
     let clock = PassClock {
         wall_secs: i64::MIN,
@@ -452,7 +457,10 @@ fn closed_window(
     let [window] = written.as_slice() else {
         panic!("an event past the window's grace closes the window: {written:?}");
     };
-    window.series.clone()
+    let [row] = window.rows() else {
+        panic!("an ungrouped window is one row: {window:?}");
+    };
+    row.series.clone()
 }
 
 fn hourly_policy(

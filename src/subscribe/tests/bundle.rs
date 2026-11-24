@@ -4,6 +4,7 @@
 //! stored events, its replay-end frame and its realtime events, when the test
 //! needs them.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use giganto_client::frame::{send_bytes, send_raw};
@@ -21,11 +22,12 @@ use tokio::time::{Duration, Instant, timeout};
 
 use super::{
     BASE_TS_NANOS, BASE_WINDOW_START_NANOS, DAY_NANOS, FakeGigantoServer, HOST, PublishBehavior,
-    TEST_TIMEOUT, cert_key, gen_conn, join_test_task, new_policy, setup_request_client,
+    RECONNECT_TEST_TIMEOUT, TEST_TIMEOUT, cert_key, gen_conn, join_test_task, new_policy,
+    setup_request_client,
 };
 use crate::cancellation::CancellationCoordinator;
 use crate::policy::PolicyHandle;
-use crate::subscribe::time_series::{CLOSE_GRACE_SECS, SECOND_TO_NANO, TimeSeries};
+use crate::subscribe::time_series::{CLOSE_GRACE_SECS, IngestFrame, SECOND_TO_NANO, TimeSeries};
 use crate::subscribe::{
     CloseTimer, Conn, REQUIRED_GIGANTO_VERSION, RequestStreamRecord,
     RequestTimeSeriesGeneratorStream, client, publish_connection_control,
@@ -86,7 +88,10 @@ struct Bundle {
     actor: JoinHandle<anyhow::Result<()>>,
     handle: PolicyHandle,
     requests: async_channel::Receiver<Request>,
-    series: async_channel::Receiver<TimeSeries>,
+    series: async_channel::Receiver<IngestFrame>,
+    /// The rows of a frame [`Self::next_window`] took that it has not yet
+    /// returned.
+    pending: Mutex<VecDeque<TimeSeries>>,
     control: JoinHandle<anyhow::Result<()>>,
     server: JoinHandle<()>,
     shutdown: Arc<Notify>,
@@ -146,6 +151,7 @@ impl Bundle {
             handle,
             requests,
             series,
+            pending: Mutex::new(VecDeque::new()),
             control,
             server,
             shutdown,
@@ -180,14 +186,39 @@ impl Bundle {
         streams
     }
 
+    /// Returns the next row written, whether or not it shares its frame.
     async fn next_window(&self) -> TimeSeries {
+        if let Some(row) = self.lock_pending().pop_front() {
+            return row;
+        }
+        let mut rows = self.next_frame().await.into_rows().into_iter();
+        let row = rows.next().expect("a frame has a row");
+        self.lock_pending().extend(rows);
+        row
+    }
+
+    /// Returns the rows of the next frame written.
+    async fn next_frame(&self) -> IngestFrame {
+        assert!(
+            self.lock_pending().is_empty(),
+            "the rows of the previous frame were taken"
+        );
         timeout(TEST_TIMEOUT, self.series.recv())
             .await
             .expect("a window is written before the test deadline")
             .expect("the written-window channel stays open")
     }
 
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, VecDeque<TimeSeries>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     async fn assert_no_window(&self, why: &str) {
+        if let Some(row) = self.lock_pending().pop_front() {
+            panic!("{why}: {row:?}");
+        }
         if let Ok(written) = timeout(QUIET, self.series.recv()).await {
             panic!("{why}: {written:?}");
         }
@@ -748,18 +779,39 @@ fn by_source(mut policy: TimeSeriesGenerationPolicy, hosts: &[&str]) -> TimeSeri
     policy
 }
 
-/// Returns the id, the window start and the total of each written series.
+/// Returns the id, the window start and the total of each row a grouped
+/// policy wrote, without its last element, the generation: for an IP row the
+/// total of its slots, and for a marker the number of IP rows.
 fn summary(written: &[TimeSeries]) -> Vec<(&str, i64, f64)> {
     written
         .iter()
         .map(|series| {
+            let (_, values) = series
+                .series
+                .split_last()
+                .expect("a row ends with its generation");
             (
                 series.time_series_id.as_str(),
                 series.start_secs,
-                series.series.iter().sum(),
+                values.iter().sum(),
             )
         })
         .collect()
+}
+
+/// Returns the generation every row of `written` ends with, which is one.
+fn generation_of(written: &[TimeSeries]) -> f64 {
+    let generation = *written
+        .first()
+        .and_then(|series| series.series.last())
+        .expect("a row ends with its generation");
+    assert!(
+        written
+            .iter()
+            .all(|series| series.series.last() == Some(&generation)),
+        "one generation: {written:?}"
+    );
+    generation
 }
 
 /// A grouped two-sensor policy adds both streams' events of one IP into the
@@ -788,7 +840,7 @@ async fn grouped_bundle_writes_every_ip_of_a_window_together() {
     second.conn(past_grace(0), EXTERNAL, EXTERNAL).await;
 
     let mut written = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         written.push(bundle.next_window().await);
     }
     let start = window_start_secs(0);
@@ -798,8 +850,11 @@ async fn grouped_bundle_writes_every_ip_of_a_window_together() {
             ("1/10.0.0.1", start, 2.0),
             ("1/10.0.0.10", start, 1.0),
             ("1/10.0.0.9", start, 1.0),
-        ]
+            ("1", start, 3.0),
+        ],
+        "the IP rows in series-id order, then the marker"
     );
+    assert!(generation_of(&written) > 0.0);
     assert_eq!(written[0].series[0], 2.0, "both streams in the same slot");
     assert!(written.iter().all(|series| series.policy_id == POLICY_ID));
     bundle.assert_no_window("no row for an external IP").await;
@@ -825,8 +880,11 @@ async fn internal_network_change_applies_from_the_next_window_without_a_restart(
     // is in window 1.
     stream.conn(past_grace(0), "10.0.0.1", EXTERNAL).await;
     assert_eq!(
-        summary(&[bundle.next_window().await]),
-        [("1/10.0.0.1", window_start_secs(0), 1.0)]
+        summary(&[bundle.next_window().await, bundle.next_window().await]),
+        [
+            ("1/10.0.0.1", window_start_secs(0), 1.0),
+            ("1", window_start_secs(0), 1.0),
+        ]
     );
 
     let mut changed = policy;
@@ -840,11 +898,9 @@ async fn internal_network_change_applies_from_the_next_window_without_a_restart(
     assert_eq!(
         bundle
             .handle
-            .stream_policy(POLICY_ID)
+            .get_policy(POLICY_ID)
             .await
             .unwrap()
-            .unwrap()
-            .policy
             .internal_networks,
         changed.internal_networks,
         "a later request starts with the new network"
@@ -856,12 +912,17 @@ async fn internal_network_change_applies_from_the_next_window_without_a_restart(
     stream.conn(in_window(2, 5), "10.0.0.2", EXTERNAL).await;
     stream.conn(in_window(2, 6), "10.0.0.1", EXTERNAL).await;
     stream.conn(past_grace(2), EXTERNAL, EXTERNAL).await;
-    let written = [bundle.next_window().await, bundle.next_window().await];
+    let mut written = Vec::new();
+    for _ in 0..4 {
+        written.push(bundle.next_window().await);
+    }
     assert_eq!(
         summary(&written),
         [
             ("1/10.0.0.1", window_start_secs(1), 2.0),
+            ("1", window_start_secs(1), 1.0),
             ("1/10.0.0.2", window_start_secs(2), 1.0),
+            ("1", window_start_secs(2), 1.0),
         ]
     );
     bundle
@@ -871,5 +932,93 @@ async fn internal_network_change_applies_from_the_next_window_without_a_restart(
         bundle.requests.try_recv().is_err(),
         "no new stream request is sent"
     );
+    bundle.finish().await;
+}
+
+/// A Publish connection lost without a process restart requests the policy
+/// again from its checkpoint with a greater generation, and the new run
+/// rewrites the checkpoint window with it.
+#[serial]
+#[tokio::test]
+async fn reconnect_rewrites_from_the_checkpoint_with_a_new_generation() {
+    let policy = by_source(new_policy(POLICY_ID), &["10.0.0.1"]);
+    let bundle = Bundle::start(policy, Some(BASE_WINDOW_START_NANOS), event_time_only()).await;
+    let mut generations = Vec::new();
+    let mut previous: Option<Connection> = None;
+    for _ in 0..2 {
+        let (connection, requests) = timeout(RECONNECT_TEST_TIMEOUT, bundle.requests(1))
+            .await
+            .expect("the policy is requested again after the connection loss");
+        if let Some(previous) = &previous {
+            assert_ne!(connection.stable_id(), previous.stable_id());
+        }
+        let [(_, _, request)] = requests.as_slice() else {
+            panic!("one request");
+        };
+        assert_eq!(
+            request.start, BASE_WINDOW_START_NANOS,
+            "from the checkpoint"
+        );
+        let mut stream = GigantoStream::open(&connection, POLICY_ID).await;
+        stream.conn(in_window(0, 5), "10.0.0.1", EXTERNAL).await;
+        stream.conn(past_grace(0), EXTERNAL, EXTERNAL).await;
+        let written = [bundle.next_window().await, bundle.next_window().await];
+        assert_eq!(
+            summary(&written),
+            [
+                ("1/10.0.0.1", window_start_secs(0), 1.0),
+                ("1", window_start_secs(0), 1.0),
+            ]
+        );
+        generations.push(generation_of(&written));
+        connection.close(0u32.into(), b"simulate Giganto connection loss");
+        previous = Some(connection);
+    }
+    assert!(
+        generations[1] > generations[0],
+        "a new generation: {generations:?}"
+    );
+    bundle.finish().await;
+}
+
+/// A grouped window without IP rows stays open, and the window with IP rows
+/// after it waits, while both streams pass it only by the idle rule. Once
+/// one stream's event passes it, it closes with `[0, generation]`, and the
+/// next window, which has IP rows, then closes by the idle rule.
+#[serial]
+#[tokio::test]
+async fn empty_grouped_window_waits_for_an_event_past_it() {
+    let policy = by_source(bundle_policy(), &["10.0.0.1"]);
+    let bundle = Bundle::start(policy, Some(BASE_WINDOW_START_NANOS), wall_clock_far_past()).await;
+    let mut streams = bundle.open_streams(2).await;
+    let [first, second] = streams.as_mut_slice() else {
+        panic!("two streams open");
+    };
+    first.conn(in_window(0, 5), EXTERNAL, EXTERNAL).await;
+    first.conn(in_window(1, 5), "10.0.0.1", EXTERNAL).await;
+    second.conn(in_window(0, 10), EXTERNAL, EXTERNAL).await;
+    first.replay_end().await;
+    second.replay_end().await;
+    bundle
+        .assert_no_window("both streams pass the empty window only by the idle rule")
+        .await;
+
+    second.conn(past_grace(0), EXTERNAL, EXTERNAL).await;
+    let mut written = Vec::new();
+    for _ in 0..3 {
+        written.push(bundle.next_window().await);
+    }
+    assert_eq!(
+        summary(&written),
+        [
+            ("1", window_start_secs(0), 0.0),
+            ("1/10.0.0.1", window_start_secs(1), 1.0),
+            ("1", window_start_secs(1), 1.0),
+        ]
+    );
+    generation_of(&written);
+    bundle
+        .assert_no_window("the next empty window is passed only by the idle rule")
+        .await;
     bundle.finish().await;
 }

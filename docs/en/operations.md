@@ -83,8 +83,10 @@ every sensor of the policy has passed the window's end:
   Sensor batch, corrects that window: Crusher writes it once more, replacing
   the earlier write. An event older than the last written window is dropped,
   and Crusher logs a warning with the number of events dropped.
-- A window without events is never written: a reader sees a gap, not a row of
-  zeros.
+- An ungrouped policy never writes a window without events: a reader sees a
+  gap, not a row of zeros. A grouped policy writes a marker for such a window
+  instead (see [Window Markers and Write
+  Generations](#window-markers-and-write-generations)).
 - A window still in progress is not written. When Crusher stops, reconnects,
   or a policy stops, the window in progress is discarded; when the policy runs
   again, Crusher rebuilds it from the events the Data Store holds and writes
@@ -113,8 +115,9 @@ of its IPs follow the rules above together:
   grouped by destination by its destination address. The series of an IP has
   the ID `P/IP`, the policy ID and the IP as written in the usual notation:
   `42/10.100.0.5` or `42/2001:db8::1`. An IPv4 address and the IPv4-mapped
-  IPv6 address of it are different IPs. A grouped policy writes nothing under
-  its own ID `P`; an ungrouped policy writes its single series under `P`.
+  IPv6 address of it are different IPs. A grouped policy writes only the
+  markers of its windows under its own ID `P` (see below); an ungrouped
+  policy writes its single series under `P`.
 - An event counts only if the IP on the grouping side is in the policy's
   internal network: it is one of its hosts, or lies in one of its networks or
   ranges. An event with an external IP on that side writes no series, but
@@ -149,6 +152,48 @@ of its IPs follow the rules above together:
   window is due in which such IPs were refused, Crusher logs a warning with
   the policy ID and the number of refused IPs. When the policy's streams are
   requested again, the IPs are taken anew from the replayed events.
+
+## Window Markers and Write Generations
+
+A grouped policy marks each window it writes as complete, so that a reader can
+tell whether it sees every IP row of the window or only those stored so far.
+An ungrouped policy writes no marker and no generation.
+
+- Every IP row of a grouped policy ends with one element after its slot
+  values: the write generation of the run that wrote it.
+- After all IP rows of a window, on the same stream, Crusher writes the
+  window's marker under the policy's own ID `P`, at the window's start. It
+  holds two values: the number of IP rows of the window, and the generation.
+  The Data Store stores a policy's rows in the order Crusher sends them, so
+  once the marker is visible, every IP row before it is visible too. A reader
+  takes only the IP rows of the marker's generation.
+- Crusher fixes a new generation each time it requests the policy's streams:
+  at startup, when the policy changes or returns to the policy list, and when
+  it reconnects to the Data Store. The generation is the clock at the request
+  in Unix milliseconds, or one more than the policy's previous generation if
+  that is larger, so it always grows, also across restarts and a clock set
+  back. Crusher stores it in the `last_timestamp_data` file before it writes
+  any row of it.
+- A grouped policy closes every window, including one in which no IP was
+  counted, such as a window whose internal network is empty, and writes the
+  marker `[0, generation]` for it. Such a window closes only once a stream of
+  the policy has delivered an event more than 900 seconds past its end: quiet
+  streams past their replay end do not close it, and the later windows wait
+  behind it. Windows close in time order. A new policy writes no marker for
+  the windows before the one of the first event it receives.
+- When Crusher requests the policy's streams again, it rewrites the window
+  where the policy resumes and every later one with the new generation: the
+  IP rows first, then the new marker. An IP the new run no longer counts
+  there, for example after a change to the internal network, gets no new row.
+  Its earlier row stays in the Data Store with its earlier generation, which
+  the new marker excludes. A window that now has no IP rows gets
+  `[0, generation]`.
+- An event that arrives after its window's marker was written corrects the
+  row of its IP with the same generation and does not write the marker again.
+  For an IP without a row in the window, Crusher writes the new row and the
+  marker counting it, `[n + 1, generation]`, together in one write. When the
+  next window closes, Crusher logs a warning with the policy ID and the number
+  of IP rows corrected or added after their marker since the previous close.
 
 ## Items to Check After Startup
 

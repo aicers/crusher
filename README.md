@@ -75,18 +75,25 @@ In the configuration file, you can specify the following options:
 
 <!-- markdownlint-disable MD013 -->
 
-| Field                      | Description                                                                                   | Required | Default |
-| -------------------------- | --------------------------------------------------------------------------------------------- | -------- | ------- |
-| `giganto_name`             | Name of the Giganto server                                                                    | Yes      | -       |
-| `giganto_ingest_srv_addr`  | Giganto's ingest IP address and port number                                                   | Yes      | -       |
-| `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                                  | Yes      | -       |
-| `last_timestamp_data`      | JSON file that stores the timestamp of the last time series per time-series generation policy | Yes      | -       |
+| Field                      | Description                                                                                     | Required | Default |
+| -------------------------- | ----------------------------------------------------------------------------------------------- | -------- | ------- |
+| `giganto_name`             | Name of the Giganto server                                                                      | Yes      | -       |
+| `giganto_ingest_srv_addr`  | Giganto's ingest IP address and port number                                                     | Yes      | -       |
+| `giganto_publish_srv_addr` | Giganto's publish IP address and port number                                                    | Yes      | -       |
+| `last_timestamp_data`      | JSON file that stores each time-series generation policy's resume position and write generation | Yes      | -       |
 
 <!-- markdownlint-enable MD013 -->
 
 - `giganto_name`, `giganto_publish_srv_addr`, and `giganto_ingest_srv_addr`
   are required.
 - `giganto_name`: This must match with the DNS name in the certificate.
+- `last_timestamp_data`: for each policy ID, an object with `timestamp`, the
+  start of the last acknowledged window in Unix nanoseconds, where the policy
+  resumes, and `generation`, the write generation of the policy's latest
+  stream request in Unix milliseconds, which a grouped policy's rows carry.
+  Deleting a policy removes its `timestamp` and keeps its `generation`. Only
+  crusher writes this file: do not edit it by hand. A file in the form an
+  earlier crusher wrote is rejected at startup.
 - Logging: crusher writes its log to standard output; `RUST_LOG` sets the level
   (default `info`); when standard output or standard error is connected to the
   systemd journal (`JOURNAL_STREAM`), each event is one line starting with its
