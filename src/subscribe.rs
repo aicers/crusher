@@ -1366,6 +1366,11 @@ async fn run_policy(
     // Not cancelled when the runner stops: the frames it has written stay
     // the request's, written in order behind its earlier ones.
     let request = policy_token.child_token();
+    let handoff = HandoffStop {
+        request: &request,
+        connection: &connection_token,
+        coordinator: &coordinator,
+    };
     let record_type = stream_record(policy.raw_event_kind)?;
     let expected = policy.sensors.len();
     let mut windows = WindowBuilder::try_new(&policy, run, expected)?;
@@ -1456,16 +1461,13 @@ async fn run_policy(
                                 frame,
                                 &close_timer,
                             );
-                            for series in written {
-                                write_window(&sender, series.of_run(&request)).await?;
-                            }
+                            write_windows(&sender, written, &request, &handoff).await?;
                         }
                     }
                 }
                 _ = check.tick() => {
-                    for series in windows.close_due(&close_timer.pass_clock()) {
-                        write_window(&sender, series.of_run(&request)).await?;
-                    }
+                    let due = windows.close_due(&close_timer.pass_clock());
+                    write_windows(&sender, due, &request, &handoff).await?;
                 }
             }
         }
@@ -1485,12 +1487,67 @@ fn run_start(state: &StreamPolicy) -> RunStart {
     }
 }
 
-/// Hands an ingest frame to the ingest control, which queues it to the
-/// policy's ingest sender. Frames never bypass the control: one written
-/// directly to a cached sender could overtake an earlier one still queued
-/// there.
-async fn write_window(send_channel: &Sender<IngestFrame>, series: IngestFrame) -> Result<()> {
-    send_channel.send(series).await?;
+/// What stops a runner's handoff of its frames to the ingest control.
+struct HandoffStop<'a> {
+    /// The request the runner writes for.
+    request: &'a CancellationToken,
+    /// The lifecycle token of the Publish connection the request was sent on.
+    connection: &'a CancellationToken,
+    coordinator: &'a CancellationCoordinator,
+}
+
+impl HandoffStop<'_> {
+    /// Resolves once the runner is to stop: its request stopped, or its
+    /// Publish connection is being replaced while crusher is not shutting
+    /// down.
+    ///
+    /// At shutdown the Publish connection is drained too, but the ingest
+    /// control keeps taking frames until every runner has dropped its
+    /// sender, so a blocked handoff completes and the frame is written. A
+    /// reconnect gives no such guarantee: the ingest control waits there,
+    /// without taking frames, until Giganto has stored what the replaced
+    /// connection carried, for as long as that takes, while the Publish
+    /// connection's drain allows its runners only
+    /// [`CONNECTION_DRAIN_TIMEOUT`] to stop.
+    async fn stopped(&self) {
+        let replaced = async {
+            self.connection.cancelled().await;
+            if self.coordinator.is_cancelled() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            () = self.request.cancelled() => {}
+            () = replaced => {}
+        }
+    }
+}
+
+/// Hands `frames`, which the runner of `request` wrote, in order to the
+/// ingest control, which queues each to the policy's ingest sender. Frames
+/// never bypass the control: one written directly to a cached sender could
+/// overtake an earlier one still queued there.
+///
+/// Once `handoff` says the runner is to stop, the frame being handed and
+/// every later one are dropped, and the runner's own select then stops it.
+/// What was handed is a prefix of the frames in the order written, so no
+/// marker is handed without the rows it counts. A window handed only in part
+/// is the latest the run wrote to, as a runner writes no frame of a window
+/// once a later one has closed, so no ACK has moved the policy's checkpoint
+/// past it and the next request rewrites it.
+async fn write_windows(
+    send_channel: &Sender<IngestFrame>,
+    frames: Vec<IngestFrame>,
+    request: &CancellationToken,
+    handoff: &HandoffStop<'_>,
+) -> Result<()> {
+    for frame in frames {
+        tokio::select! {
+            biased;
+            () = handoff.stopped() => return Ok(()),
+            result = send_channel.send(frame.of_run(request)) => result?,
+        }
+    }
     Ok(())
 }
 

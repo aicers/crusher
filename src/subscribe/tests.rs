@@ -2469,6 +2469,234 @@ async fn failed_sender_drops_the_rest_of_its_request() {
     INGEST_CHANNEL.write().await.clear();
 }
 
+/// A reconnect waits, without taking frames from the runners, for Giganto to
+/// store a frame of the replaced ingest connection, which it holds beyond
+/// [`CONNECTION_DRAIN_TIMEOUT`] with the connection up. Meanwhile a runner
+/// on the Publish connection that the reconnect replaces closes a window of
+/// two IP rows and a marker through a queue of the production capacity: the
+/// first row fills the queue, and the runner is blocked handing the second.
+/// The runner still stops within the Publish connection's drain, dropping
+/// the rest of the window, so the Publish control reconnects instead of
+/// failing. Once the frame is stored, the ingest reconnect completes, and
+/// the next request rewrites the window with a new generation, its rows
+/// before its marker.
+#[serial]
+#[tokio::test]
+async fn runner_blocked_on_a_reconnect_waiting_for_storage_stops_with_its_connection() {
+    INGEST_CHANNEL.write().await.clear();
+    let w0 = BASE_WINDOW_START_NANOS;
+    let (stored_send, stored) = async_channel::unbounded();
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let ingest_shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::HoldFirstStore {
+            received: received.clone(),
+            release: release.clone(),
+            pending: Arc::new(AtomicBool::new(true)),
+        })
+        .start_ingest(ingest_shutdown.clone());
+    let publish_shutdown = Arc::new(Notify::new());
+    let (publish_addr, publish_handle) = FakeGigantoServer::new_publish()
+        .with_publish_behavior(PublishBehavior::Records(
+            vec![
+                conn_from(BASE_TS_NANOS, IP_A),
+                conn_from(BASE_TS_NANOS + 1, IP_B),
+                // Passes w0, which closes with two IP rows and its marker.
+                conn_from(BASE_TS_NANOS + DAY_NANOS, EXTERNAL_IP),
+            ]
+            .into(),
+        ))
+        .start_publish(publish_shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("timestamps.json");
+    let (policy_handle, actor_task) = spawn_policy_actor(path.clone(), &coordinator)
+        .await
+        .unwrap();
+    policy_handle
+        .replace_policies(vec![grouped_policy()])
+        .await
+        .unwrap();
+    let run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the policy is active");
+
+    let (series_send, series_recv) = async_channel::bounded(TIME_SERIES_CHANNEL_SIZE);
+    let connection_notify = Arc::new(Notify::new());
+    let ingest = tokio::spawn({
+        let endpoint = endpoint.clone();
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        let connection_notify = connection_notify.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                connection_notify,
+                coordinator,
+            )
+            .await
+        }
+    });
+
+    // A frame of the replaced connection, which Giganto receives and holds.
+    let held_row = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
+    series_send
+        .send(
+            IngestFrame::from(TimeSeries {
+                time_series_id: held_row.clone(),
+                policy_id: DEFAULT_POLICY_ID,
+                start_secs: w0 / 1_000_000_000,
+                series: vec![9.0],
+            })
+            .of_run(&run.child_token()),
+        )
+        .await
+        .unwrap();
+    timeout(TEST_TIMEOUT, received.notified())
+        .await
+        .expect("Giganto receives the replaced connection's frame");
+
+    // The ingest control starts the reconnect, which closes the policy's
+    // queue and waits for that frame.
+    connection_notify.notify_one();
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            let closed = INGEST_CHANNEL
+                .read()
+                .await
+                .get(&DEFAULT_POLICY_ID)
+                .is_some_and(|queue| queue.frames.is_closed());
+            if closed {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the ingest control waits for the held frame before reconnecting");
+
+    // The Publish control requests the policy, and its runner closes w0:
+    // the first row fills the queue, which nothing takes, and the runner
+    // blocks handing the second.
+    let mut publish = tokio::spawn({
+        let endpoint = endpoint.clone();
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        let connection_notify = connection_notify.clone();
+        let series_send = series_send.clone();
+        async move {
+            publish_connection_control(
+                series_send,
+                publish_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                connection_notify,
+                coordinator,
+                CloseTimer::new(
+                    || i64::MIN,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                ),
+            )
+            .await
+        }
+    });
+    timeout(TEST_TIMEOUT, async {
+        while !series_send.is_full() {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the runner hands the window's first row");
+    let first_generation = stored_generation(&path);
+
+    // The reconnect signal reaches the Publish control, which drains its
+    // connection; the ingest control is still waiting for Giganto.
+    connection_notify.notify_waiters();
+    let outlast_drain = CONNECTION_DRAIN_TIMEOUT + Duration::from_secs(2);
+    if let Ok(result) = timeout(outlast_drain, &mut publish).await {
+        panic!("the Publish control ended while the reconnect waited for Giganto: {result:?}");
+    }
+    assert!(
+        !ingest.is_finished(),
+        "the ingest reconnect is still pending"
+    );
+    assert!(stored.try_recv().is_err(), "Giganto has stored nothing yet");
+
+    // Giganto stores the held frame; the ingest reconnect completes and
+    // writes what the runners handed it.
+    release.notify_one();
+    let mut writes = Vec::new();
+    for _ in 0..5 {
+        let (timestamp, series) = timeout(RECONNECT_TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("the held frame and the windows handed after it are stored")
+            .unwrap();
+        writes.push((series.time_series_id, timestamp, series.series));
+    }
+    let generation = stored_generation(&path);
+    assert!(
+        generation > first_generation,
+        "the next request has a new generation"
+    );
+    let row_a = format!("{DEFAULT_POLICY_ID}/{IP_A}");
+    let row_b = format!("{DEFAULT_POLICY_ID}/{IP_B}");
+    assert_eq!(
+        writes.first(),
+        Some(&(held_row, w0, vec![9.0])),
+        "the held frame is stored first"
+    );
+    assert_eq!(
+        writes
+            .iter()
+            .skip(1)
+            .map(|(id, timestamp, data)| (id.as_str(), *timestamp, data.last().copied()))
+            .collect::<Vec<_>>(),
+        [
+            (row_a.as_str(), w0, Some(first_generation)),
+            (row_a.as_str(), w0, Some(generation)),
+            (row_b.as_str(), w0, Some(generation)),
+            (DEFAULT_POLICY_ID.to_string().as_str(), w0, Some(generation)),
+        ],
+        "the stopped runner's first row alone, then the next request's rows \
+         and marker"
+    );
+    assert_eq!(
+        writes.last().map(|(_, _, data)| data.as_slice()),
+        Some([2.0, generation].as_slice()),
+        "the marker counts both rows of the next request"
+    );
+
+    coordinator.request_cancellation("blocked runner reconnect test");
+    drop(series_send);
+    join_test_task("Publish control", publish)
+        .await
+        .expect("the Publish control exits cleanly");
+    join_test_task("ingest control", ingest)
+        .await
+        .expect("the ingest control exits cleanly");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    endpoint.close(0u32.into(), &[]);
+    ingest_shutdown.notify_one();
+    publish_shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    publish_handle.await.expect("publish server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
 /// Windows still queued in the ingest control at shutdown are handed to an
 /// ingest sender: the first starts one, and the next is queued behind it.
 #[serial]
