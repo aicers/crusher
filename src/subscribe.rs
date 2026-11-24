@@ -35,7 +35,7 @@ use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarIn
 use review_protocol::types::{
     ConnField, Measure, RawEventKind as PolicyRawEventKind, TimeSeriesGenerationPolicy,
 };
-use time_series::{PassClock, TimeSeries, WindowBuilder};
+use time_series::{IngestFrame, PassClock, RunStart, WindowBuilder};
 use tokio::{
     sync::{Notify, RwLock, mpsc},
     task::JoinSet,
@@ -43,7 +43,7 @@ use tokio::{
         Duration, Instant, MissedTickBehavior, interval, interval_at, sleep, timeout, timeout_at,
     },
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tokio_util::task::TaskTracker as ConnectionTaskTracker;
 use tracing::{info, warn};
 
@@ -57,6 +57,22 @@ pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.28.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a policy's new ingest sender waits for Giganto to store what the
+/// sender it replaces wrote before it fails and signals a reconnect. Shorter
+/// in tests, which hold that storing beyond it.
+const PREVIOUS_STREAM_STORE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(10)
+};
+/// How often a reconnect warns while it still waits for Giganto to store what
+/// the senders on the connection it replaces wrote. Shorter in tests, which
+/// hold that storing for several intervals.
+const STORE_BEFORE_RECONNECT_WARN_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(10)
+};
 
 /// The fewest inbound streams a Publish connection lets Giganto have open at
 /// once: quinn's default, which applied before crusher raised it.
@@ -166,10 +182,39 @@ async fn drain_connection_generation(
     Ok(())
 }
 
-// The ingest queue of each policy's sender, by policy id. Every series of a
+// The ingest queue of each policy's sender, by policy id. Every frame of a
 // policy is written on that one sender's stream.
-static INGEST_CHANNEL: LazyLock<RwLock<HashMap<u32, Sender<TimeSeries>>>> =
+static INGEST_CHANNEL: LazyLock<RwLock<HashMap<u32, IngestQueue>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// The queue of a policy's ingest sender.
+struct IngestQueue {
+    frames: Sender<IngestFrame>,
+    /// The policy token the sender stops on. Once it is cancelled, the sender
+    /// drops whatever is still queued.
+    run: CancellationToken,
+    /// Cancelled once Giganto has stored everything the sender wrote and
+    /// finished its side of the stream, or once the stream can carry nothing
+    /// more (the sender failed or the connection was replaced), and in either
+    /// case only after [`Self::previous`] is cancelled too. The entry stays
+    /// installed until then, so that a sender replacing this one, and a
+    /// reconnect, find it.
+    stored: CancellationToken,
+    /// The [`Self::stored`] of the sender this one replaced, if Giganto had
+    /// not stored its writes yet when this one was installed.
+    previous: Option<CancellationToken>,
+}
+
+/// The receiving end of a policy's ingest queue, as its sender takes it.
+struct QueueRegistration {
+    /// The frames queued to the sender.
+    frames: Receiver<IngestFrame>,
+    /// The sender's [`IngestQueue::stored`].
+    stored: CancellationToken,
+    /// The [`IngestQueue::stored`] of the sender this one replaced, which
+    /// may still have writes on its own stream that Giganto has not stored.
+    previous: Option<CancellationToken>,
+}
 
 /// Returns the Giganto stream kind that carries the raw events of `kind`.
 ///
@@ -412,7 +457,7 @@ impl Client {
         mut actor_task: tokio::task::JoinHandle<Result<()>>,
         coordinator: CancellationCoordinator,
     ) -> Result<()> {
-        let (sender, receiver) = async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
+        let (sender, receiver) = async_channel::bounded::<IngestFrame>(TIME_SERIES_CHANNEL_SIZE);
         let connection_notify = Arc::new(Notify::new());
         let mut connection_controls = Box::pin(async {
             tokio::try_join!(
@@ -548,7 +593,7 @@ impl Client {
 
 #[allow(clippy::too_many_arguments)]
 async fn ingest_connection_control(
-    series_recv: Receiver<TimeSeries>,
+    series_recv: Receiver<IngestFrame>,
     server_addr: SocketAddr,
     server_name: &str,
     endpoint: &Endpoint,
@@ -586,6 +631,7 @@ async fn ingest_connection_control(
                         }
                         () = connection_notify.notified() => {
                             drop(connection_notify);
+                            store_before_reconnect(&arc_conn, &coordinator).await;
                             INGEST_CHANNEL.write().await.clear();
                             drain_connection_generation(
                                 arc_conn.as_ref(),
@@ -600,30 +646,13 @@ async fn ingest_connection_control(
                             continue 'connection;
                         }
                         Ok(series) = series_recv.recv() => {
-                            // Queue behind the policy's live sender to keep its writes in order.
-                            let Err(series) = queue_to_ingest_sender(series).await else {
-                                continue;
-                            };
-                            // Bind the freshly received series to the currently active policy id by
-                            // looking up its `CancellationToken` in a single actor call. If the
-                            // policy is no longer active by the time we dequeue the series, drop it
-                            // instead of spawning another sender task.
-                            let Some(policy_token) = policy_token_for_series(
-                                &policy_handle,
-                                series.policy_id,
-                            )
-                            .await else {
-                                continue;
-                            };
-                            let connection = arc_conn.clone();
-                            spawn_time_series_sender(
-                                &coordinator,
-                                connection,
+                            route_series(
                                 series,
-                                policy_token,
-                                connection_lifecycle.clone(),
-                                policy_handle.clone(),
-                                connection_notify.clone(),
+                                &coordinator,
+                                &arc_conn,
+                                &connection_lifecycle,
+                                &policy_handle,
+                                &connection_notify,
                             )
                             .await;
                         }
@@ -660,6 +689,48 @@ async fn ingest_connection_control(
     }
 }
 
+/// Queues `series` behind its policy's live sender, which keeps the policy's
+/// writes in order, or starts a sender with it. A frame of a replaced request
+/// or a deleted policy is dropped, as its own sender would drop it, rather
+/// than written behind the next run's.
+async fn route_series(
+    series: IngestFrame,
+    coordinator: &CancellationCoordinator,
+    connection: &Arc<Connection>,
+    connection_lifecycle: &ConnectionLifecycle,
+    policy_handle: &PolicyHandle,
+    connection_notify: &Arc<Notify>,
+) {
+    if series.run_stopped() {
+        return;
+    }
+    let Err(series) = queue_to_ingest_sender(series).await else {
+        return;
+    };
+    // Bind the series to the currently active policy by looking up its
+    // `CancellationToken` in a single actor call. If the policy is no longer
+    // active, drop the series instead of spawning another sender task.
+    let Some(policy_token) = policy_token_for_series(policy_handle, series.policy_id()).await
+    else {
+        return;
+    };
+    // A policy token is replaced only after it is cancelled, so a run still
+    // live now is the run of the token just looked up.
+    if series.run_stopped() {
+        return;
+    }
+    spawn_time_series_sender(
+        coordinator,
+        connection.clone(),
+        series,
+        policy_token,
+        connection_lifecycle.clone(),
+        policy_handle.clone(),
+        connection_notify.clone(),
+    )
+    .await;
+}
+
 /// Producers observe the same cancellation as the ingest control and drop
 /// their senders. Keep receiving until the outer queue closes so a series
 /// already queued at the shutdown boundary is still handed to an ingest worker.
@@ -668,7 +739,7 @@ async fn ingest_connection_control(
 /// their queues, so a correction still in the outer queue follows the window
 /// it replaces on that window's stream.
 async fn drain_series_at_shutdown(
-    series_recv: &Receiver<TimeSeries>,
+    series_recv: &Receiver<IngestFrame>,
     coordinator: &CancellationCoordinator,
     connection: &Arc<Connection>,
     connection_lifecycle: &ConnectionLifecycle,
@@ -676,6 +747,9 @@ async fn drain_series_at_shutdown(
     connection_notify: &Arc<Notify>,
 ) {
     while let Ok(series) = series_recv.recv().await {
+        if series.run_stopped() {
+            continue;
+        }
         let Err(series) = queue_to_ingest_sender(series).await else {
             continue;
         };
@@ -721,7 +795,7 @@ fn classify_stream_error(err: &anyhow::Error) -> Option<StreamRecoveryAction> {
 
 #[allow(clippy::too_many_arguments)]
 async fn publish_connection_control(
-    series_send: Sender<TimeSeries>,
+    series_send: Sender<IngestFrame>,
     server_addr: SocketAddr,
     server_name: &str,
     endpoint: &Endpoint,
@@ -746,6 +820,7 @@ async fn publish_connection_control(
                     lifecycle: lifecycle.clone(),
                     coordinator: coordinator.clone(),
                     close_timer: close_timer.clone(),
+                    connection_notify: connection_notify.clone(),
                 };
                 let dispatcher = lifecycle.tasks.track_future(run_inbound_dispatcher(
                     conn.clone(),
@@ -860,10 +935,12 @@ impl PublishRequests {
 
 /// What a Publish connection starts each policy's runner with.
 struct PolicyRunners {
-    series: Sender<TimeSeries>,
+    series: Sender<IngestFrame>,
     lifecycle: ConnectionLifecycle,
     coordinator: CancellationCoordinator,
     close_timer: CloseTimer,
+    /// The reconnect signal, which a runner whose request lost a write gives.
+    connection_notify: Arc<Notify>,
 }
 
 impl PolicyRunners {
@@ -875,6 +952,7 @@ impl PolicyRunners {
         let connection_token = self.lifecycle.token.clone();
         let coordinator = self.coordinator.clone();
         let close_timer = self.close_timer.clone();
+        let connection_notify = self.connection_notify.clone();
         let policy_id = state.policy.id;
         let runner = self.lifecycle.tasks.track_future(async move {
             if let Err(e) = run_policy(
@@ -884,6 +962,7 @@ impl PolicyRunners {
                 connection_token,
                 coordinator,
                 close_timer,
+                connection_notify,
             )
             .await
             {
@@ -897,7 +976,10 @@ impl PolicyRunners {
 
 /// Watches current state rather than replaying queued add events. Each connection
 /// sends a policy's requests once, including requests still waiting for an
-/// inbound stream, and starts the policy's runner as it sends them.
+/// inbound stream, and starts the policy's runner as it sends them. Taking the
+/// policy's view for its requests fixes the write generation of a grouped
+/// policy's run, which is on disk before the requests are written; if that
+/// fails, nothing is requested and the error ends the Publish control.
 ///
 /// A policy whose token was cancelled after its requests went out (deleted,
 /// absent from a list, or replaced with new content) is requested again only
@@ -1157,7 +1239,7 @@ fn next_frame<'a>(
 }
 
 /// Applies a frame that stream `index` of `policy` received to its windows, and
-/// returns the windows to write, in order.
+/// returns the ingest frames to write, in order.
 fn take_frame(
     windows: &mut WindowBuilder,
     policy: &TimeSeriesGenerationPolicy,
@@ -1165,7 +1247,7 @@ fn take_frame(
     index: usize,
     frame: TimeSeriesGeneratorData,
     close_timer: &CloseTimer,
-) -> Vec<TimeSeries> {
+) -> Vec<IngestFrame> {
     let id = policy.id;
     match frame {
         TimeSeriesGeneratorData::ReplayEnd { .. } => {
@@ -1248,30 +1330,50 @@ fn warn_if_stalled(windows: &WindowBuilder, id: u32, expected: usize) {
 /// windows not yet closed without writing them: they are not complete, and the
 /// resume rebuilds them from the events Giganto stores.
 ///
+/// Every frame the runner writes carries a token of this request alone, a
+/// child of the policy token. An ingest sender that drops a frame unwritten
+/// cancels it, and every later frame of the request is then dropped as well,
+/// so that no marker is stored without a row it counts. The runner then stops
+/// and signals a reconnect, whose request of the policy rewrites its windows
+/// from the checkpoint with a new generation.
+///
 /// A stream that ends passes no further window, so the policy's windows stop
 /// closing until the next request. Reconnection is driven by `conn.closed()`
 /// in `publish_connection_control` and by `accept_uni()` in the dispatcher,
 /// both of which observe genuine connection failures directly. Forcing a
 /// reconnect from a single stream's end would race-kill any sibling streams in
 /// flight.
+// One select loop over every source a runner reacts to keeps their priority
+// order visible in one place.
+#[allow(clippy::too_many_lines)]
 async fn run_policy(
     state: StreamPolicy,
     mut streams: mpsc::UnboundedReceiver<RecvStream>,
-    sender: Sender<TimeSeries>,
+    sender: Sender<IngestFrame>,
     connection_token: CancellationToken,
     coordinator: CancellationCoordinator,
     close_timer: CloseTimer,
+    connection_notify: Arc<Notify>,
 ) -> Result<()> {
+    let run = run_start(&state);
     let StreamPolicy {
         policy,
         token: policy_token,
-        start,
         mut networks,
+        ..
     } = state;
     let id = policy.id;
+    // Not cancelled when the runner stops: the frames it has written stay
+    // the request's, written in order behind its earlier ones.
+    let request = policy_token.child_token();
+    let handoff = HandoffStop {
+        request: &request,
+        connection: &connection_token,
+        coordinator: &coordinator,
+    };
     let record_type = stream_record(policy.raw_event_kind)?;
     let expected = policy.sensors.len();
-    let mut windows = WindowBuilder::try_new(&policy, start, expected)?;
+    let mut windows = WindowBuilder::try_new(&policy, run, expected)?;
     let mut readers = JoinSet::new();
     // The frames of each opened stream, by stream index; `None` once ended.
     let mut frames: Vec<Option<mpsc::Receiver<TimeSeriesGeneratorData>>> =
@@ -1301,6 +1403,15 @@ async fn run_policy(
                 }
                 () = connection_token.cancelled() => {
                     info!("Runner for policy {id} stopping; publish connection replaced");
+                    return Ok(());
+                }
+                () = request.cancelled() => {
+                    warn!(
+                        policy_id = id,
+                        "Runner for policy {id} stopping; its ingest sender dropped a write \
+                         of this request. Requesting the policy again"
+                    );
+                    connection_notify.notify_waiters();
                     return Ok(());
                 }
                 // Before the frames, so that streams that keep delivering
@@ -1350,16 +1461,13 @@ async fn run_policy(
                                 frame,
                                 &close_timer,
                             );
-                            for series in written {
-                                write_window(&sender, series).await?;
-                            }
+                            write_windows(&sender, written, &request, &handoff).await?;
                         }
                     }
                 }
                 _ = check.tick() => {
-                    for series in windows.close_due(&close_timer.pass_clock()) {
-                        write_window(&sender, series).await?;
-                    }
+                    let due = windows.close_due(&close_timer.pass_clock());
+                    write_windows(&sender, due, &request, &handoff).await?;
                 }
             }
         }
@@ -1370,50 +1478,217 @@ async fn run_policy(
     result
 }
 
-/// Hands a window to the ingest control, which queues it to the policy's
-/// ingest sender. Windows never bypass the control: one written directly to a
-/// cached sender could overtake an earlier one still queued there.
-async fn write_window(send_channel: &Sender<TimeSeries>, series: TimeSeries) -> Result<()> {
-    send_channel.send(series).await?;
+/// Returns how the run of the request `state` was taken for starts.
+fn run_start(state: &StreamPolicy) -> RunStart {
+    RunStart {
+        start: state.start,
+        resumed: state.resumed,
+        generation: state.generation,
+    }
+}
+
+/// What stops a runner's handoff of its frames to the ingest control.
+struct HandoffStop<'a> {
+    /// The request the runner writes for.
+    request: &'a CancellationToken,
+    /// The lifecycle token of the Publish connection the request was sent on.
+    connection: &'a CancellationToken,
+    coordinator: &'a CancellationCoordinator,
+}
+
+impl HandoffStop<'_> {
+    /// Resolves once the runner is to stop: its request stopped, or its
+    /// Publish connection is being replaced while crusher is not shutting
+    /// down.
+    ///
+    /// At shutdown the Publish connection is drained too, but the ingest
+    /// control keeps taking frames until every runner has dropped its
+    /// sender, so a blocked handoff completes and the frame is written. A
+    /// reconnect gives no such guarantee: the ingest control waits there,
+    /// without taking frames, until Giganto has stored what the replaced
+    /// connection carried, for as long as that takes, while the Publish
+    /// connection's drain allows its runners only
+    /// [`CONNECTION_DRAIN_TIMEOUT`] to stop.
+    async fn stopped(&self) {
+        let replaced = async {
+            self.connection.cancelled().await;
+            if self.coordinator.is_cancelled() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            () = self.request.cancelled() => {}
+            () = replaced => {}
+        }
+    }
+}
+
+/// Hands `frames`, which the runner of `request` wrote, in order to the
+/// ingest control, which queues each to the policy's ingest sender. Frames
+/// never bypass the control: one written directly to a cached sender could
+/// overtake an earlier one still queued there.
+///
+/// Once `handoff` says the runner is to stop, the frame being handed and
+/// every later one are dropped, and the runner's own select then stops it.
+/// What was handed is a prefix of the frames in the order written, so no
+/// marker is handed without the rows it counts. A window handed only in part
+/// is the latest the run wrote to, as a runner writes no frame of a window
+/// once a later one has closed, so no ACK has moved the policy's checkpoint
+/// past it and the next request rewrites it.
+async fn write_windows(
+    send_channel: &Sender<IngestFrame>,
+    frames: Vec<IngestFrame>,
+    request: &CancellationToken,
+    handoff: &HandoffStop<'_>,
+) -> Result<()> {
+    for frame in frames {
+        tokio::select! {
+            biased;
+            () = handoff.stopped() => return Ok(()),
+            result = send_channel.send(frame.of_run(request)) => result?,
+        }
+    }
     Ok(())
 }
 
 /// Queues `series` to its policy's ingest sender. Returns the series back when
 /// the policy has no sender, or its sender closed with a deleted policy, a
-/// replaced ingest connection or shutdown, so that the caller starts one.
+/// replaced ingest connection or shutdown, or stops with a replaced request,
+/// so that the caller starts one.
 ///
 /// The ingest control takes every window in the order its policy runner wrote
 /// it, and queues it here before it takes the next. A corrected window thus
 /// follows the write it replaces on the same QUIC stream; a second sender
 /// would carry it on another stream, which Giganto could store first.
-async fn queue_to_ingest_sender(series: TimeSeries) -> Result<(), TimeSeries> {
+async fn queue_to_ingest_sender(series: IngestFrame) -> Result<(), IngestFrame> {
     // Clone the sender out of the lock to avoid holding the RwLock read
     // guard across an await point.
-    let cached_sender = INGEST_CHANNEL.read().await.get(&series.policy_id).cloned();
-    let Some(sender) = cached_sender else {
+    let cached = INGEST_CHANNEL
+        .read()
+        .await
+        .get(&series.policy_id())
+        .map(|queue| (queue.frames.clone(), queue.run.clone()));
+    let Some((sender, run)) = cached else {
         return Err(series);
     };
+    if run.is_cancelled() {
+        // The sender of a replaced request can still be writing, its queue
+        // still installed, but drops whatever is queued once it sees its
+        // token. A row of the next run queued there would be lost, and the
+        // window's marker, starting a sender of its own, stored without it.
+        // Closing the queue lets nothing more in; the caller then starts the
+        // next run's sender, whose queue replaces this one and which writes
+        // only once Giganto has stored what this sender is still writing.
+        sender.close();
+        return Err(series);
+    }
     sender
         .send(series)
         .await
         .map_err(|async_channel::SendError(series)| series)
 }
 
-/// Installs a new queue as the ingest sender of policy `policy_id`,
-/// replacing a closed one. The ingest control installs it before it takes the
-/// next window, so that window finds it.
-async fn register_ingest_queue(policy_id: u32) -> Receiver<TimeSeries> {
+/// Installs a new queue as the ingest sender of policy `policy_id`, which
+/// stops on `run`, replacing a closed one. The ingest control installs it
+/// before it takes the next window, so that window finds it.
+///
+/// The queue it replaces belongs to a sender that is stopping, but whose
+/// last writes Giganto may not have stored yet. They are on another QUIC
+/// stream, and Giganto keeps the order of one stream only, so the new sender
+/// waits for them (`previous`) before it writes: an old-generation row stored
+/// after the new run's row would replace it under a marker that counts it.
+async fn register_ingest_queue(policy_id: u32, run: CancellationToken) -> QueueRegistration {
     let (send_channel, recv_channel) =
-        async_channel::bounded::<TimeSeries>(TIME_SERIES_CHANNEL_SIZE);
-    INGEST_CHANNEL.write().await.insert(policy_id, send_channel);
-    recv_channel
+        async_channel::bounded::<IngestFrame>(TIME_SERIES_CHANNEL_SIZE);
+    let stored = CancellationToken::new();
+    let mut map = INGEST_CHANNEL.write().await;
+    let previous = map
+        .get(&policy_id)
+        .map(|replaced| replaced.stored.clone())
+        .filter(|previous| !previous.is_cancelled());
+    map.insert(
+        policy_id,
+        IngestQueue {
+            frames: send_channel,
+            run,
+            stored: stored.clone(),
+            previous: previous.clone(),
+        },
+    );
+    drop(map);
+    QueueRegistration {
+        frames: recv_channel,
+        stored,
+        previous,
+    }
+}
+
+/// Lets every policy's ingest sender on `connection`, which a reconnect is
+/// about to replace, write what is queued and finish its stream, and waits
+/// until Giganto has stored what each sender and the one it replaced wrote.
+///
+/// Giganto keeps the order of one stream only, and the policy's next writes
+/// go on a stream of the next connection. Without this wait a frame Giganto
+/// received here but had not stored yet could be stored after the next run's
+/// row and marker, and an old-generation row would replace the row the
+/// marker counts. Giganto finishes its side of a stream only after storing
+/// every frame of it, which is what the senders' `stored` tokens wait for.
+///
+/// The wait has no deadline while `connection` is up: giving up would let an
+/// old-generation frame Giganto still holds be stored after the next run's
+/// rows. It warns every [`STORE_BEFORE_RECONNECT_WARN_INTERVAL`] instead, and
+/// ends early only when `connection` closes, since Giganto can then tell
+/// nothing more about the frames it received on it, and at shutdown.
+async fn store_before_reconnect(connection: &Connection, coordinator: &CancellationCoordinator) {
+    let pending: Vec<CancellationToken> = {
+        let map = INGEST_CHANNEL.read().await;
+        for queue in map.values() {
+            queue.frames.close();
+        }
+        map.values()
+            .flat_map(|queue| std::iter::once(&queue.stored).chain(queue.previous.as_ref()))
+            .filter(|stored| !stored.is_cancelled())
+            .cloned()
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let all_stored = async {
+        for stored in &pending {
+            stored.cancelled().await;
+        }
+    };
+    tokio::pin!(all_stored);
+    let closed = connection.closed();
+    tokio::pin!(closed);
+    let mut waited = Duration::ZERO;
+    loop {
+        tokio::select! {
+            biased;
+            () = coordinator.cancelled() => return,
+            () = &mut all_stored => return,
+            error = &mut closed => {
+                warn!(
+                    "Ingest connection closed before Giganto stored every time series written on it: {error}"
+                );
+                return;
+            }
+            () = sleep(STORE_BEFORE_RECONNECT_WARN_INTERVAL) => {
+                waited = waited.saturating_add(STORE_BEFORE_RECONNECT_WARN_INTERVAL);
+                warn!(
+                    "Giganto has not stored every time series written on the ingest connection being replaced after {waited:?}; still waiting before reconnecting"
+                );
+            }
+        }
+    }
 }
 
 /// Closes every policy's ingest queue. Each sender writes what is queued and
 /// then finishes its stream.
 async fn close_ingest_queues() {
-    for sender in INGEST_CHANNEL.read().await.values() {
-        sender.close();
+    for queue in INGEST_CHANNEL.read().await.values() {
+        queue.frames.close();
     }
 }
 
@@ -1444,53 +1719,91 @@ async fn policy_token_for_series(
 async fn spawn_time_series_sender(
     coordinator: &CancellationCoordinator,
     connection: Arc<Connection>,
-    series: TimeSeries,
+    series: IngestFrame,
     policy_token: CancellationToken,
     connection_lifecycle: ConnectionLifecycle,
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
 ) {
-    let policy_id = series.policy_id;
-    let recv_channel = register_ingest_queue(policy_id).await;
-    let error_notify = connection_notify.clone();
+    let policy_id = series.policy_id();
+    let queue = register_ingest_queue(policy_id, policy_token.clone()).await;
     let task_coordinator = coordinator.clone();
     let connection_tasks = connection_lifecycle.tasks.clone();
     let tracked = connection_tasks.track_future(async move {
-        if let Err(e) = send_time_series(
+        // The sender logs its failure and signals the reconnect itself,
+        // before it waits for its writes to be stored.
+        let _ = send_time_series(
             connection,
             series,
-            recv_channel,
+            queue,
             policy_token,
             connection_lifecycle,
             policy_handle,
             connection_notify,
             task_coordinator,
         )
-        .await
-        {
-            warn!(policy_id, "Time-series sender failed: {e:#}");
-            error_notify.notify_waiters();
-        }
+        .await;
     });
     coordinator.tracker().spawn(tracked);
 }
 
-/// Writes `series` and then every window queued to `recv_channel`, the queue
+/// Writes `series` and then every frame queued to `queue`, the queue
 /// [`register_ingest_queue`] installed for the policy, on one QUIC stream.
+///
+/// It writes nothing before Giganto has stored what the sender it replaced
+/// wrote, and it removes its queue only once Giganto has stored what it wrote
+/// itself and what that sender wrote, so that the policy's writes are stored
+/// in order across senders. A failure is logged and signals a reconnect.
+///
+/// A frame it ends without writing (`series` before it is written, the frame
+/// a failed write was carrying, and every frame left in its queue) stops the
+/// run that wrote it, before the queue closes, so that a later frame of that
+/// run, which a closing queue hands back to the ingest control, is dropped
+/// rather than written by the next sender without the frames before it.
 #[allow(clippy::too_many_arguments)]
 async fn send_time_series(
     connection: Arc<Connection>,
-    series: TimeSeries,
-    recv_channel: Receiver<TimeSeries>,
+    series: IngestFrame,
+    queue: QueueRegistration,
     policy_token: CancellationToken,
     connection_lifecycle: ConnectionLifecycle,
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
     coordinator: CancellationCoordinator,
 ) -> Result<()> {
-    let policy_id = series.policy_id;
+    let policy_id = series.policy_id();
+    let QueueRegistration {
+        frames: recv_channel,
+        stored,
+        previous,
+    } = queue;
+    let error_notify = connection_notify.clone();
+    // Kept through the cleanup below: a sender that ends before the one it
+    // replaced is stored must still hold that barrier.
+    let predecessor = previous.clone();
+    // Moved to the ACK receiver once it runs; dropped here otherwise, as
+    // nothing this sender wrote is then waiting to be stored.
+    let mut stored_guard = Some(stored.clone().drop_guard());
+    // The frame being written, until it is.
+    let mut held = Some(series);
 
     let result = async {
+        if let Some(previous) = previous {
+            tokio::select! {
+                biased;
+                () = connection_lifecycle.token.cancelled() => return Ok(()),
+                () = previous.cancelled() => {}
+                () = sleep(PREVIOUS_STREAM_STORE_TIMEOUT) => bail!(
+                    "the previous ingest stream of policy {policy_id} was not stored within {} seconds",
+                    PREVIOUS_STREAM_STORE_TIMEOUT.as_secs(),
+                ),
+            }
+        }
+        // The run may have stopped while this sender waited.
+        if held.as_ref().is_some_and(IngestFrame::run_stopped) {
+            return Ok(());
+        }
+
         let Ok((mut series_sender, series_receiver)) = connection.open_bi().await else {
             bail!("Failed to open bi-direction QUIC channel");
         };
@@ -1498,7 +1811,7 @@ async fn send_time_series(
         // First data transmission (record type + series data)
         send_record_header(&mut series_sender, RawEventKind::PeriodicTimeSeries).await?;
 
-        send_time_series_record(&mut series_sender, &series).await?;
+        send_held_frame(&mut series_sender, &mut held).await?;
 
         // Receive start time of giganto last saved time series.
         let receiver = connection_lifecycle
@@ -1510,6 +1823,7 @@ async fn send_time_series(
                 connection_lifecycle.token.clone(),
                 policy_handle,
                 connection_notify,
+                stored_guard.take(),
             ));
         coordinator.tracker().spawn(receiver);
 
@@ -1529,7 +1843,8 @@ async fn send_time_series(
                             biased;
                             result = recv_channel.recv() => {
                                 let Ok(series) = result else { break };
-                                send_time_series_record(&mut series_sender, &series).await?;
+                                held = Some(series);
+                                send_held_frame(&mut series_sender, &mut held).await?;
                             }
                             () = connection_lifecycle.token.cancelled() => break,
                             _ = connection.closed() => break,
@@ -1552,7 +1867,8 @@ async fn send_time_series(
                 result = recv_channel.recv() => {
                     match result {
                         Ok(series) => {
-                            send_time_series_record(&mut series_sender, &series).await?;
+                            held = Some(series);
+                            send_held_frame(&mut series_sender, &mut held).await?;
                         }
                         Err(_) => break,
                     }
@@ -1566,32 +1882,105 @@ async fn send_time_series(
     }
     .await;
 
-    // Always clean up on both success and error paths.
-    // Close our channel to mark its instance, then only remove the entry
-    // if it is still our channel (not a newer sender registered by a
-    // reconnect).
-    recv_channel.close();
-    let mut map = INGEST_CHANNEL.write().await;
-    if let Some(existing) = map.get(&policy_id)
-        && existing.is_closed()
-    {
-        map.remove(&policy_id);
+    // Always clean up on both success and error paths. Closing our channel
+    // marks this instance as finished.
+    close_dropping(&recv_channel, held);
+    if let Err(e) = &result {
+        // Signalled before the waits below, so that the reconnect starts
+        // now and waits for the same writes through this sender's entry.
+        warn!(policy_id, "Time-series sender failed: {e:#}");
+        error_notify.notify_waiters();
     }
-    drop(map);
+    release_ingest_queue(policy_id, predecessor, stored_guard, stored).await;
 
     result
 }
 
-async fn send_time_series_record(
+/// Closes a sender's queue `frames`, and stops the run of every frame the
+/// sender drops with it: `held`, the frame it did not finish writing, and
+/// each frame left in the queue.
+///
+/// The runs stop before the queue closes: closing hands a frame blocked on
+/// the queue back to the ingest control, which drops it only if its run has
+/// stopped. A frame that enters the queue after the first drain is dropped
+/// by the second.
+fn close_dropping(frames: &Receiver<IngestFrame>, held: Option<IngestFrame>) {
+    if let Some(dropped) = held {
+        dropped.stop_run();
+    }
+    while let Ok(dropped) = frames.try_recv() {
+        dropped.stop_run();
+    }
+    frames.close();
+    while let Ok(dropped) = frames.try_recv() {
+        dropped.stop_run();
+    }
+}
+
+/// Removes the finished ingest queue of policy `policy_id` once Giganto has
+/// stored what its sender wrote (`stored`, held by `stored_guard` until then
+/// unless the ACK receiver took it) and what the sender it replaced wrote
+/// (`predecessor`).
+///
+/// The entry stays until then, so that a sender replacing this one, and a
+/// reconnect's [`store_before_reconnect`], find it and wait. A sender that
+/// ended before its predecessor was stored (its wait timed out, or its
+/// connection was replaced) still stands for that predecessor's writes, as
+/// the predecessor's own entry was replaced by this one. The predecessor's
+/// `stored` is cancelled only once Giganto has stored its writes or its
+/// connection is gone. The entry is removed only if it is still a finished
+/// one, not that of a newer sender registered by a replaced request or a
+/// reconnect.
+async fn release_ingest_queue(
+    policy_id: u32,
+    predecessor: Option<CancellationToken>,
+    stored_guard: Option<DropGuard>,
+    stored: CancellationToken,
+) {
+    if let Some(predecessor) = predecessor {
+        predecessor.cancelled().await;
+    }
+    drop(stored_guard);
+    stored.cancelled().await;
+    let mut map = INGEST_CHANNEL.write().await;
+    if let Some(existing) = map.get(&policy_id)
+        && existing.frames.is_closed()
+        && existing.stored.is_cancelled()
+    {
+        map.remove(&policy_id);
+    }
+}
+
+/// Writes the frame `held` and empties it, or only empties it if the run that
+/// wrote the frame has stopped. A failed write leaves it in `held`.
+async fn send_held_frame(
     series_sender: &mut SendStream,
-    series: &TimeSeries,
+    held: &mut Option<IngestFrame>,
 ) -> Result<()> {
-    let serde_series = bincode::serialize(series)?;
-    let timestamp_nanos = series
-        .start_secs
-        .checked_mul(time_series::SECOND_TO_NANO)
-        .unwrap_or(i64::MAX);
-    send_event_in_batch(series_sender, &[(timestamp_nanos, serde_series)]).await
+    if let Some(frame) = held.as_ref()
+        && !frame.run_stopped()
+    {
+        send_ingest_frame(series_sender, frame).await?;
+    }
+    *held = None;
+    Ok(())
+}
+
+/// Sends every row of `frame`, keyed by its window start in nanoseconds, in
+/// one time-series ingest frame, which Giganto stores with one write.
+async fn send_ingest_frame(series_sender: &mut SendStream, frame: &IngestFrame) -> Result<()> {
+    let events = frame
+        .rows()
+        .iter()
+        .map(|row| {
+            let timestamp_nanos = row
+                .start_secs
+                .checked_mul(time_series::SECOND_TO_NANO)
+                .unwrap_or(i64::MAX);
+            Ok((timestamp_nanos, bincode::serialize(row)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    send_event_in_batch(series_sender, &events).await
 }
 
 async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -> Result<()> {
@@ -1601,7 +1990,12 @@ async fn send_event_in_batch(send: &mut SendStream, events: &[(i64, Vec<u8>)]) -
 }
 
 /// Records each ACK of the ingest stream of policy `policy_id` against that
-/// policy's checkpoint.
+/// policy's checkpoint, and drops `stored` once Giganto has finished its side
+/// of the stream, which it does only after storing every frame of it.
+///
+/// Once `policy_token` is cancelled the ACKs are no longer recorded: they are
+/// of a run that stopped. The stream is still read to its end, so that the
+/// sender replacing this one waits for its writes to be stored.
 async fn receive_time_series_timestamp(
     mut series_receiver: RecvStream,
     policy_id: u32,
@@ -1609,34 +2003,43 @@ async fn receive_time_series_timestamp(
     connection_token: CancellationToken,
     policy_handle: PolicyHandle,
     connection_notify: Arc<Notify>,
+    stored: Option<DropGuard>,
 ) {
+    let mut recording = true;
     loop {
-        let result = tokio::select! {
-            biased;
-            () = policy_token.cancelled() => {
-                // Policy deletion: exit immediately without draining.
-                // The policy actor ignores ACKs for inactive policies.
-                info!(
-                    policy_id,
-                    "receive_time_series_timestamp stopping; policy deleted"
-                );
-                return;
+        // One read per ACK, kept across the policy token firing: dropping a
+        // read part-way would lose the bytes it already took.
+        let read = receive_ack_timestamp(&mut series_receiver);
+        tokio::pin!(read);
+        let result = loop {
+            tokio::select! {
+                biased;
+                () = connection_token.cancelled() => {
+                    info!(
+                        policy_id,
+                        "receive_time_series_timestamp stopping; ingest connection replaced"
+                    );
+                    return;
+                }
+                () = policy_token.cancelled(), if recording => {
+                    // The policy actor ignores ACKs for inactive policies,
+                    // but a restarted policy is active with a new run.
+                    info!(
+                        policy_id,
+                        "receive_time_series_timestamp no longer recording; run stopped"
+                    );
+                    recording = false;
+                }
+                result = &mut read => break result,
             }
-            () = connection_token.cancelled() => {
-                info!(
-                    policy_id,
-                    "receive_time_series_timestamp stopping; ingest connection replaced"
-                );
-                return;
-            }
-            result = receive_ack_timestamp(&mut series_receiver) => result,
         };
         match result {
             Ok(timestamp) => {
-                if policy_handle
-                    .record_ack(policy_id, timestamp)
-                    .await
-                    .is_err()
+                if recording
+                    && policy_handle
+                        .record_ack(policy_id, timestamp)
+                        .await
+                        .is_err()
                 {
                     warn!(policy_id, "Policy actor closed while recording an ACK");
                     return;
@@ -1645,11 +2048,19 @@ async fn receive_time_series_timestamp(
             Err(RecvError::ReadError(quinn::ReadExactError::FinishedEarly(_))) => {
                 break;
             }
-            Err(e) => {
+            Err(e) if recording => {
                 warn!(policy_id, "receive_time_series_timestamp error: {e}");
                 connection_notify.notify_waiters();
                 break;
             }
+            Err(e) => {
+                info!(
+                    policy_id,
+                    "receive_time_series_timestamp of a stopped run ended: {e}"
+                );
+                break;
+            }
         }
     }
+    drop(stored);
 }

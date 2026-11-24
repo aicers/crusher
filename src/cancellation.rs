@@ -105,7 +105,6 @@ impl CancellationCoordinator {
     }
 
     /// Returns `true` if cancellation has been requested.
-    #[cfg(test)]
     pub(crate) fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
     }

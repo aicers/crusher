@@ -3,9 +3,12 @@ mod checkpoint;
 use std::{
     collections::{HashMap, hash_map::Entry},
     path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use checkpoint::{Checkpoints, GENERATION_LIMIT};
 use review_protocol::types::{
     CounterpartScope, GroupByUnit, HostNetworkGroup, TimeSeriesGenerationPolicy,
 };
@@ -20,6 +23,10 @@ use crate::cancellation::CancellationCoordinator;
 
 const POLICY_COMMAND_CHANNEL_SIZE: usize = 32;
 
+/// The wall clock, in milliseconds since the Unix epoch, that fixes a request's
+/// write generation.
+type WallClockMillis = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 enum PolicyCommand {
     ReplacePolicies {
         policies: Vec<TimeSeriesGenerationPolicy>,
@@ -29,9 +36,16 @@ enum PolicyCommand {
         ids: Vec<u32>,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    GetPolicy {
+    /// A request of the policy's streams, which fixes its write generation.
+    RequestPolicy {
         id: u32,
         reply: oneshot::Sender<Result<Option<StreamPolicy>, String>>,
+    },
+    /// A lookup of the policy and its cancellation signal, which changes
+    /// nothing.
+    LookupPolicy {
+        id: u32,
+        reply: oneshot::Sender<Option<(TimeSeriesGenerationPolicy, CancellationToken)>>,
     },
     RecordAck {
         id: u32,
@@ -58,12 +72,20 @@ impl PolicyEntry {
     }
 }
 
-/// A consistent view of the policy, its cancellation signal and resume position.
+/// A consistent view of the policy, its cancellation signal and resume
+/// position, taken for one request of its streams.
 #[derive(Clone)]
 pub(crate) struct StreamPolicy {
     pub(crate) policy: TimeSeriesGenerationPolicy,
     pub(crate) token: CancellationToken,
     pub(crate) start: i64,
+    /// Whether `start` is the policy's checkpoint. Without one, the request
+    /// starts at 0 and replays every stored event.
+    pub(crate) resumed: bool,
+    /// The write generation the request fixed, carried by every row of a
+    /// grouped policy's run. `None` for an ungrouped policy, whose rows carry
+    /// none.
+    pub(crate) generation: Option<u64>,
     /// Changes of the policy's internal network after this view was taken.
     /// `policy.internal_networks` is the network it starts with.
     pub(crate) networks: watch::Receiver<HostNetworkGroup>,
@@ -112,10 +134,21 @@ impl PolicyHandle {
         self.policy_ids.clone()
     }
 
+    /// Takes the view a request of policy `id`'s streams is sent with, or
+    /// `None` if the policy is not active.
+    ///
+    /// For a grouped policy this fixes the request's write generation: one
+    /// greater than any earlier one of the policy and no less than the wall
+    /// clock, persisted before this returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped, or if the generation cannot
+    /// be fixed or persisted, after which the actor fails.
     pub(crate) async fn stream_policy(&self, id: u32) -> Result<Option<StreamPolicy>> {
         let (reply, received) = oneshot::channel();
         self.tx
-            .send(PolicyCommand::GetPolicy { id, reply })
+            .send(PolicyCommand::RequestPolicy { id, reply })
             .await
             .map_err(|_| anyhow::anyhow!("policy actor closed"))?;
         received
@@ -124,15 +157,18 @@ impl PolicyHandle {
             .map_err(anyhow::Error::msg)
     }
 
+    /// Looks up the active policy `id` and its cancellation signal, without
+    /// fixing a write generation.
     pub(crate) async fn get_policy_with_token(
         &self,
         id: u32,
     ) -> Option<(TimeSeriesGenerationPolicy, CancellationToken)> {
-        self.stream_policy(id)
+        let (reply, received) = oneshot::channel();
+        self.tx
+            .send(PolicyCommand::LookupPolicy { id, reply })
             .await
-            .ok()
-            .flatten()
-            .map(|state| (state.policy, state.token))
+            .ok()?;
+        received.await.ok().flatten()
     }
 
     pub(crate) async fn record_ack(&self, id: u32, timestamp: i64) -> Result<()> {
@@ -160,14 +196,43 @@ impl PolicyHandle {
     }
 }
 
+/// Returns the wall clock in milliseconds since the Unix epoch, or 0 before
+/// it.
+fn system_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 /// Restores checkpoints before accepting Review policies. Missing active policies
 /// during startup are not deletions: Review has not supplied its policy list yet.
 pub(crate) async fn spawn_policy_actor(
     path: PathBuf,
     coordinator: &CancellationCoordinator,
 ) -> Result<(PolicyHandle, JoinHandle<Result<()>>)> {
+    spawn_with_clock(path, coordinator, Arc::new(system_millis)).await
+}
+
+/// Like [`spawn_policy_actor`], with `now` as the wall clock in Unix
+/// milliseconds that fixes write generations.
+#[cfg(test)]
+pub(crate) async fn spawn_policy_actor_with_clock(
+    path: PathBuf,
+    coordinator: &CancellationCoordinator,
+    now: impl Fn() -> i64 + Send + Sync + 'static,
+) -> Result<(PolicyHandle, JoinHandle<Result<()>>)> {
+    spawn_with_clock(path, coordinator, Arc::new(now)).await
+}
+
+async fn spawn_with_clock(
+    path: PathBuf,
+    coordinator: &CancellationCoordinator,
+    clock: WallClockMillis,
+) -> Result<(PolicyHandle, JoinHandle<Result<()>>)> {
     let load_path = path.clone();
-    let timestamps =
+    let checkpoints =
         tokio::task::spawn_blocking(move || checkpoint::read_last_timestamp(&load_path))
             .await
             .context("timestamp loader task panicked")??;
@@ -175,7 +240,7 @@ pub(crate) async fn spawn_policy_actor(
     let (policy_ids, snapshot) = watch::channel(Vec::new());
     let task = coordinator
         .tracker()
-        .spawn(run_actor(path, timestamps, rx, policy_ids));
+        .spawn(run_actor(path, checkpoints, rx, policy_ids, clock));
     Ok((
         PolicyHandle {
             tx,
@@ -185,11 +250,23 @@ pub(crate) async fn spawn_policy_actor(
     ))
 }
 
+/// Sends `result` as the reply, formatting an error, and returns it.
+fn reply_with<T: Copy>(reply: oneshot::Sender<Result<T, String>>, result: Result<T>) -> Result<T> {
+    let _ = reply.send(
+        result
+            .as_ref()
+            .copied()
+            .map_err(|error| format!("{error:#}")),
+    );
+    result
+}
+
 async fn run_actor(
     path: PathBuf,
-    mut timestamps: HashMap<String, i64>,
+    mut checkpoints: Checkpoints,
     mut commands: mpsc::Receiver<PolicyCommand>,
     policy_ids: watch::Sender<Vec<u32>>,
+    clock: WallClockMillis,
 ) -> Result<()> {
     let mut active: HashMap<u32, PolicyEntry> = HashMap::new();
     // Global cancellation stops producers first. Keep accepting final ACKs until
@@ -197,60 +274,120 @@ async fn run_actor(
     while let Some(command) = commands.recv().await {
         match command {
             PolicyCommand::ReplacePolicies { policies, reply } => {
-                let outcome = replace_policies(&mut active, &mut timestamps, policies);
+                let outcome = replace_policies(&mut active, &mut checkpoints, policies);
                 if outcome.changed {
                     policy_ids.send_replace(active.keys().copied().collect());
                 }
                 let result = if outcome.checkpoint_removed {
-                    checkpoint::write_timestamp_file(&path, timestamps.clone()).await
+                    checkpoint::write_timestamp_file(&path, &checkpoints).await
                 } else {
                     Ok(())
                 };
-                let _ = reply.send(
-                    result
-                        .as_ref()
-                        .copied()
-                        .map_err(|error| format!("{error:#}")),
-                );
-                result?;
+                reply_with(reply, result)?;
             }
             PolicyCommand::DeletePolicies { ids, reply } => {
                 for id in ids {
                     if let Some(entry) = active.remove(&id) {
                         entry.token.cancel();
                     }
-                    timestamps.remove(&id.to_string());
+                    remove_timestamp(&mut checkpoints, id);
                 }
                 policy_ids.send_replace(active.keys().copied().collect());
-                let result = checkpoint::write_timestamp_file(&path, timestamps.clone()).await;
-                let _ = reply.send(
-                    result
-                        .as_ref()
-                        .copied()
-                        .map_err(|error| format!("{error:#}")),
-                );
-                result?;
+                let result = checkpoint::write_timestamp_file(&path, &checkpoints).await;
+                reply_with(reply, result)?;
             }
-            PolicyCommand::GetPolicy { id, reply } => {
-                let state = active.get(&id).map(|entry| StreamPolicy {
-                    start: start_timestamp(timestamps.get(&id.to_string()).copied()),
+            PolicyCommand::RequestPolicy { id, reply } => {
+                let Some(entry) = active.get(&id) else {
+                    let _ = reply.send(Ok(None));
+                    continue;
+                };
+                let saved = checkpoints
+                    .get(&id.to_string())
+                    .copied()
+                    .unwrap_or_default();
+                let generation = if entry.policy.group_by.is_some() {
+                    // The generation is on disk before the request that uses
+                    // it is sent, so that no row of it can precede it there.
+                    let fixed = match next_generation(saved.generation, clock()) {
+                        Ok(generation) => {
+                            checkpoints.entry(id.to_string()).or_default().generation =
+                                Some(generation);
+                            checkpoint::write_timestamp_file(&path, &checkpoints)
+                                .await
+                                .map(|()| generation)
+                        }
+                        Err(e) => Err(e),
+                    }
+                    .with_context(|| format!("fixing the write generation of policy {id}"));
+                    match fixed {
+                        Ok(generation) => Some(generation),
+                        Err(e) => {
+                            let _ = reply.send(Err(format!("{e:#}")));
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    None
+                };
+                let state = StreamPolicy {
+                    start: start_timestamp(saved.timestamp),
+                    resumed: saved.timestamp.is_some(),
+                    generation,
                     policy: entry.policy.clone(),
                     token: entry.token.clone(),
                     networks: entry.networks.subscribe(),
-                });
-                let _ = reply.send(Ok(state));
+                };
+                let _ = reply.send(Ok(Some(state)));
+            }
+            PolicyCommand::LookupPolicy { id, reply } => {
+                let _ = reply.send(
+                    active
+                        .get(&id)
+                        .map(|entry| (entry.policy.clone(), entry.token.clone())),
+                );
             }
             PolicyCommand::RecordAck { id, timestamp } => {
                 // A late ACK cannot recreate the checkpoint of an inactive policy.
-                if active.contains_key(&id) && record_ack(&mut timestamps, id, timestamp) {
-                    checkpoint::write_timestamp_file(&path, timestamps.clone()).await?;
+                if active.contains_key(&id) && record_ack(&mut checkpoints, id, timestamp) {
+                    checkpoint::write_timestamp_file(&path, &checkpoints).await?;
                 }
             }
         }
     }
-    checkpoint::write_timestamp_file(&path, timestamps).await?;
+    checkpoint::write_timestamp_file(&path, &checkpoints).await?;
     info!("Policy actor flushed timestamps and shutting down");
     Ok(())
+}
+
+/// Returns the write generation of a new request: one greater than
+/// `previous`, the policy's latest, and no less than `now_millis`, the wall
+/// clock in Unix milliseconds.
+///
+/// # Errors
+///
+/// Returns an error if the generation would reach 2^53, past which an `f64`
+/// no longer holds it exactly.
+fn next_generation(previous: Option<u64>, now_millis: i64) -> Result<u64> {
+    let after_previous = previous.map_or(0, |previous| previous.saturating_add(1));
+    let now = u64::try_from(now_millis).unwrap_or(0);
+    let generation = after_previous.max(now);
+    if generation >= GENERATION_LIMIT {
+        bail!("the write generation {generation} reaches 2^53");
+    }
+    Ok(generation)
+}
+
+/// Removes the resume position of policy `id`, keeping its generation, and
+/// returns whether it had one. A checkpoint left with neither is removed.
+fn remove_timestamp(checkpoints: &mut Checkpoints, id: u32) -> bool {
+    let Entry::Occupied(mut entry) = checkpoints.entry(id.to_string()) else {
+        return false;
+    };
+    let removed = entry.get_mut().timestamp.take().is_some();
+    if entry.get().is_empty() {
+        entry.remove();
+    }
+    removed
 }
 
 struct ReplaceOutcome {
@@ -265,12 +402,13 @@ struct ReplaceOutcome {
 /// policy that returns resumes from its last written window instead of
 /// rebuilding windows whose raw events may be gone. An ID whose content changed
 /// is restarted from the beginning, because the old checkpoint describes the
-/// old content's windows. An ID whose content is the same keeps running with
-/// the policy as received, and its runner is handed a changed internal
+/// old content's windows; its write generation is kept, so that its next
+/// request gets a greater one. An ID whose content is the same keeps running
+/// with the policy as received, and its runner is handed a changed internal
 /// network.
 fn replace_policies(
     active: &mut HashMap<u32, PolicyEntry>,
-    timestamps: &mut HashMap<String, i64>,
+    checkpoints: &mut Checkpoints,
     policies: Vec<TimeSeriesGenerationPolicy>,
 ) -> ReplaceOutcome {
     let mut received: HashMap<u32, TimeSeriesGenerationPolicy> =
@@ -335,7 +473,7 @@ fn replace_policies(
                 );
                 entry.get().token.cancel();
                 entry.insert(PolicyEntry::new(policy));
-                if timestamps.remove(&id.to_string()).is_some() {
+                if remove_timestamp(checkpoints, id) {
                     outcome.checkpoint_removed = true;
                 }
                 outcome.changed = true;
@@ -404,25 +542,21 @@ fn start_timestamp(last: Option<i64>) -> i64 {
 /// Keeps the later of the saved and the acknowledged window start, and returns
 /// whether the checkpoint changed. A window corrected by a late event is
 /// acknowledged after a newer one, and must not move the checkpoint back.
-fn record_ack(timestamps: &mut HashMap<String, i64>, id: u32, timestamp: i64) -> bool {
-    match timestamps.entry(id.to_string()) {
-        Entry::Vacant(entry) => {
-            entry.insert(timestamp);
-            true
-        }
-        Entry::Occupied(mut entry) => {
-            if *entry.get() >= timestamp {
-                return false;
-            }
-            entry.insert(timestamp);
-            true
-        }
+fn record_ack(checkpoints: &mut Checkpoints, id: u32, timestamp: i64) -> bool {
+    let saved = &mut checkpoints.entry(id.to_string()).or_default().timestamp;
+    if saved.is_some_and(|saved| saved >= timestamp) {
+        return false;
     }
+    *saved = Some(timestamp);
+    true
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicI64, Ordering},
+    };
     use std::time::Duration;
 
     use review_protocol::types::{
@@ -432,6 +566,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::time::timeout;
 
+    use super::checkpoint::Checkpoint;
     use super::*;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -532,34 +667,118 @@ mod tests {
         }
     }
 
+    /// Returns the resume position of each checkpoint that has one.
+    fn timestamps(checkpoints: &Checkpoints) -> HashMap<String, i64> {
+        checkpoints
+            .iter()
+            .filter_map(|(id, checkpoint)| Some((id.clone(), checkpoint.timestamp?)))
+            .collect()
+    }
+
+    /// A policy grouped by source, which a request fixes a generation for.
+    fn grouped(id: u32) -> TimeSeriesGenerationPolicy {
+        let mut grouped = policy(id);
+        grouped.group_by = Some(EndpointRole::Source);
+        grouped
+    }
+
+    /// A wall clock in Unix milliseconds that a test sets.
+    #[derive(Clone)]
+    struct TestClock(Arc<AtomicI64>);
+
+    impl TestClock {
+        fn at(millis: i64) -> Self {
+            Self(Arc::new(AtomicI64::new(millis)))
+        }
+
+        fn set(&self, millis: i64) {
+            self.0.store(millis, Ordering::SeqCst);
+        }
+
+        fn reader(&self) -> impl Fn() -> i64 + Send + Sync + 'static {
+            let clock = self.0.clone();
+            move || clock.load(Ordering::SeqCst)
+        }
+    }
+
     struct Harness {
         handle: PolicyHandle,
         task: JoinHandle<Result<()>>,
         coordinator: CancellationCoordinator,
         path: PathBuf,
-        _dir: TempDir,
+        dir: TempDir,
     }
 
     impl Harness {
         async fn new(contents: &str) -> Self {
+            Self::with_clock(contents, &TestClock::at(system_millis())).await
+        }
+
+        /// Starts an actor over a file of `contents` whose wall clock is
+        /// `clock`.
+        async fn with_clock(contents: &str, clock: &TestClock) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("timestamps.json");
             std::fs::write(&path, contents).unwrap();
             let coordinator = CancellationCoordinator::new();
-            let (handle, task) = spawn_policy_actor(path.clone(), &coordinator)
-                .await
-                .unwrap();
+            let (handle, task) =
+                spawn_policy_actor_with_clock(path.clone(), &coordinator, clock.reader())
+                    .await
+                    .unwrap();
             Self {
                 handle,
                 task,
                 coordinator,
                 path,
-                _dir: dir,
+                dir,
             }
         }
 
+        /// Returns the saved resume positions, by policy id.
         fn saved(&self) -> HashMap<String, i64> {
-            serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap()
+            timestamps(&self.checkpoints())
+        }
+
+        /// Returns every saved checkpoint, read as at startup.
+        fn checkpoints(&self) -> Checkpoints {
+            checkpoint::read_last_timestamp(&self.path).unwrap()
+        }
+
+        /// Returns the generation the next request of `id` fixes.
+        async fn request_generation(&self, id: u32) -> Option<u64> {
+            self.handle
+                .stream_policy(id)
+                .await
+                .unwrap()
+                .expect("the policy is active")
+                .generation
+        }
+
+        /// Stops the actor and starts another over the same file, or over
+        /// none if `lose_file`, with the wall clock `clock`.
+        async fn restart(mut self, clock: &TestClock, lose_file: bool) -> Self {
+            drop(self.handle);
+            join_actor(self.task).await.unwrap();
+            if lose_file {
+                std::fs::remove_file(&self.path).unwrap();
+            }
+            let (handle, task) =
+                spawn_policy_actor_with_clock(self.path.clone(), &self.coordinator, clock.reader())
+                    .await
+                    .unwrap();
+            self.handle = handle;
+            self.task = task;
+            self
+        }
+
+        /// Stops the actor, which flushes the file, and returns the
+        /// directory that holds it.
+        async fn finish_keeping_file(self) -> TempDir {
+            drop(self.handle);
+            join_actor(self.task).await.unwrap();
+            self.coordinator.request_cancellation("test finished");
+            assert!(self.coordinator.wait_for_drain(TEST_TIMEOUT).await);
+            self.dir
         }
 
         async fn finish(self) {
@@ -605,7 +824,7 @@ mod tests {
     #[tokio::test]
     async fn absent_policy_stops_but_keeps_checkpoint_and_resumes_when_it_returns() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100,"7":200}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":100},"7":{"timestamp":200}}"#).await;
             h.handle
                 .replace_policies(vec![policy(42), policy(7)])
                 .await
@@ -639,7 +858,10 @@ mod tests {
     #[tokio::test]
     async fn empty_list_stops_every_policy_and_keeps_every_checkpoint() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100,"7":200,"99":300}"#).await;
+            let h = Harness::new(
+                r#"{"42":{"timestamp":100},"7":{"timestamp":200},"99":{"timestamp":300}}"#,
+            )
+            .await;
             h.handle
                 .replace_policies(vec![policy(42), policy(7)])
                 .await
@@ -713,7 +935,7 @@ mod tests {
             .chain(GROUPED_CHANGES.iter().map(|change| (true, change)));
         run_test(async {
             for (grouped, (field, change)) in changes {
-                let h = Harness::new(r#"{"42":100,"7":200}"#).await;
+                let h = Harness::new(r#"{"42":{"timestamp":100},"7":{"timestamp":200}}"#).await;
                 let mut original = policy(42);
                 if grouped {
                     original.group_by = Some(EndpointRole::Source);
@@ -755,7 +977,7 @@ mod tests {
     #[tokio::test]
     async fn identical_content_changes_nothing() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":100}}"#).await;
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             let token = h.handle.get_policy_token(42).await.unwrap();
             let mut snapshot = h.handle.subscribe();
@@ -776,7 +998,7 @@ mod tests {
     #[tokio::test]
     async fn internal_networks_change_keeps_policy_and_checkpoint() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":100}}"#).await;
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             let token = h.handle.get_policy_token(42).await.unwrap();
             let mut snapshot = h.handle.subscribe();
@@ -806,7 +1028,7 @@ mod tests {
     #[tokio::test]
     async fn internal_networks_change_reaches_the_runner_and_later_requests() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":100}}"#).await;
             let mut grouped = policy(42);
             grouped.group_by = Some(EndpointRole::Source);
             h.handle
@@ -922,7 +1144,7 @@ mod tests {
     async fn unsupported_policy_writes_nothing_and_is_skipped() {
         run_test(async {
             for (what, change) in UNSUPPORTED {
-                let h = Harness::new(r#"{"42":100}"#).await;
+                let h = Harness::new(r#"{"42":{"timestamp":100}}"#).await;
                 let mut unsupported = policy(42);
                 change(&mut unsupported);
                 h.handle
@@ -946,7 +1168,7 @@ mod tests {
     async fn change_to_unsupported_policy_stops_it_and_keeps_its_checkpoint() {
         run_test(async {
             for (what, change) in UNSUPPORTED {
-                let h = Harness::new(r#"{"42":100,"7":200}"#).await;
+                let h = Harness::new(r#"{"42":{"timestamp":100},"7":{"timestamp":200}}"#).await;
                 h.handle
                     .replace_policies(vec![policy(42), policy(7)])
                     .await
@@ -1025,7 +1247,9 @@ mod tests {
     #[tokio::test]
     async fn deletion_before_any_worker_persists_before_success() {
         run_test(async {
-            let h = Harness::new(r#"{"42":1700000000000000000,"99":123}"#).await;
+            let h =
+                Harness::new(r#"{"42":{"timestamp":1700000000000000000},"99":{"timestamp":123}}"#)
+                    .await;
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             let token = h.handle.get_policy_token(42).await.unwrap();
             h.handle.delete_policies(vec![42]).await.unwrap();
@@ -1040,7 +1264,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_delete_removes_checkpoint_even_before_review_restores_policy() {
         run_test(async {
-            let h = Harness::new(r#"{"42":10,"7":20}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":10},"7":{"timestamp":20}}"#).await;
             h.handle.delete_policies(vec![42, 42, 999]).await.unwrap();
             assert_eq!(h.saved(), HashMap::from([("7".into(), 20)]));
             h.finish().await;
@@ -1072,7 +1296,7 @@ mod tests {
     #[tokio::test]
     async fn readd_after_completed_delete_starts_from_zero_and_accepts_new_ack() {
         run_test(async {
-            let h = Harness::new(r#"{"42":123}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":123}}"#).await;
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             let mut snapshot = h.handle.subscribe();
             assert_eq!(*snapshot.borrow_and_update(), [42]);
@@ -1104,7 +1328,7 @@ mod tests {
     #[tokio::test]
     async fn startup_preserves_saved_timestamps_until_review_policy_restore() {
         run_test(async {
-            let h = Harness::new(r#"{"42":1700000000000000000}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":1700000000000000000}}"#).await;
             assert_eq!(h.handle.get_all_policy_ids(), [] as [u32; 0]);
             assert!(h.handle.stream_policy(42).await.unwrap().is_none());
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
@@ -1120,7 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn restart_restores_survivors_but_does_not_restore_deleted_timestamp() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100,"7":200}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":100},"7":{"timestamp":200}}"#).await;
             h.handle
                 .replace_policies(vec![policy(42), policy(7)])
                 .await
@@ -1146,7 +1370,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_keeps_actor_alive_for_final_ack_and_delete() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":100}}"#).await;
             h.handle
                 .replace_policies(vec![policy(42), policy(7)])
                 .await
@@ -1160,8 +1384,7 @@ mod tests {
             let path = h.path.clone();
             drop(h.handle);
             join_actor(h.task).await.unwrap();
-            let saved: HashMap<String, i64> =
-                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let saved = timestamps(&checkpoint::read_last_timestamp(&path).unwrap());
             assert_eq!(saved, HashMap::from([("7".into(), 999)]));
         })
         .await;
@@ -1170,7 +1393,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_delete_caller_does_not_cancel_accepted_deletion() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":100}}"#).await;
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             let (reply, received) = oneshot::channel();
             h.handle
@@ -1212,7 +1435,7 @@ mod tests {
     #[tokio::test]
     async fn delete_write_failure_is_returned_and_actor_fails() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":100}}"#).await;
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             // Replacing the target with a directory deterministically fails rename,
             // including when tests run with elevated filesystem permissions.
@@ -1231,7 +1454,7 @@ mod tests {
     #[tokio::test]
     async fn changed_content_write_failure_is_returned_and_actor_fails() {
         run_test(async {
-            let h = Harness::new(r#"{"42":100}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":100}}"#).await;
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             std::fs::remove_file(&h.path).unwrap();
             std::fs::create_dir(&h.path).unwrap();
@@ -1267,7 +1490,7 @@ mod tests {
     #[tokio::test]
     async fn ack_older_than_the_checkpoint_does_not_lower_it() {
         run_test(async {
-            let h = Harness::new(r#"{"42":200}"#).await;
+            let h = Harness::new(r#"{"42":{"timestamp":200}}"#).await;
             h.handle.replace_policies(vec![policy(42)]).await.unwrap();
             // A window corrected by a late event is acknowledged after a newer one.
             h.handle.record_ack(42, 100).await.unwrap();
@@ -1323,6 +1546,20 @@ mod tests {
                 r#"{"1":"date"}"#,
                 r#"{"1":true}"#,
                 r#"{"1":9223372036854775808}"#,
+                // The form an earlier crusher wrote: policy id to timestamp.
+                r#"{"1":100}"#,
+                r#"{"1":100,"2":{"timestamp":200}}"#,
+                r#"{"1":{"timestamp":100,"window":1}}"#,
+                r#"{"1":{"timestamp":1.5}}"#,
+                r#"{"1":{"timestamp":"100"}}"#,
+                r#"{"1":{"timestamp":null}}"#,
+                r#"{"1":{"timestamp":9223372036854775808}}"#,
+                r#"{"1":{"generation":-1}}"#,
+                r#"{"1":{"generation":1.0}}"#,
+                r#"{"1":{"generation":"1764000000000"}}"#,
+                r#"{"1":{"generation":9007199254740992}}"#,
+                r#"{"1":{"timestamp":100,"generation":true}}"#,
+                r#"{"1":[100]}"#,
             ] {
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("timestamps.json");
@@ -1357,6 +1594,326 @@ mod tests {
                     .await
                     .is_err()
             );
+        })
+        .await;
+    }
+
+    const NOW: i64 = 1_764_000_000_000;
+
+    /// Each request of a grouped policy fixes a generation greater than the
+    /// policy's previous one and no less than the wall clock: two requests in
+    /// the same millisecond differ, and a wall clock set back does not lower
+    /// it.
+    #[tokio::test]
+    async fn request_fixes_a_generation_after_the_previous_one_and_the_wall_clock() {
+        run_test(async {
+            let clock = TestClock::at(NOW);
+            let h = Harness::with_clock("{}", &clock).await;
+            h.handle.replace_policies(vec![grouped(42)]).await.unwrap();
+            assert_eq!(h.request_generation(42).await, Some(1_764_000_000_000));
+            assert_eq!(
+                h.request_generation(42).await,
+                Some(1_764_000_000_001),
+                "the same millisecond"
+            );
+            clock.set(NOW - 60_000);
+            assert_eq!(
+                h.request_generation(42).await,
+                Some(1_764_000_000_002),
+                "a wall clock set back"
+            );
+            clock.set(NOW + 5_000);
+            assert_eq!(h.request_generation(42).await, Some(1_764_000_005_000));
+            clock.set(-1);
+            assert_eq!(
+                h.request_generation(42).await,
+                Some(1_764_000_005_001),
+                "a wall clock before the epoch"
+            );
+            h.finish().await;
+        })
+        .await;
+    }
+
+    /// The generation is on disk when the request's view is handed out, the
+    /// request starts at the checkpoint, and an ACK changes only `timestamp`.
+    #[tokio::test]
+    async fn generation_is_persisted_before_the_request_is_handed_out() {
+        run_test(async {
+            let clock = TestClock::at(NOW);
+            let h = Harness::with_clock(
+                r#"{"42":{"timestamp":100,"generation":7},"7":{"generation":9}}"#,
+                &clock,
+            )
+            .await;
+            h.handle
+                .replace_policies(vec![grouped(42), policy(7)])
+                .await
+                .unwrap();
+            let state = h.handle.stream_policy(42).await.unwrap().unwrap();
+            assert_eq!(state.generation, Some(NOW.unsigned_abs()));
+            assert_eq!(state.start, 100);
+            assert!(state.resumed);
+            assert_eq!(
+                h.checkpoints()["42"],
+                Checkpoint {
+                    timestamp: Some(100),
+                    generation: Some(NOW.unsigned_abs()),
+                },
+                "on disk before the request is sent"
+            );
+
+            // An ungrouped policy's rows carry no generation, and its stored
+            // one is kept for a later grouped content.
+            let state = h.handle.stream_policy(7).await.unwrap().unwrap();
+            assert_eq!(state.generation, None);
+            assert!(!state.resumed);
+            assert_eq!(state.start, 0);
+            assert_eq!(
+                h.checkpoints()["7"],
+                Checkpoint {
+                    timestamp: None,
+                    generation: Some(9),
+                }
+            );
+
+            h.handle.record_ack(42, 200).await.unwrap();
+            h.handle.record_ack(42, 150).await.unwrap();
+            h.handle.record_ack(7, 300).await.unwrap();
+            let _ = h.handle.get_policy(42).await;
+            assert_eq!(
+                h.checkpoints(),
+                HashMap::from([
+                    (
+                        "42".into(),
+                        Checkpoint {
+                            timestamp: Some(200),
+                            generation: Some(NOW.unsigned_abs()),
+                        }
+                    ),
+                    (
+                        "7".into(),
+                        Checkpoint {
+                            timestamp: Some(300),
+                            generation: Some(9),
+                        }
+                    ),
+                ]),
+                "an ACK keeps the maximum and leaves the generation"
+            );
+            h.finish().await;
+        })
+        .await;
+    }
+
+    /// Looking up a policy, as the ingest control does to start its sender,
+    /// fixes no generation.
+    #[tokio::test]
+    async fn lookups_leave_the_stored_generation_unchanged() {
+        run_test(async {
+            let clock = TestClock::at(NOW);
+            let h = Harness::with_clock(r#"{"42":{"generation":5}}"#, &clock).await;
+            h.handle.replace_policies(vec![grouped(42)]).await.unwrap();
+            let before = std::fs::read_to_string(&h.path).unwrap();
+            assert!(h.handle.get_policy_with_token(42).await.is_some());
+            assert!(h.handle.get_policy(42).await.is_some());
+            assert!(h.handle.get_policy_token(42).await.is_some());
+            assert_eq!(std::fs::read_to_string(&h.path).unwrap(), before);
+            assert_eq!(h.checkpoints()["42"].generation, Some(5));
+            assert_eq!(h.request_generation(42).await, Some(NOW.unsigned_abs()));
+            h.finish().await;
+        })
+        .await;
+    }
+
+    /// A restart with the wall clock set before the stored generation gets
+    /// one past it, and without the checkpoint file the generation is the
+    /// wall clock.
+    #[tokio::test]
+    async fn generation_grows_across_restarts_and_without_a_file_is_the_wall_clock() {
+        run_test(async {
+            let clock = TestClock::at(NOW);
+            let h = Harness::with_clock("{}", &clock).await;
+            h.handle.replace_policies(vec![grouped(42)]).await.unwrap();
+            assert_eq!(h.request_generation(42).await, Some(NOW.unsigned_abs()));
+
+            let earlier = TestClock::at(NOW - 3_600_000);
+            let h = h.restart(&earlier, false).await;
+            h.handle.replace_policies(vec![grouped(42)]).await.unwrap();
+            assert_eq!(
+                h.request_generation(42).await,
+                Some(NOW.unsigned_abs() + 1),
+                "past the stored generation"
+            );
+
+            let h = h.restart(&earlier, true).await;
+            h.handle.replace_policies(vec![grouped(42)]).await.unwrap();
+            assert_eq!(
+                h.request_generation(42).await,
+                Some((NOW - 3_600_000).unsigned_abs()),
+                "the wall clock at the request"
+            );
+            h.finish().await;
+        })
+        .await;
+    }
+
+    /// Deleting a policy and a restarting change remove its `timestamp` and
+    /// keep its `generation`, so a re-created policy starts without a
+    /// checkpoint and with a greater generation, and so does a policy
+    /// switched from grouped to ungrouped and back.
+    #[tokio::test]
+    async fn delete_and_restarting_changes_keep_the_generation() {
+        run_test(async {
+            let clock = TestClock::at(NOW);
+            let h = Harness::with_clock("{}", &clock).await;
+            h.handle
+                .replace_policies(vec![grouped(42), policy(7)])
+                .await
+                .unwrap();
+            let first = h.request_generation(42).await.unwrap();
+            h.handle.record_ack(42, 100).await.unwrap();
+            h.handle.record_ack(7, 100).await.unwrap();
+            h.handle.delete_policies(vec![42, 7]).await.unwrap();
+            assert_eq!(
+                h.checkpoints(),
+                HashMap::from([(
+                    "42".into(),
+                    Checkpoint {
+                        timestamp: None,
+                        generation: Some(first),
+                    }
+                )]),
+                "the generation is kept; an entry with neither field is removed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&h.path).unwrap(),
+                format!(r#"{{"42":{{"generation":{first}}}}}"#)
+            );
+
+            h.handle.replace_policies(vec![grouped(42)]).await.unwrap();
+            let state = h.handle.stream_policy(42).await.unwrap().unwrap();
+            assert_eq!((state.start, state.resumed), (0, false));
+            let recreated = state.generation.unwrap();
+            assert!(recreated > first, "{recreated} > {first}");
+
+            // Grouped to ungrouped and back: each change restarts the policy
+            // without its checkpoint, and the generation keeps growing.
+            h.handle.record_ack(42, 200).await.unwrap();
+            h.handle.replace_policies(vec![policy(42)]).await.unwrap();
+            assert_eq!(
+                h.checkpoints()["42"],
+                Checkpoint {
+                    timestamp: None,
+                    generation: Some(recreated),
+                }
+            );
+            assert_eq!(h.request_generation(42).await, None);
+            h.handle.replace_policies(vec![grouped(42)]).await.unwrap();
+            let regrouped = h.request_generation(42).await.unwrap();
+            assert!(regrouped > recreated, "{regrouped} > {recreated}");
+            h.finish().await;
+        })
+        .await;
+    }
+
+    /// A generation that cannot be written fails the request: no view is
+    /// handed out, the reply is the error, and the actor fails.
+    #[tokio::test]
+    async fn generation_write_failure_fails_the_request_and_the_actor() {
+        run_test(async {
+            let h = Harness::new("{}").await;
+            h.handle.replace_policies(vec![grouped(42)]).await.unwrap();
+            std::fs::remove_file(&h.path).unwrap();
+            std::fs::create_dir(&h.path).unwrap();
+            assert!(h.handle.stream_policy(42).await.is_err());
+            assert!(join_actor(h.task).await.is_err());
+            assert!(h.handle.stream_policy(42).await.is_err());
+        })
+        .await;
+    }
+
+    /// A generation that would reach 2^53 fails the request like a failed
+    /// write, and leaves the file as it was.
+    #[tokio::test]
+    async fn generation_reaching_2_pow_53_fails_the_request_and_the_actor() {
+        run_test(async {
+            let contents = format!(r#"{{"42":{{"generation":{}}}}}"#, GENERATION_LIMIT - 1);
+            let h = Harness::new(&contents).await;
+            h.handle.replace_policies(vec![grouped(42)]).await.unwrap();
+            assert!(h.handle.stream_policy(42).await.is_err());
+            assert!(join_actor(h.task).await.is_err());
+            assert_eq!(std::fs::read_to_string(&h.path).unwrap(), contents);
+        })
+        .await;
+    }
+
+    #[test]
+    fn next_generation_is_past_the_previous_and_the_wall_clock() {
+        assert_eq!(next_generation(None, 1000).unwrap(), 1000);
+        assert_eq!(next_generation(None, -5).unwrap(), 0);
+        assert_eq!(next_generation(Some(1000), 1000).unwrap(), 1001);
+        assert_eq!(next_generation(Some(1000), 10).unwrap(), 1001);
+        assert_eq!(next_generation(Some(1000), 2000).unwrap(), 2000);
+        assert_eq!(
+            next_generation(Some(GENERATION_LIMIT - 2), 0).unwrap(),
+            GENERATION_LIMIT - 1
+        );
+        assert!(next_generation(Some(GENERATION_LIMIT - 1), 0).is_err());
+        assert!(next_generation(None, i64::MAX).is_err());
+    }
+
+    /// The file round-trips both fields at their boundaries, and a value
+    /// without either is accepted and dropped.
+    #[tokio::test]
+    async fn checkpoint_file_round_trips_both_fields() {
+        run_test(async {
+            let max_generation = GENERATION_LIMIT - 1;
+            let contents = format!(
+                r#"{{"1":{{"timestamp":{},"generation":0}},"2":{{"generation":{max_generation}}},"3":{{"timestamp":{}}},"4":{{}}}}"#,
+                i64::MIN,
+                i64::MAX
+            );
+            let h = Harness::new(&contents).await;
+            let expected = HashMap::from([
+                (
+                    "1".into(),
+                    Checkpoint {
+                        timestamp: Some(i64::MIN),
+                        generation: Some(0),
+                    },
+                ),
+                (
+                    "2".into(),
+                    Checkpoint {
+                        timestamp: None,
+                        generation: Some(max_generation),
+                    },
+                ),
+                (
+                    "3".into(),
+                    Checkpoint {
+                        timestamp: Some(i64::MAX),
+                        generation: None,
+                    },
+                ),
+            ]);
+            assert_eq!(h.checkpoints().len(), 3, "the empty value is dropped");
+            let path = h.path.clone();
+            let dir_keep = h.finish_keeping_file().await;
+            let saved = checkpoint::read_last_timestamp(&path).unwrap();
+            assert_eq!(saved, expected);
+            let raw: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                raw,
+                serde_json::json!({
+                    "1": {"timestamp": i64::MIN, "generation": 0},
+                    "2": {"generation": max_generation},
+                    "3": {"timestamp": i64::MAX},
+                })
+            );
+            drop(dir_keep);
         })
         .await;
     }

@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -39,6 +39,7 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, timeout};
 
+use super::time_series::TimeSeries;
 use super::*;
 use crate::cancellation::{CancellationCoordinator, CancellationPhase};
 use crate::client::{Certs, SharedTlsBytes, TlsBytes};
@@ -136,6 +137,21 @@ enum IngestBehavior {
     /// Reads the first stream of each connection only after this delay, so
     /// that a write on a later stream would be stored before it.
     DelayFirstStream(Duration),
+    /// Stores the first frame received on any connection only `delay` after
+    /// receiving it, and notifies `received` on its receipt, so that a frame
+    /// written on a later connection would be stored before it.
+    DelayFirstStore {
+        delay: Duration,
+        received: Arc<Notify>,
+        pending: Arc<AtomicBool>,
+    },
+    /// Stores the first frame received on any connection only once `release`
+    /// is notified, and notifies `received` on its receipt.
+    HoldFirstStore {
+        received: Arc<Notify>,
+        release: Arc<Notify>,
+        pending: Arc<AtomicBool>,
+    },
 }
 
 struct FakeGigantoServer {
@@ -143,6 +159,8 @@ struct FakeGigantoServer {
     server_address: SocketAddr,
     ingest_notify: Option<async_channel::Sender<u32>>,
     series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
+    /// Reports the rows of each ingest frame together, in the order stored.
+    frame_notify: Option<async_channel::Sender<Vec<(i64, TimeSeries)>>>,
     peer_cert_notify: Option<async_channel::Sender<PeerCertEvent>>,
     publish_timestamps: Vec<i64>,
     /// Keeps each default stream open after its events, as Giganto does,
@@ -169,6 +187,7 @@ impl FakeGigantoServer {
             server_address,
             ingest_notify: None,
             series_notify: None,
+            frame_notify: None,
             peer_cert_notify: None,
             publish_timestamps: Vec::new(),
             publish_hold_streams: false,
@@ -185,6 +204,7 @@ impl FakeGigantoServer {
             server_address,
             ingest_notify: None,
             series_notify: None,
+            frame_notify: None,
             peer_cert_notify: None,
             publish_timestamps: Vec::new(),
             publish_hold_streams: false,
@@ -202,6 +222,7 @@ impl FakeGigantoServer {
             server_address,
             ingest_notify: None,
             series_notify: None,
+            frame_notify: None,
             peer_cert_notify: None,
             publish_timestamps: one_window_then_next(),
             publish_hold_streams: false,
@@ -218,6 +239,7 @@ impl FakeGigantoServer {
             server_address,
             ingest_notify: None,
             series_notify: None,
+            frame_notify: None,
             peer_cert_notify: None,
             publish_timestamps: one_window_then_next(),
             publish_hold_streams: false,
@@ -239,6 +261,11 @@ impl FakeGigantoServer {
 
     fn with_series_notify(mut self, notify: async_channel::Sender<(i64, TimeSeries)>) -> Self {
         self.series_notify = Some(notify);
+        self
+    }
+
+    fn with_frame_notify(mut self, notify: async_channel::Sender<Vec<(i64, TimeSeries)>>) -> Self {
+        self.frame_notify = Some(notify);
         self
     }
 
@@ -266,7 +293,10 @@ impl FakeGigantoServer {
         let endpoint = Endpoint::server(self.server_config, self.server_address).expect("endpoint");
         let local_addr = endpoint.local_addr().expect("local_addr");
         let ingest_notify = self.ingest_notify.clone();
-        let series_notify = self.series_notify.clone();
+        let notifies = IngestNotify {
+            series: self.series_notify.clone(),
+            frames: self.frame_notify.clone(),
+        };
         let peer_cert_notify = self.peer_cert_notify.clone();
         let behavior = self.ingest_behavior;
         let handle = tokio::spawn(async move {
@@ -274,7 +304,7 @@ impl FakeGigantoServer {
                 tokio::select! {
                     Some(conn) = endpoint.accept() => {
                         let notify = ingest_notify.clone();
-                        let series_notify = series_notify.clone();
+                        let notifies = notifies.clone();
                         let peer_cert_notify = peer_cert_notify.clone();
                         let behavior = behavior.clone();
                         tokio::spawn(async move {
@@ -282,7 +312,7 @@ impl FakeGigantoServer {
                                 handle_ingest_connection(
                                     connection,
                                     notify,
-                                    series_notify,
+                                    notifies,
                                     peer_cert_notify,
                                     behavior,
                                 )
@@ -340,10 +370,19 @@ impl FakeGigantoServer {
     }
 }
 
+/// Where the fake ingest server reports what it stores.
+#[derive(Clone, Default)]
+struct IngestNotify {
+    /// Each stored row, with its timestamp.
+    series: Option<async_channel::Sender<(i64, TimeSeries)>>,
+    /// The rows of each stored frame together.
+    frames: Option<async_channel::Sender<Vec<(i64, TimeSeries)>>>,
+}
+
 async fn handle_ingest_connection(
     connection: Connection,
     notify: Option<async_channel::Sender<u32>>,
-    series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
+    series_notify: IngestNotify,
     peer_cert_notify: Option<async_channel::Sender<PeerCertEvent>>,
     behavior: IngestBehavior,
 ) {
@@ -652,7 +691,7 @@ async fn handle_ingest_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     notify: Option<async_channel::Sender<u32>>,
-    series_notify: Option<async_channel::Sender<(i64, TimeSeries)>>,
+    series_notify: IngestNotify,
     behavior: IngestBehavior,
 ) {
     let mut header_buf = [0_u8; 4];
@@ -683,6 +722,26 @@ async fn handle_ingest_stream(
         let Ok(batch) = bincode::deserialize::<Vec<(i64, Vec<u8>)>>(&buf) else {
             continue;
         };
+        if let IngestBehavior::DelayFirstStore {
+            delay,
+            received,
+            pending,
+        } = &behavior
+            && pending.swap(false, Ordering::SeqCst)
+        {
+            received.notify_one();
+            sleep(*delay).await;
+        }
+        if let IngestBehavior::HoldFirstStore {
+            received,
+            release,
+            pending,
+        } = &behavior
+            && pending.swap(false, Ordering::SeqCst)
+        {
+            received.notify_one();
+            release.notified().await;
+        }
         // The policy id is the part of the series id before `/`.
         let policy_id = batch
             .first()
@@ -695,8 +754,20 @@ async fn handle_ingest_stream(
                 id.parse::<u32>().ok()
             })
             .unwrap_or(0);
+        if let Some(frames) = &series_notify.frames {
+            let rows = batch
+                .iter()
+                .filter_map(|(timestamp, payload)| {
+                    Some((
+                        *timestamp,
+                        bincode::deserialize::<TimeSeries>(payload).ok()?,
+                    ))
+                })
+                .collect();
+            let _ = frames.send(rows).await;
+        }
         for (timestamp, payload) in batch {
-            if let Some(series_notify) = &series_notify
+            if let Some(series_notify) = &series_notify.series
                 && let Ok(series) = bincode::deserialize::<TimeSeries>(&payload)
             {
                 let _ = series_notify.send((timestamp, series)).await;
@@ -1024,12 +1095,35 @@ async fn cleanup_server_resources(server_handles: TestServerHandlers) {
     );
 }
 
+/// Returns the `timestamp` of each policy in the checkpoint file that has
+/// one.
 fn read_time_data_map(last_time_series_path: &Path) -> HashMap<String, i64> {
+    read_checkpoints(last_time_series_path)
+        .into_iter()
+        .filter_map(|(id, (timestamp, _))| Some((id, timestamp?)))
+        .collect()
+}
+
+/// Returns the `timestamp` and the `generation` of each policy in the
+/// checkpoint file.
+fn read_checkpoints(last_time_series_path: &Path) -> HashMap<String, (Option<i64>, Option<u64>)> {
     let content = fs::read_to_string(last_time_series_path).unwrap_or_default();
     if content.trim().is_empty() {
         return HashMap::new();
     }
-    serde_json::from_str::<HashMap<String, i64>>(&content).expect("Failed to parse time_data.json")
+    let file: HashMap<String, serde_json::Map<String, serde_json::Value>> =
+        serde_json::from_str(&content).expect("Failed to parse time_data.json");
+    file.into_iter()
+        .map(|(id, fields)| {
+            let timestamp = fields
+                .get("timestamp")
+                .map(|value| value.as_i64().expect("the timestamp is an i64"));
+            let generation = fields
+                .get("generation")
+                .map(|value| value.as_u64().expect("the generation is a u64"));
+            (id, (timestamp, generation))
+        })
+        .collect()
 }
 
 fn config_server() -> ServerConfig {
@@ -1742,12 +1836,12 @@ async fn ingest_control_queues_consecutive_writes_on_one_sender() {
     let (series_send, series_recv) = async_channel::unbounded();
     for value in [1.0, 2.0] {
         series_send
-            .try_send(TimeSeries {
+            .try_send(IngestFrame::from(TimeSeries {
                 time_series_id: DEFAULT_POLICY_ID.to_string(),
                 policy_id: DEFAULT_POLICY_ID,
                 start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
                 series: vec![value],
-            })
+            }))
             .unwrap();
     }
     let control = tokio::spawn({
@@ -1792,6 +1886,817 @@ async fn ingest_control_queues_consecutive_writes_on_one_sender() {
     INGEST_CHANNEL.write().await.clear();
 }
 
+/// A restarting policy change cancels the token of the policy's sender, which
+/// may still be writing with its queue installed. The next run's IP row and
+/// marker then go out together on a sender of the new run, not into that
+/// queue, whose sender would drop the row once it saw its token, leaving the
+/// marker to be stored without it. A frame the stopped run still wrote is
+/// dropped rather than written between them.
+///
+/// The old sender's write is on its own QUIC stream, which Giganto reads
+/// late here. The new sender writes only once Giganto has stored it, so the
+/// old run's row is not stored after the new run's row and marker, where it
+/// would replace the row the marker counts.
+#[serial]
+#[tokio::test]
+async fn ingest_control_bypasses_the_queue_of_a_replaced_request() {
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::DelayFirstStream(Duration::from_millis(500)))
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+    policy_handle
+        .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .await
+        .unwrap();
+    let old_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the policy is active");
+
+    let start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
+    let frame = |id: String, value, run: &CancellationToken| {
+        IngestFrame::from(TimeSeries {
+            time_series_id: id,
+            policy_id: DEFAULT_POLICY_ID,
+            start_secs,
+            series: vec![value],
+        })
+        .of_run(run)
+    };
+    let ip_row = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
+    let (series_send, series_recv) = async_channel::unbounded();
+    series_send
+        .try_send(frame(ip_row.clone(), 9.0, &old_run))
+        .unwrap();
+    let control = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                Arc::new(Notify::new()),
+                coordinator,
+            )
+            .await
+            .expect("ingest control exits cleanly");
+            endpoint
+        }
+    });
+    // The old run's row starts its sender, which writes it on the first
+    // stream: Giganto reads that stream only after a delay.
+    wait_for_ingest_channel(DEFAULT_POLICY_ID, true)
+        .await
+        .expect("the old run's row starts the policy's sender");
+
+    let changed = TimeSeriesGenerationPolicy {
+        slot_size: Duration::from_secs(5 * SECS_PER_MINUTE),
+        ..new_policy(DEFAULT_POLICY_ID)
+    };
+    policy_handle.replace_policies(vec![changed]).await.unwrap();
+    assert!(old_run.is_cancelled(), "the change restarts the policy");
+    let new_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the changed policy is active");
+    for (id, value, run) in [
+        (ip_row.clone(), 1.0, &new_run),
+        (ip_row.clone(), 9.5, &old_run),
+        (DEFAULT_POLICY_ID.to_string(), 2.0, &new_run),
+    ] {
+        series_send.try_send(frame(id, value, run)).unwrap();
+    }
+
+    let mut writes = Vec::new();
+    for _ in 0..3 {
+        let (_, series) = timeout(TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("the old run's row and the new run's row and marker are stored")
+            .unwrap();
+        writes.push((series.time_series_id, series.series));
+    }
+    assert_eq!(
+        writes,
+        [
+            (ip_row.clone(), vec![9.0]),
+            (ip_row, vec![1.0]),
+            (DEFAULT_POLICY_ID.to_string(), vec![2.0]),
+        ],
+        "the old run's write is stored first, the row precedes its marker, \
+         and the stopped run's later frame is dropped"
+    );
+
+    coordinator.request_cancellation("replaced request test");
+    drop(series_send);
+    let endpoint = control.await.expect("ingest control joins");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    assert!(
+        stored.try_recv().is_err(),
+        "nothing else is stored, the stopped run's frame included"
+    );
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
+/// A reconnect replaces the ingest connection while Giganto has received a
+/// policy's frame on it but not yet stored it, and holds it, with the
+/// connection up, for several of the reconnect's warning intervals. The
+/// policy's next writes, on the new connection, are stored only after that
+/// frame: an old-generation row stored after the new run's row and marker
+/// would replace the row the marker counts.
+#[serial]
+#[tokio::test]
+async fn reconnect_stores_the_old_connections_writes_before_the_new_ones() {
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let received = Arc::new(Notify::new());
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::DelayFirstStore {
+            delay: STORE_BEFORE_RECONNECT_WARN_INTERVAL * 5,
+            received: received.clone(),
+            pending: Arc::new(AtomicBool::new(true)),
+        })
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+    policy_handle
+        .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .await
+        .unwrap();
+    let run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the policy is active");
+
+    let start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
+    let frame = |id: String, value| {
+        IngestFrame::from(TimeSeries {
+            time_series_id: id,
+            policy_id: DEFAULT_POLICY_ID,
+            start_secs,
+            series: vec![value],
+        })
+        .of_run(&run)
+    };
+    let ip_row = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
+    let (series_send, series_recv) = async_channel::unbounded();
+    series_send.try_send(frame(ip_row.clone(), 9.0)).unwrap();
+    let connection_notify = Arc::new(Notify::new());
+    let control = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        let connection_notify = connection_notify.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                connection_notify,
+                coordinator,
+            )
+            .await
+            .expect("ingest control exits cleanly");
+            endpoint
+        }
+    });
+    timeout(TEST_TIMEOUT, received.notified())
+        .await
+        .expect("Giganto receives the old connection's row");
+
+    // The reconnect signal, as a lost Publish connection gives it, and then
+    // the rows of the run requested on the new connections.
+    connection_notify.notify_one();
+    for (id, value) in [(ip_row.clone(), 1.0), (DEFAULT_POLICY_ID.to_string(), 2.0)] {
+        series_send.try_send(frame(id, value)).unwrap();
+    }
+
+    let mut writes = Vec::new();
+    for _ in 0..3 {
+        let (_, series) = timeout(RECONNECT_TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("the old row and the new row and marker are stored")
+            .unwrap();
+        writes.push((series.time_series_id, series.series));
+    }
+    assert_eq!(
+        writes,
+        [
+            (ip_row.clone(), vec![9.0]),
+            (ip_row, vec![1.0]),
+            (DEFAULT_POLICY_ID.to_string(), vec![2.0]),
+        ],
+        "the old connection's row is stored first, and the row precedes its marker"
+    );
+
+    coordinator.request_cancellation("reconnect ordering test");
+    drop(series_send);
+    let endpoint = control.await.expect("ingest control joins");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
+/// A replaced request's sender has written a frame that Giganto received but
+/// holds unstored beyond [`PREVIOUS_STREAM_STORE_TIMEOUT`]. The next run's
+/// sender, waiting for it, times out and signals a reconnect. The reconnect
+/// still waits for that frame through the failed sender's entry, so the next
+/// run's writes on the new connection are stored after it: an old-generation
+/// row stored after the new run's row and marker would replace the row the
+/// marker counts.
+#[serial]
+#[tokio::test]
+async fn replacement_timeout_keeps_the_old_senders_writes_before_the_new_ones() {
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let received = Arc::new(Notify::new());
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::DelayFirstStore {
+            delay: PREVIOUS_STREAM_STORE_TIMEOUT + STORE_BEFORE_RECONNECT_WARN_INTERVAL * 5,
+            received: received.clone(),
+            pending: Arc::new(AtomicBool::new(true)),
+        })
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+    policy_handle
+        .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .await
+        .unwrap();
+    let old_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the policy is active");
+
+    let start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
+    let frame = |id: String, value, run: &CancellationToken| {
+        IngestFrame::from(TimeSeries {
+            time_series_id: id,
+            policy_id: DEFAULT_POLICY_ID,
+            start_secs,
+            series: vec![value],
+        })
+        .of_run(run)
+    };
+    let ip_row = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
+    let (series_send, series_recv) = async_channel::unbounded();
+    series_send
+        .try_send(frame(ip_row.clone(), 9.0, &old_run))
+        .unwrap();
+    let connection_notify = Arc::new(Notify::new());
+    let control = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        let connection_notify = connection_notify.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                connection_notify,
+                coordinator,
+            )
+            .await
+            .expect("ingest control exits cleanly");
+            endpoint
+        }
+    });
+    timeout(TEST_TIMEOUT, received.notified())
+        .await
+        .expect("Giganto receives the old run's row");
+
+    let changed = TimeSeriesGenerationPolicy {
+        slot_size: Duration::from_secs(5 * SECS_PER_MINUTE),
+        ..new_policy(DEFAULT_POLICY_ID)
+    };
+    policy_handle.replace_policies(vec![changed]).await.unwrap();
+    assert!(old_run.is_cancelled(), "the change restarts the policy");
+    let new_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the changed policy is active");
+
+    // The next run's first row starts a sender that waits for the old one,
+    // times out and signals a reconnect; the row it held is lost with it,
+    // and its request stops.
+    let lost = new_run.child_token();
+    let failed = connection_notify.notified();
+    tokio::pin!(failed);
+    failed.as_mut().enable();
+    series_send
+        .try_send(frame(ip_row.clone(), 0.5, &lost))
+        .unwrap();
+    timeout(TEST_TIMEOUT, failed)
+        .await
+        .expect("the replacing sender times out and signals a reconnect");
+    assert!(lost.is_cancelled(), "the request that lost its row stops");
+    assert!(!new_run.is_cancelled(), "the policy stays active");
+
+    // The rows of the policy's next request, written on the new connection.
+    let rewrite = new_run.child_token();
+    for (id, value) in [(ip_row.clone(), 1.0), (DEFAULT_POLICY_ID.to_string(), 2.0)] {
+        series_send.try_send(frame(id, value, &rewrite)).unwrap();
+    }
+
+    let mut writes = Vec::new();
+    for _ in 0..3 {
+        let (_, series) = timeout(RECONNECT_TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("the old run's row and the new run's row and marker are stored")
+            .unwrap();
+        writes.push((series.time_series_id, series.series));
+    }
+    assert_eq!(
+        writes,
+        [
+            (ip_row.clone(), vec![9.0]),
+            (ip_row, vec![1.0]),
+            (DEFAULT_POLICY_ID.to_string(), vec![2.0]),
+        ],
+        "the old run's row is stored first, and the row precedes its marker"
+    );
+
+    coordinator.request_cancellation("replacement timeout ordering test");
+    drop(series_send);
+    let endpoint = control.await.expect("ingest control joins");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
+/// A request's two IP rows and their marker are queued, through queues of
+/// the production capacity, behind a sender that waits for a replaced
+/// request's frame Giganto holds unstored: the first row is the sender's
+/// own, the second is in its queue, and the marker is blocked on that queue.
+/// The sender times out and drops both rows. The marker, which the closing
+/// queue hands back to the ingest control, is dropped with them, and is not
+/// written by another sender once the old frame is stored, with the
+/// connection still up: a marker visible without the rows it counts would
+/// claim rows Giganto never stored. The request stops, and only the next
+/// request's rows and marker follow the old frame.
+#[serial]
+#[tokio::test]
+async fn failed_sender_drops_the_rest_of_its_request() {
+    const OTHER_POLICY_ID: u32 = DEFAULT_POLICY_ID + 1;
+    INGEST_CHANNEL.write().await.clear();
+    let (stored_send, stored) = async_channel::unbounded();
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::HoldFirstStore {
+            received: received.clone(),
+            release: release.clone(),
+            pending: Arc::new(AtomicBool::new(true)),
+        })
+        .start_ingest(shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (policy_handle, actor_task) =
+        spawn_policy_actor(dir.path().join("timestamps.json"), &coordinator)
+            .await
+            .unwrap();
+    policy_handle
+        .replace_policies(vec![
+            new_policy(DEFAULT_POLICY_ID),
+            new_policy(OTHER_POLICY_ID),
+        ])
+        .await
+        .unwrap();
+    let old_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the policy is active");
+    let other_run = policy_handle
+        .get_policy_token(OTHER_POLICY_ID)
+        .await
+        .expect("the other policy is active");
+
+    let start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
+    let frame = |policy_id: u32, id: &str, value, run: &CancellationToken| {
+        IngestFrame::from(TimeSeries {
+            time_series_id: id.to_string(),
+            policy_id,
+            start_secs,
+            series: vec![value],
+        })
+        .of_run(run)
+    };
+    let ip_a = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
+    let ip_b = format!("{DEFAULT_POLICY_ID}/10.0.0.2");
+    let marker = DEFAULT_POLICY_ID.to_string();
+    let other = OTHER_POLICY_ID.to_string();
+    let (series_send, series_recv) = async_channel::bounded(TIME_SERIES_CHANNEL_SIZE);
+    series_send
+        .send(frame(DEFAULT_POLICY_ID, &ip_a, 9.0, &old_run.child_token()))
+        .await
+        .unwrap();
+    let connection_notify = Arc::new(Notify::new());
+    let control = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        let connection_notify = connection_notify.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                connection_notify,
+                coordinator,
+            )
+            .await
+            .expect("ingest control exits cleanly");
+            endpoint
+        }
+    });
+    timeout(TEST_TIMEOUT, received.notified())
+        .await
+        .expect("Giganto receives the old run's row");
+
+    let changed = TimeSeriesGenerationPolicy {
+        slot_size: Duration::from_secs(5 * SECS_PER_MINUTE),
+        ..new_policy(DEFAULT_POLICY_ID)
+    };
+    policy_handle
+        .replace_policies(vec![changed, new_policy(OTHER_POLICY_ID)])
+        .await
+        .unwrap();
+    assert!(old_run.is_cancelled(), "the change restarts the policy");
+    assert!(!other_run.is_cancelled(), "the other policy is unchanged");
+    let new_run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the changed policy is active");
+
+    // The request's rows and marker, all queued before the sender times out,
+    // and then another policy's row, which the ingest control takes only
+    // once it has routed the marker.
+    let lost = new_run.child_token();
+    let failed = connection_notify.notified();
+    tokio::pin!(failed);
+    failed.as_mut().enable();
+    let producer = tokio::spawn({
+        let series_send = series_send.clone();
+        let frames = [
+            frame(DEFAULT_POLICY_ID, &ip_a, 1.0, &lost),
+            frame(DEFAULT_POLICY_ID, &ip_b, 1.0, &lost),
+            frame(DEFAULT_POLICY_ID, &marker, 2.0, &lost),
+            frame(OTHER_POLICY_ID, &other, 7.0, &other_run.child_token()),
+        ];
+        async move {
+            for frame in frames {
+                series_send.send(frame).await.unwrap();
+            }
+        }
+    });
+    timeout(TEST_TIMEOUT, failed)
+        .await
+        .expect("the replacing sender times out and signals a reconnect");
+    let (_, series) = timeout(TEST_TIMEOUT, stored.recv())
+        .await
+        .expect("the other policy's row is stored")
+        .unwrap();
+    assert_eq!(
+        (series.time_series_id, series.series),
+        (other.clone(), vec![7.0]),
+        "the other policy's row, routed after the marker, is stored first"
+    );
+    producer
+        .await
+        .expect("every frame is handed to the ingest control");
+    assert!(lost.is_cancelled(), "the request that lost its rows stops");
+    assert!(!new_run.is_cancelled(), "the policy stays active");
+
+    // Giganto stores the old run's row with the connection up, and the
+    // reconnect signal follows, as the stopped request's runner gives it.
+    release.notify_one();
+    let (_, series) = timeout(TEST_TIMEOUT, stored.recv())
+        .await
+        .expect("the old run's row is stored")
+        .unwrap();
+    assert_eq!(
+        (series.time_series_id, series.series),
+        (ip_a.clone(), vec![9.0])
+    );
+    connection_notify.notify_one();
+
+    // The rows of the policy's next request, written on the new connection.
+    let rewrite = new_run.child_token();
+    for (id, value) in [(&ip_a, 1.0), (&ip_b, 1.0), (&marker, 2.0)] {
+        series_send
+            .send(frame(DEFAULT_POLICY_ID, id, value, &rewrite))
+            .await
+            .unwrap();
+    }
+    let mut writes = Vec::new();
+    for _ in 0..3 {
+        let (_, series) = timeout(RECONNECT_TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("the next request's rows and marker are stored")
+            .unwrap();
+        writes.push((series.time_series_id, series.series));
+    }
+    assert_eq!(
+        writes,
+        [(ip_a, vec![1.0]), (ip_b, vec![1.0]), (marker, vec![2.0]),],
+        "no marker of the stopped request is stored, and the next request's \
+         marker follows both rows it counts"
+    );
+
+    coordinator.request_cancellation("failed sender request test");
+    drop(series_send);
+    let endpoint = control.await.expect("ingest control joins");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    assert!(
+        stored.try_recv().is_err(),
+        "nothing else is stored, the stopped request's marker included"
+    );
+    endpoint.close(0u32.into(), &[]);
+    shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
+/// A reconnect waits, without taking frames from the runners, for Giganto to
+/// store a frame of the replaced ingest connection, which it holds beyond
+/// [`CONNECTION_DRAIN_TIMEOUT`] with the connection up. Meanwhile a runner
+/// on the Publish connection that the reconnect replaces closes a window of
+/// two IP rows and a marker through a queue of the production capacity: the
+/// first row fills the queue, and the runner is blocked handing the second.
+/// The runner still stops within the Publish connection's drain, dropping
+/// the rest of the window, so the Publish control reconnects instead of
+/// failing. Once the frame is stored, the ingest reconnect completes, and
+/// the next request rewrites the window with a new generation, its rows
+/// before its marker.
+#[serial]
+#[tokio::test]
+async fn runner_blocked_on_a_reconnect_waiting_for_storage_stops_with_its_connection() {
+    INGEST_CHANNEL.write().await.clear();
+    let w0 = BASE_WINDOW_START_NANOS;
+    let (stored_send, stored) = async_channel::unbounded();
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let ingest_shutdown = Arc::new(Notify::new());
+    let (ingest_addr, ingest_handle) = FakeGigantoServer::new_ingest()
+        .with_series_notify(stored_send)
+        .with_ingest_behavior(IngestBehavior::HoldFirstStore {
+            received: received.clone(),
+            release: release.clone(),
+            pending: Arc::new(AtomicBool::new(true)),
+        })
+        .start_ingest(ingest_shutdown.clone());
+    let publish_shutdown = Arc::new(Notify::new());
+    let (publish_addr, publish_handle) = FakeGigantoServer::new_publish()
+        .with_publish_behavior(PublishBehavior::Records(
+            vec![
+                conn_from(BASE_TS_NANOS, IP_A),
+                conn_from(BASE_TS_NANOS + 1, IP_B),
+                // Passes w0, which closes with two IP rows and its marker.
+                conn_from(BASE_TS_NANOS + DAY_NANOS, EXTERNAL_IP),
+            ]
+            .into(),
+        ))
+        .start_publish(publish_shutdown.clone());
+    let endpoint = client::config(&cert_key()).expect("client endpoint");
+    let coordinator = CancellationCoordinator::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("timestamps.json");
+    let (policy_handle, actor_task) = spawn_policy_actor(path.clone(), &coordinator)
+        .await
+        .unwrap();
+    policy_handle
+        .replace_policies(vec![grouped_policy()])
+        .await
+        .unwrap();
+    let run = policy_handle
+        .get_policy_token(DEFAULT_POLICY_ID)
+        .await
+        .expect("the policy is active");
+
+    let (series_send, series_recv) = async_channel::bounded(TIME_SERIES_CHANNEL_SIZE);
+    let connection_notify = Arc::new(Notify::new());
+    let ingest = tokio::spawn({
+        let endpoint = endpoint.clone();
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        let connection_notify = connection_notify.clone();
+        async move {
+            ingest_connection_control(
+                series_recv,
+                ingest_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                connection_notify,
+                coordinator,
+            )
+            .await
+        }
+    });
+
+    // A frame of the replaced connection, which Giganto receives and holds.
+    let held_row = format!("{DEFAULT_POLICY_ID}/10.0.0.1");
+    series_send
+        .send(
+            IngestFrame::from(TimeSeries {
+                time_series_id: held_row.clone(),
+                policy_id: DEFAULT_POLICY_ID,
+                start_secs: w0 / 1_000_000_000,
+                series: vec![9.0],
+            })
+            .of_run(&run.child_token()),
+        )
+        .await
+        .unwrap();
+    timeout(TEST_TIMEOUT, received.notified())
+        .await
+        .expect("Giganto receives the replaced connection's frame");
+
+    // The ingest control starts the reconnect, which closes the policy's
+    // queue and waits for that frame.
+    connection_notify.notify_one();
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            let closed = INGEST_CHANNEL
+                .read()
+                .await
+                .get(&DEFAULT_POLICY_ID)
+                .is_some_and(|queue| queue.frames.is_closed());
+            if closed {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the ingest control waits for the held frame before reconnecting");
+
+    // The Publish control requests the policy, and its runner closes w0:
+    // the first row fills the queue, which nothing takes, and the runner
+    // blocks handing the second.
+    let mut publish = tokio::spawn({
+        let endpoint = endpoint.clone();
+        let coordinator = coordinator.clone();
+        let policy_handle = policy_handle.clone();
+        let connection_notify = connection_notify.clone();
+        let series_send = series_send.clone();
+        async move {
+            publish_connection_control(
+                series_send,
+                publish_addr,
+                HOST,
+                &endpoint,
+                REQUIRED_GIGANTO_VERSION,
+                policy_handle,
+                connection_notify,
+                coordinator,
+                CloseTimer::new(
+                    || i64::MIN,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                ),
+            )
+            .await
+        }
+    });
+    timeout(TEST_TIMEOUT, async {
+        while !series_send.is_full() {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the runner hands the window's first row");
+    let first_generation = stored_generation(&path);
+
+    // The reconnect signal reaches the Publish control, which drains its
+    // connection; the ingest control is still waiting for Giganto.
+    connection_notify.notify_waiters();
+    let outlast_drain = CONNECTION_DRAIN_TIMEOUT + Duration::from_secs(2);
+    if let Ok(result) = timeout(outlast_drain, &mut publish).await {
+        panic!("the Publish control ended while the reconnect waited for Giganto: {result:?}");
+    }
+    assert!(
+        !ingest.is_finished(),
+        "the ingest reconnect is still pending"
+    );
+    assert!(stored.try_recv().is_err(), "Giganto has stored nothing yet");
+
+    // Giganto stores the held frame; the ingest reconnect completes and
+    // writes what the runners handed it.
+    release.notify_one();
+    let mut writes = Vec::new();
+    for _ in 0..5 {
+        let (timestamp, series) = timeout(RECONNECT_TEST_TIMEOUT, stored.recv())
+            .await
+            .expect("the held frame and the windows handed after it are stored")
+            .unwrap();
+        writes.push((series.time_series_id, timestamp, series.series));
+    }
+    let generation = stored_generation(&path);
+    assert!(
+        generation > first_generation,
+        "the next request has a new generation"
+    );
+    let row_a = format!("{DEFAULT_POLICY_ID}/{IP_A}");
+    let row_b = format!("{DEFAULT_POLICY_ID}/{IP_B}");
+    assert_eq!(
+        writes.first(),
+        Some(&(held_row, w0, vec![9.0])),
+        "the held frame is stored first"
+    );
+    assert_eq!(
+        writes
+            .iter()
+            .skip(1)
+            .map(|(id, timestamp, data)| (id.as_str(), *timestamp, data.last().copied()))
+            .collect::<Vec<_>>(),
+        [
+            (row_a.as_str(), w0, Some(first_generation)),
+            (row_a.as_str(), w0, Some(generation)),
+            (row_b.as_str(), w0, Some(generation)),
+            (DEFAULT_POLICY_ID.to_string().as_str(), w0, Some(generation)),
+        ],
+        "the stopped runner's first row alone, then the next request's rows \
+         and marker"
+    );
+    assert_eq!(
+        writes.last().map(|(_, _, data)| data.as_slice()),
+        Some([2.0, generation].as_slice()),
+        "the marker counts both rows of the next request"
+    );
+
+    coordinator.request_cancellation("blocked runner reconnect test");
+    drop(series_send);
+    join_test_task("Publish control", publish)
+        .await
+        .expect("the Publish control exits cleanly");
+    join_test_task("ingest control", ingest)
+        .await
+        .expect("the ingest control exits cleanly");
+    drop(policy_handle);
+    assert!(coordinator.wait_for_drain(Duration::from_secs(5)).await);
+    actor_task.await.unwrap().unwrap();
+    endpoint.close(0u32.into(), &[]);
+    ingest_shutdown.notify_one();
+    publish_shutdown.notify_one();
+    ingest_handle.await.expect("ingest server joins");
+    publish_handle.await.expect("publish server joins");
+    INGEST_CHANNEL.write().await.clear();
+}
+
 /// Windows still queued in the ingest control at shutdown are handed to an
 /// ingest sender: the first starts one, and the next is queued behind it.
 #[serial]
@@ -1817,12 +2722,12 @@ async fn shutdown_drain_writes_series_queued_in_the_ingest_control() {
     let (series_send, series_recv) = async_channel::unbounded();
     for value in [1.0, 2.0] {
         series_send
-            .try_send(TimeSeries {
+            .try_send(IngestFrame::from(TimeSeries {
                 time_series_id: DEFAULT_POLICY_ID.to_string(),
                 policy_id: DEFAULT_POLICY_ID,
                 start_secs: BASE_WINDOW_START_NANOS / 1_000_000_000,
                 series: vec![value],
-            })
+            }))
             .unwrap();
     }
     drop(series_send);
@@ -1885,11 +2790,13 @@ async fn shutdown_drain_keeps_corrections_behind_the_window_they_replace() {
 
     let window_start_secs = BASE_WINDOW_START_NANOS / 1_000_000_000;
     let next_start_secs = (BASE_WINDOW_START_NANOS + DAY_NANOS) / 1_000_000_000;
-    let window = |start_secs, value| TimeSeries {
-        time_series_id: DEFAULT_POLICY_ID.to_string(),
-        policy_id: DEFAULT_POLICY_ID,
-        start_secs,
-        series: vec![value],
+    let window = |start_secs, value| {
+        IngestFrame::from(TimeSeries {
+            time_series_id: DEFAULT_POLICY_ID.to_string(),
+            policy_id: DEFAULT_POLICY_ID,
+            start_secs,
+            series: vec![value],
+        })
     };
     let (series_send, series_recv) = async_channel::unbounded();
     series_send
@@ -1988,25 +2895,26 @@ async fn cancellation_drains_queued_time_series() {
         .await
         .unwrap();
     let policy_id = DEFAULT_POLICY_ID;
-    let first = TimeSeries {
+    let first = IngestFrame::from(TimeSeries {
         time_series_id: policy_id.to_string(),
         policy_id,
         start_secs: 1,
         series: vec![1.0],
-    };
-    let second = TimeSeries {
+    });
+    let second = IngestFrame::from(TimeSeries {
         time_series_id: policy_id.to_string(),
         policy_id,
         start_secs: 2,
         series: vec![2.0],
-    };
+    });
 
-    let recv_channel = register_ingest_queue(policy_id).await;
+    let sender_token = CancellationToken::new();
+    let recv_channel = register_ingest_queue(policy_id, sender_token.clone()).await;
     let sender_task = coordinator.tracker().spawn(send_time_series(
         Arc::new(connection),
         first,
         recv_channel,
-        CancellationToken::new(),
+        sender_token,
         ConnectionLifecycle::new(),
         policy_handle,
         Arc::new(Notify::new()),
@@ -2026,7 +2934,7 @@ async fn cancellation_drains_queued_time_series() {
         .read()
         .await
         .get(&policy_id)
-        .cloned()
+        .map(|queue| queue.frames.clone())
         .expect("per-policy sender exists");
     queued_sender
         .try_send(second)
@@ -2362,10 +3270,20 @@ async fn grouped_policy_writes_ip_rows_and_its_ack_moves_its_checkpoint() {
     let (timestamp, series) = next_written_window(&servers.series).await;
     assert_eq!(timestamp, BASE_WINDOW_START_NANOS);
     assert_eq!(series.time_series_id, "1/192.168.4.76");
-    assert_eq!(series.series.iter().sum::<f64>(), 3.0);
+    let (generation, slots) = series.series.split_last().unwrap();
+    assert_eq!(slots.iter().sum::<f64>(), 3.0);
+    let (timestamp, marker) = next_written_window(&servers.series).await;
+    assert_eq!(timestamp, BASE_WINDOW_START_NANOS);
+    assert_eq!(marker.time_series_id, "1", "the marker follows the IP row");
+    assert_eq!(marker.series, [1.0, *generation]);
     let map = timeout(TEST_TIMEOUT, wait_for_policy_ids(&path, &[policy.id], true))
         .await
         .expect("the grouped window is acknowledged");
+    assert_eq!(
+        stored_generation(&path),
+        *generation,
+        "the rows carry the generation stored for the request"
+    );
     assert_eq!(
         map,
         HashMap::from([(policy.id.to_string(), BASE_WINDOW_START_NANOS)]),
@@ -2671,6 +3589,303 @@ async fn restart_writes_the_window_open_at_shutdown_and_no_zero_row() {
             "no all-zero window is written: {series:?}"
         );
     }
+    drop(dir);
+}
+
+/// Servers whose Publish side answers every request with a stream carrying
+/// `frames` and keeps it open, and whose Ingest side reports the rows of each
+/// stored ingest frame together, as `(series id, timestamp, data)`.
+struct FrameServers {
+    frames: async_channel::Receiver<Vec<(i64, TimeSeries)>>,
+    handles: TestServerHandlers,
+    ingest_addr: SocketAddr,
+    publish_addr: SocketAddr,
+}
+
+type StoredRow = (String, i64, Vec<f64>);
+
+impl FrameServers {
+    fn start(frames: Vec<GeneratorFrame>) -> Self {
+        let (frame_send, frame_recv) = async_channel::unbounded();
+        let ingest_server = FakeGigantoServer::new_ingest().with_frame_notify(frame_send);
+        let publish_server = FakeGigantoServer::new_publish()
+            .with_publish_behavior(PublishBehavior::Records(frames.into()));
+        let ingest_shutdown = Arc::new(Notify::new());
+        let publish_shutdown = Arc::new(Notify::new());
+        let (ingest_addr, ingest_handle) = ingest_server.start_ingest(ingest_shutdown.clone());
+        let (publish_addr, publish_handle) = publish_server.start_publish(publish_shutdown.clone());
+        Self {
+            frames: frame_recv,
+            handles: TestServerHandlers {
+                ingest_shutdown,
+                publish_shutdown,
+                ingest_handle,
+                publish_handle,
+            },
+            ingest_addr,
+            publish_addr,
+        }
+    }
+
+    /// Returns the rows of the next stored ingest frame.
+    async fn next(&self) -> Vec<StoredRow> {
+        timeout(TEST_TIMEOUT, self.frames.recv())
+            .await
+            .expect("a frame is stored before the test deadline")
+            .expect("the frame channel stays open")
+            .into_iter()
+            .map(|(timestamp, row)| (row.time_series_id, timestamp, row.series))
+            .collect()
+    }
+}
+
+/// A raw Conn event from `orig` to an external IP at `timestamp`.
+fn conn_from(timestamp: i64, orig: &str) -> GeneratorFrame {
+    let conn = Conn {
+        orig_addr: orig.parse().unwrap(),
+        resp_addr: "8.8.8.8".parse().unwrap(),
+        ..gen_conn()
+    };
+    GeneratorFrame::Event(timestamp, bincode::serialize(&conn).unwrap())
+}
+
+const IP_A: &str = "192.168.4.76";
+const IP_B: &str = "192.168.4.77";
+const EXTERNAL_IP: &str = "8.8.8.8";
+
+/// [`new_policy`] grouped by source over `192.168.4.0/24`.
+fn grouped_policy() -> TimeSeriesGenerationPolicy {
+    let mut policy = new_policy(DEFAULT_POLICY_ID);
+    policy.group_by = Some(review_protocol::types::EndpointRole::Source);
+    policy.internal_networks = HostNetworkGroup {
+        hosts: Vec::new(),
+        networks: vec!["192.168.4.0/24".parse().unwrap()],
+        ip_ranges: Vec::new(),
+    };
+    policy
+}
+
+/// A 1-day IP row of [`new_policy`] whose only event is in the slot of
+/// [`BASE_TS_NANOS`] (88), as stored: its slots, then `generation`.
+fn base_slot_row(id: &str, window_start: i64, count: f64, generation: f64) -> StoredRow {
+    let mut data = vec![0.0; 96];
+    data[88] = count;
+    data.push(generation);
+    (id.to_owned(), window_start, data)
+}
+
+/// The marker of the window starting at `window_start`, as stored.
+fn stored_marker(window_start: i64, rows: f64, generation: f64) -> StoredRow {
+    (
+        DEFAULT_POLICY_ID.to_string(),
+        window_start,
+        vec![rows, generation],
+    )
+}
+
+/// Returns the generation the checkpoint file holds for the default policy.
+#[allow(clippy::cast_precision_loss)] // Generations are below 2^53.
+fn stored_generation(path: &Path) -> f64 {
+    read_checkpoints(path)[&DEFAULT_POLICY_ID.to_string()]
+        .1
+        .expect("a grouped request stores its generation") as f64
+}
+
+/// Runs [`grouped_policy`] over [`FrameServers`] carrying `frames`, with its
+/// checkpoint file at `path` if given, and windows closing by event time
+/// only.
+struct GroupedRun {
+    coordinator: CancellationCoordinator,
+    review: crate::request::Client,
+    policy_handle: PolicyHandle,
+    client_handle: tokio::task::JoinHandle<()>,
+    servers: FrameServers,
+    path: PathBuf,
+    dir: TempDir,
+}
+
+impl GroupedRun {
+    async fn start(path: Option<&Path>, frames: Vec<GeneratorFrame>) -> Self {
+        const NEVER: Duration = Duration::from_secs(3600);
+        INGEST_CHANNEL.write().await.clear();
+        let servers = FrameServers::start(frames);
+        let coordinator = CancellationCoordinator::new();
+        let (mut review, actor_task, path, dir, policy_handle) =
+            setup_request_client(path, &coordinator).await;
+        review
+            .time_series_generation_policy_list(&[grouped_policy()])
+            .await
+            .unwrap();
+        let client_handle = spawn_subscribe_client_with_timer(
+            &cert_key(),
+            actor_task,
+            servers.ingest_addr,
+            servers.publish_addr,
+            policy_handle.clone(),
+            coordinator.clone(),
+            CloseTimer::new(|| i64::MIN, NEVER, NEVER),
+        );
+        Self {
+            coordinator,
+            review,
+            policy_handle,
+            client_handle,
+            servers,
+            path,
+            dir,
+        }
+    }
+
+    /// Stops the run and returns the directory it was given or created.
+    async fn stop(self) -> TempDir {
+        drop(self.review);
+        drop(self.policy_handle);
+        cleanup_test_resources(self.coordinator, self.client_handle, self.servers.handles).await;
+        self.dir
+    }
+}
+
+/// A grouped close writes each IP row, ending with the run's generation, in
+/// its own frame and then the marker. After the marker, a new IP's row and
+/// the marker counting it arrive in one frame, and an existing IP's
+/// correction alone. A window without IP rows closes with `[0, generation]`
+/// once an event passes it, and a late event there writes its row and
+/// `[1, generation]` in one frame.
+#[serial]
+#[tokio::test]
+async fn grouped_corrections_after_the_marker_arrive_in_one_frame() {
+    let w0 = BASE_WINDOW_START_NANOS;
+    let w1 = BASE_WINDOW_START_NANOS + DAY_NANOS;
+    let run = GroupedRun::start(
+        None,
+        vec![
+            conn_from(BASE_TS_NANOS, IP_A),
+            // Passes w0, which closes; w1 counts nothing.
+            conn_from(BASE_TS_NANOS + DAY_NANOS, EXTERNAL_IP),
+            conn_from(BASE_TS_NANOS + 1, IP_B),
+            conn_from(BASE_TS_NANOS + 2, IP_A),
+            // Passes w1, which closes without IP rows.
+            conn_from(BASE_TS_NANOS + 2 * DAY_NANOS, EXTERNAL_IP),
+            conn_from(BASE_TS_NANOS + DAY_NANOS + 1, IP_A),
+        ],
+    )
+    .await;
+    let first = run.servers.next().await;
+    let generation = stored_generation(&run.path);
+    assert_eq!(
+        first,
+        [base_slot_row("1/192.168.4.76", w0, 1.0, generation)],
+        "the generation stored for the request"
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [stored_marker(w0, 1.0, generation)]
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [
+            base_slot_row("1/192.168.4.77", w0, 1.0, generation),
+            stored_marker(w0, 2.0, generation),
+        ],
+        "a new IP's row and the marker in one frame"
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [base_slot_row("1/192.168.4.76", w0, 2.0, generation)],
+        "a correction alone"
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [stored_marker(w1, 0.0, generation)],
+        "a window without IP rows"
+    );
+    assert_eq!(
+        run.servers.next().await,
+        [
+            base_slot_row("1/192.168.4.76", w1, 1.0, generation),
+            stored_marker(w1, 1.0, generation),
+        ],
+        "a late row in a window without IP rows, with the marker"
+    );
+    drop(run.stop().await);
+}
+
+/// After a stop following the ACK of window T, a restart requests from T
+/// with a greater generation, which is on disk before its first row, and
+/// rewrites T and the later windows with it, IP rows before each marker. No
+/// window before T is written again.
+#[serial]
+#[tokio::test]
+async fn grouped_restart_rewrites_from_the_checkpoint_with_a_new_generation() {
+    let w0 = BASE_WINDOW_START_NANOS;
+    let w1 = BASE_WINDOW_START_NANOS + DAY_NANOS;
+    let run = GroupedRun::start(
+        None,
+        vec![
+            conn_from(BASE_TS_NANOS, IP_A),
+            conn_from(BASE_TS_NANOS + 1, IP_B),
+            conn_from(BASE_TS_NANOS + DAY_NANOS, IP_A),
+        ],
+    )
+    .await;
+    let mut written = Vec::new();
+    for _ in 0..3 {
+        written.extend(run.servers.next().await);
+    }
+    let first = stored_generation(&run.path);
+    assert_eq!(
+        written,
+        [
+            base_slot_row("1/192.168.4.76", w0, 1.0, first),
+            base_slot_row("1/192.168.4.77", w0, 1.0, first),
+            stored_marker(w0, 2.0, first),
+        ]
+    );
+    let checkpoint = timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Some(timestamp) =
+                read_time_data_map(&run.path).get(&DEFAULT_POLICY_ID.to_string())
+            {
+                return *timestamp;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the window is acknowledged");
+    assert_eq!(checkpoint, w0);
+    let path = run.path.clone();
+    let dir = run.stop().await;
+
+    let run = GroupedRun::start(
+        Some(&path),
+        vec![
+            // Before the checkpoint: not part of the resumed request.
+            conn_from(BASE_TS_NANOS - DAY_NANOS, IP_B),
+            conn_from(BASE_TS_NANOS, IP_A),
+            conn_from(BASE_TS_NANOS + DAY_NANOS, IP_A),
+            conn_from(BASE_TS_NANOS + 2 * DAY_NANOS, EXTERNAL_IP),
+        ],
+    )
+    .await;
+    let first_frame = run.servers.next().await;
+    let second = stored_generation(&path);
+    assert!(second > first, "{second} > {first}");
+    let mut written = first_frame;
+    for _ in 0..3 {
+        written.extend(run.servers.next().await);
+    }
+    assert_eq!(
+        written,
+        [
+            base_slot_row("1/192.168.4.76", w0, 1.0, second),
+            stored_marker(w0, 1.0, second),
+            base_slot_row("1/192.168.4.76", w1, 1.0, second),
+            stored_marker(w1, 1.0, second),
+        ],
+        "T is rewritten with the IPs of this run, then the later window"
+    );
+    drop(run.stop().await);
     drop(dir);
 }
 
@@ -3763,6 +4978,7 @@ mod policy_lifecycle {
                 connection_token.clone(),
                 coordinator.clone(),
                 CloseTimer::default(),
+                Arc::new(Notify::new()),
             ));
             // Join this worker itself, not an assumed total number of unrelated tasks.
             // Neither policy nor connection cancellation can account for its exit.
@@ -3773,7 +4989,10 @@ mod policy_lifecycle {
             assert!(!connection_token.is_cancelled());
             assert!(!coordinator.is_cancelled());
             assert!(connection.close_reason().is_none());
-            assert_eq!(receiver.recv().await.unwrap().time_series_id, "42");
+            assert_eq!(
+                receiver.recv().await.unwrap().rows()[0].time_series_id,
+                "42"
+            );
             // Seed an acknowledged checkpoint after natural worker completion.
             handle.record_ack(42, 123).await.unwrap();
             let _ = handle.stream_policy(42).await.unwrap();
@@ -3785,6 +5004,89 @@ mod policy_lifecycle {
             assert!(!read_time_data_map(&path).contains_key("42"));
             assert!(handle.get_policy(42).await.is_none());
             coordinator.request_cancellation("EOF deletion test complete");
+            endpoint.close(0u32.into(), &[]);
+            shutdown.notify_one();
+            join_test_task("Giganto Publish server", server).await;
+            drop(review);
+            drop(handle);
+            join_test_task("policy actor", actor).await.unwrap();
+            assert!(coordinator.wait_for_drain(TEST_TIMEOUT).await);
+        })
+        .await;
+    }
+
+    /// An ingest sender that drops a frame of a request stops that request.
+    /// The request's runner then stops writing and signals a reconnect, whose
+    /// request of the policy rewrites its windows with a new generation, while
+    /// the policy itself stays active.
+    #[serial]
+    #[tokio::test]
+    async fn runner_of_a_stopped_request_stops_and_signals_a_reconnect() {
+        run_test(async {
+            let coordinator = CancellationCoordinator::new();
+            let (mut review, actor, _path, _dir, handle) =
+                setup_request_client(None, &coordinator).await;
+            review
+                .time_series_generation_policy_list(&[new_policy(42)])
+                .await
+                .unwrap();
+            let state = handle.stream_policy(42).await.unwrap().unwrap();
+            let shutdown = Arc::new(Notify::new());
+            let mut fake = FakeGigantoServer::new_publish().with_held_streams();
+            fake.publish_repeat_delay = Duration::ZERO;
+            let (addr, server) = fake.start_publish(shutdown.clone());
+            let endpoint = client::config(&cert_key()).unwrap();
+            let (connection, mut send) =
+                publish_connect(&endpoint, addr, HOST, REQUIRED_GIGANTO_VERSION)
+                    .await
+                    .unwrap();
+            process_network_stream(&mut send, &state, RequestStreamRecord::Conn)
+                .await
+                .unwrap();
+            let mut recv = connection.accept_uni().await.unwrap();
+            assert_eq!(
+                receive_time_series_generator_stream_start_message(&mut recv)
+                    .await
+                    .unwrap(),
+                42
+            );
+            let policy_token = state.token.clone();
+            let connection_token = CancellationToken::new();
+            let connection_notify = Arc::new(Notify::new());
+            let reconnect = connection_notify.notified();
+            tokio::pin!(reconnect);
+            reconnect.as_mut().enable();
+            let (sender, receiver) = async_channel::unbounded();
+            let (stream_send, stream_recv) = mpsc::unbounded_channel();
+            stream_send.send(recv).unwrap();
+            let worker = coordinator.tracker().spawn(run_policy(
+                state,
+                stream_recv,
+                sender,
+                connection_token.clone(),
+                coordinator.clone(),
+                CloseTimer::default(),
+                connection_notify.clone(),
+            ));
+
+            let written = timeout(TEST_TIMEOUT, receiver.recv())
+                .await
+                .expect("the runner writes its window")
+                .unwrap();
+            assert!(!written.run_stopped());
+            // As an ingest sender does with a frame it drops.
+            written.stop_run();
+            timeout(TEST_TIMEOUT, reconnect)
+                .await
+                .expect("the runner signals a reconnect");
+            join_test_task("runner of the stopped request", worker)
+                .await
+                .unwrap();
+            assert!(!policy_token.is_cancelled(), "the policy stays active");
+            assert!(!connection_token.is_cancelled());
+            assert!(handle.get_policy(42).await.is_some());
+
+            coordinator.request_cancellation("stopped request test complete");
             endpoint.close(0u32.into(), &[]);
             shutdown.notify_one();
             join_test_task("Giganto Publish server", server).await;

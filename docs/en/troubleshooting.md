@@ -11,6 +11,10 @@
 - Verify that the file path is correct
 - Verify that the parent directory has write permissions
 - If the file exists, verify that it is in valid JSON format
+- A file in the form an earlier Crusher wrote, a number for each policy ID
+  such as `{"42": 1700006400000000000}`, is rejected at startup: Crusher does
+  not start and leaves the file unchanged. This version is installed fresh:
+  start it without that file, which it then creates anew.
 
 ## When Connection Fails
 
