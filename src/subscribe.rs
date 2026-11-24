@@ -3,6 +3,7 @@ mod tests;
 mod time_series;
 
 use std::sync::{LazyLock, Mutex};
+use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
@@ -34,10 +35,13 @@ use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarIn
 use review_protocol::types::{
     ConnField, Measure, RawEventKind as PolicyRawEventKind, TimeSeriesGenerationPolicy,
 };
-use time_series::{TimeSeries, WindowBuilder};
+use time_series::{PassClock, TimeSeries, WindowBuilder};
 use tokio::{
     sync::{Notify, RwLock, mpsc},
-    time::{Duration, Instant, MissedTickBehavior, interval, sleep, timeout, timeout_at},
+    task::JoinSet,
+    time::{
+        Duration, Instant, MissedTickBehavior, interval, interval_at, sleep, timeout, timeout_at,
+    },
 };
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker as ConnectionTaskTracker;
@@ -54,23 +58,31 @@ const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a stream must have received no event before the timer closes its
-/// open window. The idle gate keeps the timer from cutting a window that a
-/// replay of stored events is still filling.
+/// How long a stream must have received no event after its replay end before
+/// it passes a window by the wall clock. A stream passes by the wall clock
+/// only after its replay end, so a replay that pauses never cuts a window it
+/// is still filling.
 const CLOSE_IDLE_SECS: u64 = 30;
 
-/// How often a stream worker checks whether its open window is due to close.
+/// How often a policy runner checks whether a window is due to close.
 const CLOSE_CHECK_SECS: u64 = 10;
 
-/// Decides when a stream worker closes the open window of a quiet stream:
-/// every `check_interval`, once no event has been received for `idle` and the
-/// wall clock is past the window's end plus its grace.
+/// How often a policy runner warns while a stream of its request has not
+/// opened or is still replaying.
+const STALL_WARNING_SECS: u64 = 600;
+
+/// Decides when a policy runner closes windows its streams passed by being
+/// quiet: every `check_interval`, a stream past its replay end that has
+/// received no event for `idle` passes the windows whose end plus the grace
+/// the wall clock has reached. Also sets how often a runner warns about
+/// streams that hold its windows open.
 #[derive(Clone)]
 struct CloseTimer {
     /// The wall clock, in seconds since the Unix epoch.
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     check_interval: Duration,
     idle: Duration,
+    stall_warning: Duration,
 }
 
 #[cfg(test)]
@@ -84,6 +96,22 @@ impl CloseTimer {
             now: Arc::new(now),
             check_interval,
             idle,
+            stall_warning: Duration::from_secs(STALL_WARNING_SECS),
+        }
+    }
+
+    fn with_stall_warning(mut self, stall_warning: Duration) -> Self {
+        self.stall_warning = stall_warning;
+        self
+    }
+}
+
+impl CloseTimer {
+    fn pass_clock(&self) -> PassClock {
+        PassClock {
+            wall_secs: (self.now)(),
+            now: Instant::now(),
+            idle: self.idle,
         }
     }
 }
@@ -100,6 +128,7 @@ impl Default for CloseTimer {
             }),
             check_interval: Duration::from_secs(CLOSE_CHECK_SECS),
             idle: Duration::from_secs(CLOSE_IDLE_SECS),
+            stall_warning: Duration::from_secs(STALL_WARNING_SECS),
         }
     }
 }
@@ -707,14 +736,18 @@ async fn publish_connection_control(
             Ok((conn, mut send)) => {
                 let lifecycle = ConnectionLifecycle::new();
                 let requests = PublishRequests::default();
+                let runners = PolicyRunners {
+                    series: series_send.clone(),
+                    lifecycle: lifecycle.clone(),
+                    coordinator: coordinator.clone(),
+                    close_timer: close_timer.clone(),
+                };
                 let dispatcher = lifecycle.tasks.track_future(run_inbound_dispatcher(
                     conn.clone(),
-                    series_send.clone(),
                     connection_notify.clone(),
                     requests.clone(),
                     lifecycle.clone(),
                     coordinator.clone(),
-                    close_timer.clone(),
                 ));
                 let mut dispatcher = coordinator.tracker().spawn(dispatcher);
                 let outcome = tokio::select! {
@@ -730,7 +763,12 @@ async fn publish_connection_control(
                         connection_notify.notify_waiters();
                         Ok(StreamRecoveryAction::Reconnect)
                     }
-                    result = send_policy_requests(&mut send, &policy_handle, &requests) => result,
+                    result = send_policy_requests(
+                        &mut send,
+                        &policy_handle,
+                        &requests,
+                        &runners,
+                    ) => result,
                 };
                 // A cancelled write may have sent part of a frame. Always close
                 // and drain this connection before reusing the latest snapshot.
@@ -769,16 +807,28 @@ async fn publish_connection_control(
     }
 }
 
-/// A stream request sent on one Publish connection, and whether Giganto's
-/// inbound stream for it has arrived.
+/// The stream requests of one policy sent on one Publish connection, one per
+/// sensor, and how many of Giganto's inbound streams for them have arrived.
 struct PublishRequest {
     state: StreamPolicy,
-    answered: bool,
+    /// The number of streams requested: one per sensor of the policy.
+    expected: usize,
+    answered: usize,
+    /// Hands each inbound stream to the policy's runner.
+    streams: mpsc::UnboundedSender<RecvStream>,
+}
+
+impl PublishRequest {
+    fn all_answered(&self) -> bool {
+        self.answered >= self.expected
+    }
 }
 
 /// The stream requests of one Publish connection, keyed by policy ID. Giganto
 /// names an inbound stream only by policy ID, so the dispatcher binds it to the
-/// request recorded here, not to the policy's current content.
+/// request recorded here, not to the policy's current content. The streams of
+/// one policy are not told apart: each binds to the policy's request until as
+/// many have arrived as were requested.
 #[derive(Clone, Default)]
 struct PublishRequests(Arc<Mutex<HashMap<u32, PublishRequest>>>);
 
@@ -789,34 +839,77 @@ impl PublishRequests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Takes the request an inbound stream for `id` answers. `None` means no
-    /// request is waiting for one, or its policy was deleted or replaced since.
-    fn answer(&self, id: u32) -> Option<StreamPolicy> {
+    /// Binds an inbound stream for `id` to the request it answers, and returns
+    /// where to hand it. `None` means no request is waiting for another
+    /// stream, or its policy was deleted or replaced since.
+    fn answer(&self, id: u32) -> Option<mpsc::UnboundedSender<RecvStream>> {
         let mut requests = self.lock();
-        let request = requests.get_mut(&id).filter(|request| !request.answered)?;
-        request.answered = true;
-        (!request.state.token.is_cancelled()).then(|| request.state.clone())
+        let request = requests
+            .get_mut(&id)
+            .filter(|request| !request.all_answered())?;
+        request.answered += 1;
+        (!request.state.token.is_cancelled()).then(|| request.streams.clone())
+    }
+}
+
+/// What a Publish connection starts each policy's runner with.
+struct PolicyRunners {
+    series: Sender<TimeSeries>,
+    lifecycle: ConnectionLifecycle,
+    coordinator: CancellationCoordinator,
+    close_timer: CloseTimer,
+}
+
+impl PolicyRunners {
+    /// Starts the runner of the request `state` was sent with, and returns the
+    /// sender the dispatcher hands that request's inbound streams to.
+    fn spawn(&self, state: StreamPolicy) -> mpsc::UnboundedSender<RecvStream> {
+        let (stream_send, stream_recv) = mpsc::unbounded_channel();
+        let series = self.series.clone();
+        let connection_token = self.lifecycle.token.clone();
+        let coordinator = self.coordinator.clone();
+        let close_timer = self.close_timer.clone();
+        let policy_id = state.policy.id;
+        let runner = self.lifecycle.tasks.track_future(async move {
+            if let Err(e) = run_policy(
+                state,
+                stream_recv,
+                series,
+                connection_token,
+                coordinator,
+                close_timer,
+            )
+            .await
+            {
+                warn!(policy_id, "Policy runner failed: {e:#}");
+            }
+        });
+        self.coordinator.tracker().spawn(runner);
+        stream_send
     }
 }
 
 /// Watches current state rather than replaying queued add events. Each connection
-/// sends a policy once, including requests still waiting for an inbound stream.
+/// sends a policy's requests once, including requests still waiting for an
+/// inbound stream, and starts the policy's runner as it sends them.
 ///
-/// A policy whose token was cancelled after its request went out (deleted,
+/// A policy whose token was cancelled after its requests went out (deleted,
 /// absent from a list, or replaced with new content) is requested again only
-/// once that request's inbound stream has arrived. Until then a stream for its
-/// ID could answer either request, so the connection is replaced instead.
+/// once every inbound stream of those requests has arrived. Until then a
+/// stream for its ID could answer either request, so the connection is
+/// replaced instead.
 async fn send_policy_requests(
     send: &mut SendStream,
     policy_handle: &PolicyHandle,
     requests: &PublishRequests,
+    runners: &PolicyRunners,
 ) -> Result<StreamRecoveryAction> {
     let mut policy_ids = policy_handle.subscribe();
     loop {
         let snapshot = policy_ids.borrow_and_update().clone();
         requests
             .lock()
-            .retain(|_, request| !request.answered || !request.state.token.is_cancelled());
+            .retain(|_, request| !request.all_answered() || !request.state.token.is_cancelled());
         for id in snapshot {
             {
                 let mut requests = requests.lock();
@@ -824,10 +917,10 @@ async fn send_policy_requests(
                     if !request.state.token.is_cancelled() {
                         continue;
                     }
-                    if !request.answered {
+                    if !request.all_answered() {
                         info!(
-                            "Reconnecting Publish: policy {id} changed before the stream \
-                             for its earlier request arrived"
+                            "Reconnecting Publish: policy {id} changed before every stream \
+                             of its earlier request arrived"
                         );
                         return Ok(StreamRecoveryAction::Reconnect);
                     }
@@ -851,13 +944,17 @@ async fn send_policy_requests(
                     continue;
                 }
             };
-            // Record the request before writing it so that its stream cannot
-            // arrive before the dispatcher can bind it.
+            // Record the request and start its runner before writing it so
+            // that its streams cannot arrive before the dispatcher can bind
+            // them.
+            let streams = runners.spawn(state.clone());
             requests.lock().insert(
                 id,
                 PublishRequest {
                     state: state.clone(),
-                    answered: false,
+                    expected: state.policy.sensors.len(),
+                    answered: 0,
+                    streams,
                 },
             );
             tokio::select! {
@@ -905,28 +1002,31 @@ async fn publish_connect(
 
 /// The Publish control task owns the request stream and writes requests in order.
 ///
-/// A policy the actor accepted has exactly one sensor, which the request names.
+/// Sends one generator stream request per sensor of the policy, all from the
+/// policy's checkpoint.
 async fn process_network_stream(
     send: &mut SendStream,
     state: &StreamPolicy,
     record_type: RequestStreamRecord,
 ) -> Result<()> {
     let policy = &state.policy;
-    let request = RequestTimeSeriesGeneratorStream {
-        start: state.start,
-        id: policy.id.to_string(),
-        src_ip: policy.src_ip,
-        dst_ip: policy.dst_ip,
-        sensor: policy.sensors.first().cloned(),
-    };
-    send_stream_request(
-        send,
-        StreamRequestPayload::TimeSeriesGenerator {
-            record_type,
-            request,
-        },
-    )
-    .await?;
+    for sensor in &policy.sensors {
+        let request = RequestTimeSeriesGeneratorStream {
+            start: state.start,
+            id: policy.id.to_string(),
+            src_ip: policy.src_ip,
+            dst_ip: policy.dst_ip,
+            sensor: Some(sensor.clone()),
+        };
+        send_stream_request(
+            send,
+            StreamRequestPayload::TimeSeriesGenerator {
+                record_type,
+                request,
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -934,18 +1034,16 @@ async fn process_network_stream(
 /// inbound stream dispatch. For each accepted unidirectional stream
 /// it reads the stream-start message to determine the policy id, then
 /// binds the stream to the request it answers on this connection and
-/// spawns a per-stream worker with the policy state that request was
-/// sent with. Streams whose policy was deleted or replaced since the
-/// request are silently skipped — they are a normal consequence of a
+/// hands it to that request's policy runner. Streams whose policy was
+/// deleted or replaced since the request, and streams beyond the number
+/// requested, are silently skipped — they are a normal consequence of a
 /// change that raced with an in-flight stream open.
 async fn run_inbound_dispatcher(
     conn: Connection,
-    sender: Sender<TimeSeries>,
     connection_notify: Arc<Notify>,
     requests: PublishRequests,
     connection_lifecycle: ConnectionLifecycle,
     coordinator: CancellationCoordinator,
-    close_timer: CloseTimer,
 ) {
     loop {
         let recv_result = tokio::select! {
@@ -976,60 +1074,165 @@ async fn run_inbound_dispatcher(
             }
         };
 
-        let Some(state) = requests.answer(id) else {
+        let Some(runner) = requests.answer(id) else {
             info!(
-                "Inbound stream for unknown, deleted or replaced policy {id}; \
-                 dropping stream"
+                "Inbound stream for unknown, deleted or replaced policy {id}, or beyond \
+                 its sensors; dropping stream"
             );
             let _ = recv.stop(VarInt::default());
             continue;
         };
-
-        let sender = sender.clone();
-        let coord = coordinator.clone();
-        let worker_lifecycle = connection_lifecycle.clone();
-        let policy_id = state.policy.id;
-        let close_timer = close_timer.clone();
-        let worker = connection_lifecycle.tasks.track_future(async move {
-            if let Err(e) = run_stream_worker(
-                recv,
-                sender,
-                state,
-                worker_lifecycle.token,
-                coord,
-                close_timer,
-            )
-            .await
-            {
-                warn!(policy_id, "Stream worker failed: {e:#}");
-            }
-        });
-        coordinator.tracker().spawn(worker);
+        if let Err(mpsc::error::SendError(mut recv)) = runner.send(recv) {
+            info!("Inbound stream for policy {id} whose runner has stopped; dropping stream");
+            let _ = recv.stop(VarInt::default());
+        }
     }
 }
 
-/// Per-stream worker, spawned by [`run_inbound_dispatcher`] only after
-/// the inbound stream has been bound to its policy by id. The worker
-/// owns the recv stream and is responsible for decoding events,
-/// building and writing their windows, closing a quiet stream's window
-/// on `close_timer`, reacting to per-policy deletion (`policy_token`),
-/// and global cancellation.
-///
-/// Shutdown, deletion and a replaced connection drop the open window
-/// without writing it: it has not ended, and the resume rebuilds it from
-/// the events Giganto stores.
-///
-/// When the inbound stream finishes or errors, the worker exits
-/// silently; reconnection is driven by `conn.closed()` in
-/// `publish_connection_control` and by `accept_uni()` in the
-/// dispatcher, both of which observe genuine connection failures
-/// directly. Forcing a reconnect from a single stream's end would
-/// race-kill any sibling streams in flight.
-async fn run_stream_worker(
+/// Reads the frames of one generator stream and hands each over `frames`. The
+/// runner's timer must not interrupt a partly read frame, so each stream is
+/// read by its own task. When the runner stops taking frames, as it does while
+/// the stream is paused, the reader stops reading once one frame waits.
+async fn read_generator_frames(
     mut recv: RecvStream,
-    sender: Sender<TimeSeries>,
+    frames: mpsc::Sender<TimeSeriesGeneratorData>,
+) {
+    while let Ok(data) = receive_time_series_generator_data(&mut recv).await {
+        if frames.send(data).await.is_err() {
+            return;
+        }
+    }
+    // Dropping the sender tells the runner that the stream ended once it has
+    // taken the frames already handed over.
+}
+
+/// Waits for the next frame of a stream that is not paused, polling the
+/// streams from `first` on so that none is starved. Returns the stream's index
+/// and the frame, or `None` once the stream has ended.
+fn next_frame<'a>(
+    frames: &'a mut [Option<mpsc::Receiver<TimeSeriesGeneratorData>>],
+    windows: &'a WindowBuilder,
+    first: usize,
+) -> impl Future<Output = (usize, Option<TimeSeriesGeneratorData>)> + 'a {
+    std::future::poll_fn(move |cx| {
+        let streams = frames.len();
+        for offset in 0..streams {
+            let index = (first + offset) % streams;
+            if windows.is_paused(index) {
+                continue;
+            }
+            let Some(receiver) = frames.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+            if let Poll::Ready(frame) = receiver.poll_recv(cx) {
+                return Poll::Ready((index, frame));
+            }
+        }
+        Poll::Pending
+    })
+}
+
+/// Applies a frame that stream `index` of `policy` received to its windows, and
+/// returns the windows to write, in order.
+fn take_frame(
+    windows: &mut WindowBuilder,
+    policy: &TimeSeriesGenerationPolicy,
+    record_type: RequestStreamRecord,
+    index: usize,
+    frame: TimeSeriesGeneratorData,
+    close_timer: &CloseTimer,
+) -> Vec<TimeSeries> {
+    let id = policy.id;
+    match frame {
+        TimeSeriesGeneratorData::ReplayEnd { .. } => {
+            // The replay end is not an event: it neither counts nor moves the
+            // stream's watermark.
+            if !windows.replay_end(index, Instant::now()) {
+                warn!(
+                    policy_id = id,
+                    "Skipping a second replay-end frame on a stream of policy {id}"
+                );
+            }
+            Vec::new()
+        }
+        TimeSeriesGeneratorData::Event { record, timestamp } => {
+            // Every received event moves the watermark, whether or not it is
+            // then counted.
+            windows.receive(index, timestamp, Instant::now());
+            let mut written = windows.close_due(&close_timer.pass_clock());
+            let Ok(event) = Event::try_new(record_type, &record) else {
+                warn!(
+                    "Failed to deserialize raw_event for raw event kind: {:?}",
+                    policy.raw_event_kind
+                );
+                return written;
+            };
+            match windows.add(index, timestamp, &event) {
+                Ok(series) => written.extend(series),
+                Err(e) => warn!("Failed to generate time series: {}", e),
+            }
+            written
+        }
+    }
+}
+
+/// Starts reading a stream bound to `policy`, whose frames the runner then
+/// takes from the end of `frames`.
+fn bind_stream(
+    recv: RecvStream,
+    readers: &mut JoinSet<()>,
+    frames: &mut Vec<Option<mpsc::Receiver<TimeSeriesGeneratorData>>>,
+    policy: &TimeSeriesGenerationPolicy,
+) {
+    let (frame_send, frame_recv) = mpsc::channel(1);
+    readers.spawn(read_generator_frames(recv, frame_send));
+    frames.push(Some(frame_recv));
+    info!(
+        "Raw event {:?} stream {} of {} of policy {} has been connected",
+        policy.raw_event_kind,
+        frames.len(),
+        policy.sensors.len(),
+        policy.id,
+    );
+}
+
+/// Warns if a stream of policy `id` has not opened or is still replaying, as
+/// either holds the policy's windows open.
+fn warn_if_stalled(windows: &WindowBuilder, id: u32, expected: usize) {
+    let (unopened, replaying) = windows.stall_counts();
+    if unopened > 0 || replaying > 0 {
+        warn!(
+            policy_id = id,
+            unopened,
+            replaying,
+            "Policy {id} holds its windows open: {unopened} of its {expected} streams have not \
+             opened and {replaying} opened streams are still replaying"
+        );
+    }
+}
+
+/// Runs one policy over the generator streams of one request, one per sensor.
+/// Spawned when the request is sent, it takes each inbound stream the
+/// dispatcher binds to the request, builds the policy's windows from the events
+/// of all its streams, closes them as its streams pass them, and writes them.
+/// It reacts to per-policy deletion (`policy_token`), to the Publish
+/// connection being replaced (`connection_token`) and to global cancellation.
+///
+/// Shutdown, deletion and a replaced connection stop every stream and drop the
+/// windows not yet closed without writing them: they are not complete, and the
+/// resume rebuilds them from the events Giganto stores.
+///
+/// A stream that ends passes no further window, so the policy's windows stop
+/// closing until the next request. Reconnection is driven by `conn.closed()`
+/// in `publish_connection_control` and by `accept_uni()` in the dispatcher,
+/// both of which observe genuine connection failures directly. Forcing a
+/// reconnect from a single stream's end would race-kill any sibling streams in
+/// flight.
+async fn run_policy(
     state: StreamPolicy,
-    connection_token: tokio_util::sync::CancellationToken,
+    mut streams: mpsc::UnboundedReceiver<RecvStream>,
+    sender: Sender<TimeSeries>,
+    connection_token: CancellationToken,
     coordinator: CancellationCoordinator,
     close_timer: CloseTimer,
 ) -> Result<()> {
@@ -1038,87 +1241,91 @@ async fn run_stream_worker(
         token: policy_token,
         start,
     } = state;
-    info!("Raw event {:?} has been connected", policy.raw_event_kind);
     let id = policy.id;
     let record_type = stream_record(policy.raw_event_kind)?;
-    let mut windows = WindowBuilder::try_new(&policy, start)?;
+    let expected = policy.sensors.len();
+    let mut windows = WindowBuilder::try_new(&policy, start, expected)?;
+    let mut readers = JoinSet::new();
+    // The frames of each opened stream, by stream index; `None` once ended.
+    let mut frames: Vec<Option<mpsc::Receiver<TimeSeriesGeneratorData>>> =
+        Vec::with_capacity(expected);
 
-    // The timer must not interrupt a partly read event, so the stream is read
-    // by its own future, which hands each complete event over this channel.
-    let (event_send, mut event_recv) = mpsc::channel(1);
-    let reader = async {
-        while let Ok(data) = receive_time_series_generator_data(&mut recv).await {
-            // The replay end is not an event: it is dropped here so that it
-            // reaches neither the builder nor its idle gate.
-            let TimeSeriesGeneratorData::Event { record, timestamp } = data else {
-                continue;
-            };
-            if event_send.send((record, timestamp)).await.is_err() {
-                break;
-            }
-        }
-        // Dropping the sender tells the builder that the stream ended once it
-        // has taken the events already handed over.
-        drop(event_send);
-        std::future::pending::<()>().await;
-    };
-    let builder = async {
+    let result = async {
         let mut check = interval(close_timer.check_interval);
         check.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut last_received = Instant::now();
+        let mut stall = interval_at(
+            Instant::now() + close_timer.stall_warning,
+            close_timer.stall_warning,
+        );
+        stall.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut withdrawn = false;
+        let mut first = 0;
         loop {
             tokio::select! {
                 biased;
                 () = coordinator.cancelled() => {
-                    info!("Stream worker for policy {id} shutting down");
-                    return Ok(false);
+                    info!("Runner for policy {id} shutting down");
+                    return Ok(());
                 }
                 () = policy_token.cancelled() => {
-                    info!("Policy {id} deleted, stopping stream worker");
-                    return Ok(true);
+                    info!("Policy {id} deleted, stopping its runner");
+                    return Ok(());
                 }
                 () = connection_token.cancelled() => {
-                    info!("Stream worker for policy {id} stopping; publish connection replaced");
-                    return Ok(false);
+                    info!("Runner for policy {id} stopping; publish connection replaced");
+                    return Ok(());
                 }
-                received = event_recv.recv() => {
-                    let Some((raw_event, timestamp_nanos)) = received else {
-                        info!("Stream for policy {id} ended");
-                        return Ok(false);
-                    };
-                    last_received = Instant::now();
-                    let Ok(event) = Event::try_new(record_type, &raw_event) else {
-                        warn!(
-                            "Failed to deserialize raw_event for raw event kind: {:?}",
-                            policy.raw_event_kind
-                        );
+                recv = streams.recv(), if !withdrawn && frames.len() < expected => {
+                    let Some(recv) = recv else {
+                        withdrawn = true;
                         continue;
                     };
-                    match windows.add(timestamp_nanos, &event) {
-                        Ok(Some(series)) => write_window(&sender, series).await?,
-                        Ok(None) => {}
-                        Err(e) => warn!("Failed to generate time series: {}", e),
+                    if windows.open_stream().is_some() {
+                        bind_stream(recv, &mut readers, &mut frames, &policy);
+                    }
+                }
+                (index, frame) = next_frame(&mut frames, &windows, first) => {
+                    first = index.wrapping_add(1);
+                    match frame {
+                        None => {
+                            if let Some(ended) = frames.get_mut(index) {
+                                *ended = None;
+                            }
+                            windows.end_stream(index, &close_timer.pass_clock());
+                            info!("A stream of policy {id} ended");
+                            if frames.len() == expected && frames.iter().all(Option::is_none) {
+                                info!("Every stream of policy {id} ended");
+                                return Ok(());
+                            }
+                        }
+                        Some(frame) => {
+                            let written = take_frame(
+                                &mut windows,
+                                &policy,
+                                record_type,
+                                index,
+                                frame,
+                                &close_timer,
+                            );
+                            for series in written {
+                                write_window(&sender, series).await?;
+                            }
+                        }
                     }
                 }
                 _ = check.tick() => {
-                    if last_received.elapsed() < close_timer.idle {
-                        continue;
-                    }
-                    if let Some(series) = windows.close_if_due((close_timer.now)()) {
+                    for series in windows.close_due(&close_timer.pass_clock()) {
                         write_window(&sender, series).await?;
                     }
                 }
+                _ = stall.tick() => warn_if_stalled(&windows, id, expected),
             }
         }
-    };
-    let deleted: Result<bool> = tokio::select! {
-        result = builder => result,
-        () = reader => unreachable!("the stream reader never completes"),
-    };
-    if deleted? {
-        recv.stop(VarInt::default())?;
     }
-    Ok(())
+    .await;
+    // Stopping the readers drops their streams, which stops them.
+    readers.shutdown().await;
+    result
 }
 
 /// Hands a window to the ingest control, which queues it to the policy's
@@ -1133,7 +1340,7 @@ async fn write_window(send_channel: &Sender<TimeSeries>, series: TimeSeries) -> 
 /// the policy has no sender, or its sender closed with a deleted policy, a
 /// replaced ingest connection or shutdown, so that the caller starts one.
 ///
-/// The ingest control takes every window in the order its stream worker wrote
+/// The ingest control takes every window in the order its policy runner wrote
 /// it, and queues it here before it takes the next. A corrected window thus
 /// follows the write it replaces on the same QUIC stream; a second sender
 /// would carry it on another stream, which Giganto could store first.

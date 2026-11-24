@@ -1,3 +1,4 @@
+mod bundle;
 mod records;
 mod regression;
 
@@ -483,6 +484,9 @@ async fn handle_publish_connection(
     connection.closed().await;
 }
 
+/// Opens a generator stream for `policy_id_bytes` and sends an event of
+/// `record_bytes` at each of `timestamps`, spaced by `repeat_delay`, then the
+/// replay-end frame, as Giganto does for a replay of stored events.
 async fn open_and_emit_stream(
     connection: &Connection,
     policy_id_bytes: &[u8],
@@ -502,6 +506,8 @@ async fn open_and_emit_stream(
             sleep(repeat_delay).await;
         }
     }
+    // The frame carries the request's start, which crusher does not read.
+    let _ = send_time_series_generator_replay_end(&mut uni, 0).await;
     if hold_open {
         connection.closed().await;
     }
@@ -2311,8 +2317,9 @@ async fn silent_source_window_is_written_by_the_timer() {
 
 /// Runs [`new_policy`] over a generator stream carrying `frames` and returns
 /// the windows written before the first one starting at or after `until`, each
-/// as its start, its series id and its values. The timer closes nothing, so the
-/// result depends only on the frames.
+/// as its start, its series id and its values. The timer never fires and the
+/// wall clock is never past a window, so windows close only by event time and
+/// the result depends only on the frames.
 async fn windows_of_generator_stream(
     frames: Vec<GeneratorFrame>,
     until: i64,
@@ -2355,20 +2362,26 @@ async fn windows_of_generator_stream(
     windows
 }
 
-/// A replay-end frame between two events is dropped by the stream reader: the
-/// stream writes the same windows as the same stream without the frame.
+/// A replay-end frame is not an event: with the timer never firing, a stream
+/// with the frame between two events writes the same windows, in the same
+/// order and with the same values, as the same stream without it. The frame
+/// adds nothing to a window and does not move the stream's watermark.
 #[serial]
 #[tokio::test]
 async fn replay_end_frame_does_not_change_the_written_windows() {
     let record = bincode::serialize(&gen_conn()).unwrap();
     let event = |timestamp| GeneratorFrame::Event(timestamp, record.clone());
     // Two events in the first window, then one in each of the next three
-    // windows: each closes the window before it, and the last closes the
-    // third, whose write ends the run.
+    // windows. Each of those is more than the grace past the end of the
+    // window before it, so the stream passes that window, which closes; the
+    // last closes the third, whose write ends the run.
     let frames = |replay_end: bool| {
         let mut frames = vec![event(BASE_TS_NANOS)];
         if replay_end {
-            frames.push(GeneratorFrame::ReplayEnd(BASE_WINDOW_START_NANOS));
+            // Giganto sends the request's start here. A later time makes a
+            // frame that moved the watermark close the first window before
+            // its second event, which would write it twice.
+            frames.push(GeneratorFrame::ReplayEnd(BASE_TS_NANOS + 10 * DAY_NANOS));
         }
         frames.extend([
             event(BASE_TS_NANOS + 1),
@@ -3507,9 +3520,9 @@ mod policy_lifecycle {
         .await;
     }
 
-    /// Only an ungrouped single-sensor policy of a network kind is requested,
-    /// once, for its kind and its one sensor; every other policy in the same
-    /// list is skipped and requests nothing.
+    /// Only an ungrouped policy of a network kind over every counterpart is
+    /// requested, once, for its kind and its sensor; every other policy in the
+    /// same list is skipped and requests nothing.
     #[tokio::test]
     async fn only_runnable_policy_is_requested_for_its_kind_and_sensor() {
         run_test(async {
@@ -3520,7 +3533,7 @@ mod policy_lifecycle {
             runnable.raw_event_kind = PolicyRawEventKind::Dns;
             let mut skipped: Vec<TimeSeriesGenerationPolicy> = (1..=7).map(new_policy).collect();
             skipped[0].group_by = Some(review_protocol::types::EndpointRole::Source);
-            skipped[1].sensors.push("other".into());
+            skipped[1].group_by = Some(review_protocol::types::EndpointRole::Destination);
             skipped[2].counterpart_scope = CounterpartScope::Internal;
             skipped[3].counterpart_scope = CounterpartScope::External;
             skipped[4].sensors.clear();
@@ -3670,10 +3683,12 @@ mod policy_lifecycle {
             let policy_token = state.token.clone();
             let connection_token = CancellationToken::new();
             let (sender, receiver) = async_channel::unbounded();
-            let worker = coordinator.tracker().spawn(run_stream_worker(
-                recv,
-                sender,
+            let (stream_send, stream_recv) = mpsc::unbounded_channel();
+            stream_send.send(recv).unwrap();
+            let worker = coordinator.tracker().spawn(run_policy(
                 state,
+                stream_recv,
+                sender,
                 connection_token.clone(),
                 coordinator.clone(),
                 CloseTimer::default(),

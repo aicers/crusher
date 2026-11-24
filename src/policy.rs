@@ -76,7 +76,7 @@ impl PolicyHandle {
     }
 
     /// Success means both the active policy and its saved timestamp were removed.
-    /// This does not depend on a stream worker existing or observing cancellation.
+    /// This does not depend on a policy runner existing or observing cancellation.
     pub(crate) async fn delete_policies(&self, ids: Vec<u32>) -> Result<(), String> {
         let (reply, received) = oneshot::channel();
         self.tx
@@ -324,22 +324,16 @@ fn replace_policies(
 
 /// Returns why the policy cannot be run, or `None` if it can.
 ///
-/// Only an ungrouped policy over one sensor and every counterpart is generated
-/// yet, and only of a network kind with a measure defined on it. Any other
-/// policy is treated as absent from the list: it is not started, a running one
-/// is stopped, and its checkpoint is kept.
+/// Only an ungrouped policy over at least one sensor and every counterpart is
+/// generated yet, and only of a network kind with a measure defined on it. Any
+/// other policy is treated as absent from the list: it is not started, a
+/// running one is stopped, and its checkpoint is kept.
 fn skip_reason(policy: &TimeSeriesGenerationPolicy) -> Option<String> {
     if let Some(role) = policy.group_by {
         return Some(format!("grouping by {role:?} is not supported yet"));
     }
-    match policy.sensors.len() {
-        0 => return Some("no sensor is assigned".to_string()),
-        1 => {}
-        n => {
-            return Some(format!(
-                "{n} sensors are assigned; only one is supported yet"
-            ));
-        }
+    if policy.sensors.is_empty() {
+        return Some("no sensor is assigned".to_string());
     }
     if policy.counterpart_scope != CounterpartScope::Any {
         return Some(format!(
@@ -451,9 +445,8 @@ mod tests {
     type Change = (&'static str, fn(&mut TimeSeriesGenerationPolicy));
 
     /// Changes that make a policy one this generator does not run.
-    const UNSUPPORTED: [Change; 8] = [
+    const UNSUPPORTED: [Change; 7] = [
         ("group_by", |p| p.group_by = Some(EndpointRole::Source)),
-        ("two sensors", |p| p.sensors.push("other".into())),
         ("internal scope", |p| {
             p.counterpart_scope = CounterpartScope::Internal;
         }),
@@ -792,7 +785,6 @@ mod tests {
             reasons,
             [
                 "grouping by Source is not supported yet",
-                "2 sensors are assigned; only one is supported yet",
                 "counterpart scope Internal is not supported yet",
                 "counterpart scope External is not supported yet",
                 "no sensor is assigned",
@@ -802,6 +794,9 @@ mod tests {
             ]
         );
         assert_eq!(skip_reason(&policy(42)), None);
+        let mut two_sensors = policy(42);
+        two_sensors.sensors.push("other".into());
+        assert_eq!(skip_reason(&two_sensors), None, "a sensor bundle runs");
     }
 
     #[tokio::test]
