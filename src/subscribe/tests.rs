@@ -17,8 +17,8 @@ use giganto_client::{
     connection::server_handshake,
     frame::{recv_raw, send_bytes, send_raw},
     ingest::receive_record_header,
-    publish::receive_stream_request,
     publish::stream::StreamRequestPayload,
+    publish::{receive_stream_request, send_time_series_generator_replay_end},
 };
 use quinn::{
     Connection, Endpoint, RecvStream, SendStream, ServerConfig, crypto::rustls::QuicServerConfig,
@@ -111,9 +111,18 @@ enum PublishBehavior {
             RequestTimeSeriesGeneratorStream,
         )>,
     },
-    /// Answers each request with a stream carrying these events, each its
-    /// own timestamp and record, without a delay, and keeps it open.
-    Records(Arc<[(i64, Vec<u8>)]>),
+    /// Answers each request with a stream carrying these frames, without a
+    /// delay, and keeps it open.
+    Records(Arc<[GeneratorFrame]>),
+}
+
+/// A frame the fake publish server sends on a time series generator stream.
+#[derive(Clone)]
+enum GeneratorFrame {
+    /// A raw event: its timestamp and its bincode-serialized record.
+    Event(i64, Vec<u8>),
+    /// The replay-end frame, carrying the `start` of the stream request.
+    ReplayEnd(i64),
 }
 
 #[derive(Clone)]
@@ -454,9 +463,16 @@ async fn handle_publish_connection(
                     return;
                 };
                 let _ = send_raw(&mut uni, request.id.as_bytes()).await;
-                for (timestamp, record) in records.iter() {
-                    let _ = send_bytes(&mut uni, &timestamp.to_le_bytes()).await;
-                    let _ = send_raw(&mut uni, record).await;
+                for frame in records.iter() {
+                    match frame {
+                        GeneratorFrame::Event(timestamp, record) => {
+                            let _ = send_bytes(&mut uni, &timestamp.to_le_bytes()).await;
+                            let _ = send_raw(&mut uni, record).await;
+                        }
+                        GeneratorFrame::ReplayEnd(start) => {
+                            let _ = send_time_series_generator_replay_end(&mut uni, *start).await;
+                        }
+                    }
                 }
                 streams.push(uni);
             }
@@ -2291,6 +2307,94 @@ async fn silent_source_window_is_written_by_the_timer() {
     drop(review);
     drop(policy_handle);
     cleanup_test_resources(coordinator, client_handle, servers.handles).await;
+}
+
+/// Runs [`new_policy`] over a generator stream carrying `frames` and returns
+/// the windows written before the first one starting at or after `until`, each
+/// as its start, its series id and its values. The timer closes nothing, so the
+/// result depends only on the frames.
+async fn windows_of_generator_stream(
+    frames: Vec<GeneratorFrame>,
+    until: i64,
+) -> Vec<(i64, String, Vec<f64>)> {
+    const NEVER: Duration = Duration::from_secs(3600);
+    let servers = start_window_servers_with(
+        FakeGigantoServer::new_ingest(),
+        FakeGigantoServer::new_publish()
+            .with_publish_behavior(PublishBehavior::Records(frames.into())),
+    );
+    let coordinator = CancellationCoordinator::new();
+    let (review, actor_task, _path, _dir, policy_handle) =
+        setup_request_client(None, &coordinator).await;
+    policy_handle
+        .replace_policies(vec![new_policy(DEFAULT_POLICY_ID)])
+        .await
+        .unwrap();
+    let client_handle = spawn_subscribe_client_with_timer(
+        &cert_key(),
+        actor_task,
+        servers.ingest_addr,
+        servers.publish_addr,
+        policy_handle.clone(),
+        coordinator.clone(),
+        CloseTimer::new(|| i64::MIN, NEVER, NEVER),
+    );
+
+    let mut windows = Vec::new();
+    loop {
+        let (start, series) = next_written_window(&servers.series).await;
+        if start >= until {
+            break;
+        }
+        windows.push((start, series.time_series_id, series.series));
+    }
+
+    drop(review);
+    drop(policy_handle);
+    cleanup_test_resources(coordinator, client_handle, servers.handles).await;
+    windows
+}
+
+/// A replay-end frame between two events is dropped by the stream reader: the
+/// stream writes the same windows as the same stream without the frame.
+#[serial]
+#[tokio::test]
+async fn replay_end_frame_does_not_change_the_written_windows() {
+    let record = bincode::serialize(&gen_conn()).unwrap();
+    let event = |timestamp| GeneratorFrame::Event(timestamp, record.clone());
+    // Two events in the first window, then one in each of the next three
+    // windows: each closes the window before it, and the last closes the
+    // third, whose write ends the run.
+    let frames = |replay_end: bool| {
+        let mut frames = vec![event(BASE_TS_NANOS)];
+        if replay_end {
+            frames.push(GeneratorFrame::ReplayEnd(BASE_WINDOW_START_NANOS));
+        }
+        frames.extend([
+            event(BASE_TS_NANOS + 1),
+            event(BASE_TS_NANOS + DAY_NANOS),
+            event(BASE_TS_NANOS + 2 * DAY_NANOS),
+            event(BASE_TS_NANOS + 3 * DAY_NANOS),
+        ]);
+        frames
+    };
+    let until = BASE_WINDOW_START_NANOS + 2 * DAY_NANOS;
+
+    let without = windows_of_generator_stream(frames(false), until).await;
+    let with = windows_of_generator_stream(frames(true), until).await;
+
+    let sums: Vec<(i64, f64)> = without
+        .iter()
+        .map(|(start, _, values)| (*start, values.iter().sum()))
+        .collect();
+    assert_eq!(
+        sums,
+        [
+            (BASE_WINDOW_START_NANOS, 2.0),
+            (BASE_WINDOW_START_NANOS + DAY_NANOS, 1.0),
+        ]
+    );
+    assert_eq!(with, without);
 }
 
 /// A window and its correction reach Giganto in the order they were written,

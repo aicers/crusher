@@ -24,8 +24,8 @@ use giganto_client::{
         receive_ack_timestamp, send_record_header,
     },
     publish::{
-        receive_time_series_generator_data, receive_time_series_generator_stream_start_message,
-        send_stream_request,
+        TimeSeriesGeneratorData, receive_time_series_generator_data,
+        receive_time_series_generator_stream_start_message, send_stream_request,
         stream::{RequestStreamRecord, RequestTimeSeriesGeneratorStream, StreamRequestPayload},
     },
 };
@@ -1047,8 +1047,13 @@ async fn run_stream_worker(
     // by its own future, which hands each complete event over this channel.
     let (event_send, mut event_recv) = mpsc::channel(1);
     let reader = async {
-        while let Ok(event) = receive_time_series_generator_data(&mut recv).await {
-            if event_send.send(event).await.is_err() {
+        while let Ok(data) = receive_time_series_generator_data(&mut recv).await {
+            // The replay end is not an event: it is dropped here so that it
+            // reaches neither the builder nor its idle gate.
+            let TimeSeriesGeneratorData::Event { record, timestamp } = data else {
+                continue;
+            };
+            if event_send.send((record, timestamp)).await.is_err() {
                 break;
             }
         }

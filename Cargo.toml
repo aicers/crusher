@@ -13,7 +13,7 @@ async-trait = "0.1"
 bincode = "1"
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", features = ["toml"], default-features = false }
-giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.29.1" }
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.30.0" }
 num_enum = "0.7"
 num-traits = "0.2"
 # Preserve Quinn's non-crypto defaults while selecting aws-lc-rs.
