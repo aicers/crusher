@@ -194,11 +194,14 @@ An ungrouped policy writes no marker and no generation.
   any row of it.
 - A grouped policy closes every window, including one in which no IP was
   counted, such as a window whose internal network is empty, and writes the
-  marker `[0, generation]` for it. Such a window closes only once a stream of
-  the policy has delivered an event more than 900 seconds past its end: quiet
-  streams past their replay end do not close it, and the later windows wait
-  behind it. Windows close in time order. A new policy writes no marker for
-  the windows before the one of the first event it receives.
+  marker `[0, generation]` for it. Such a window closes like every other
+  window, once every stream of the policy has passed it: by delivering an
+  event more than 900 seconds past its end, or, after its replay has ended,
+  by being quiet for 30 seconds while the clock is at least 900 seconds past
+  its end. On a quiet source, it is thus written about 15 minutes after its
+  end, with no further event. Windows close in time order. A new policy
+  writes no marker for the windows before the one of the first event it
+  receives.
 - When Crusher requests the policy's streams again, it rewrites the window
   where the policy resumes and every later one with the new generation: the
   IP rows first, then the new marker. An IP the new run no longer counts

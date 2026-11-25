@@ -981,13 +981,14 @@ async fn reconnect_rewrites_from_the_checkpoint_with_a_new_generation() {
     bundle.finish().await;
 }
 
-/// A grouped window without IP rows stays open, and the window with IP rows
-/// after it waits, while both streams pass it only by the idle rule. Once
-/// one stream's event passes it, it closes with `[0, generation]`, and the
-/// next window, which has IP rows, then closes by the idle rule.
+/// A grouped window without IP rows closes by the idle rule like any other
+/// once both streams are past their replay end: no event has to pass it. It
+/// stays open while one stream is still replaying, then closes with
+/// `[0, generation]`, followed in time order by the next window, which has IP
+/// rows, and by every later empty window the wall clock is past.
 #[serial]
 #[tokio::test]
-async fn empty_grouped_window_waits_for_an_event_past_it() {
+async fn empty_grouped_window_closes_by_the_idle_rule_after_every_replay_end() {
     let policy = by_source(bundle_policy(), &["10.0.0.1"]);
     let bundle = Bundle::start(policy, Some(BASE_WINDOW_START_NANOS), wall_clock_far_past()).await;
     let mut streams = bundle.open_streams(2).await;
@@ -998,27 +999,27 @@ async fn empty_grouped_window_waits_for_an_event_past_it() {
     first.conn(in_window(1, 5), "10.0.0.1", EXTERNAL).await;
     second.conn(in_window(0, 10), EXTERNAL, EXTERNAL).await;
     first.replay_end().await;
-    second.replay_end().await;
     bundle
-        .assert_no_window("both streams pass the empty window only by the idle rule")
+        .assert_no_window("the second stream is still replaying")
         .await;
 
-    second.conn(past_grace(0), EXTERNAL, EXTERNAL).await;
+    second.replay_end().await;
+    // The wall clock, the start of day 10, is past the end of day 8 plus the
+    // grace and not past that of day 9.
     let mut written = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..10 {
         written.push(bundle.next_window().await);
     }
-    assert_eq!(
-        summary(&written),
-        [
-            ("1", window_start_secs(0), 0.0),
-            ("1/10.0.0.1", window_start_secs(1), 1.0),
-            ("1", window_start_secs(1), 1.0),
-        ]
-    );
+    let mut expected = vec![
+        ("1", window_start_secs(0), 0.0),
+        ("1/10.0.0.1", window_start_secs(1), 1.0),
+        ("1", window_start_secs(1), 1.0),
+    ];
+    expected.extend((2..=8).map(|day| ("1", window_start_secs(day), 0.0)));
+    assert_eq!(summary(&written), expected);
     generation_of(&written);
     bundle
-        .assert_no_window("the next empty window is passed only by the idle rule")
+        .assert_no_window("day 9 is not past the wall clock minus the grace")
         .await;
     bundle.finish().await;
 }
