@@ -45,8 +45,10 @@ it is refused.
   from the beginning.
 - Crusher updates `timestamp` as windows are acknowledged and `generation` at
   each stream request of a grouped policy.
-- Deleting a policy, or changing its content, removes its `timestamp` and
-  keeps its `generation`, so that a policy created again with the same ID
-  still gets a greater generation.
+- Deleting a policy, or changing anything in it but its internal network,
+  which restarts it without its checkpoint, removes its `timestamp`. A change
+  to the internal network alone keeps the running policy and its `timestamp`.
+  The `generation` is kept in every case, so that a policy created again with
+  the same ID still gets a greater generation.
 - Only Crusher writes the file: do not edit it by hand. A file not in this
   form stops Crusher at startup.

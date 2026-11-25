@@ -268,8 +268,9 @@ enum Value {
 /// rows of a window comes its marker under `P`: the number of IP rows and the
 /// generation. A grouped policy closes every window from the request's
 /// checkpoint on, or without one from the window of the first event received,
-/// even one without IP rows, which gets the marker `[0, generation]`; but such
-/// a window closes only once a stream has also passed it by event time.
+/// even one without IP rows, which gets the marker `[0, generation]`. Such a
+/// window closes by the same rule as any other: once every stream has passed
+/// it, by event time or by the idle rule after its replay end.
 pub(super) struct WindowBuilder {
     policy: TimeSeriesGenerationPolicy,
     policy_id: String,
@@ -296,9 +297,9 @@ pub(super) struct WindowBuilder {
     /// The start of the window of the first event any stream received.
     first_event_window: Option<i64>,
     /// The start of the earliest window not yet warned about as due. A grouped
-    /// window can be due long before it closes, so this runs ahead of
-    /// [`Self::current`]. A grouped policy's does not move until
-    /// [`Self::first_event_window`] is known.
+    /// policy's does not move until [`Self::first_event_window`] is known:
+    /// until then a window can be due without closing (without a checkpoint)
+    /// or close without being warned about (with one).
     warned: i64,
     /// The IPs a grouped policy keeps a series for in this request.
     accepted: HashSet<IpAddr>,
@@ -666,13 +667,11 @@ impl WindowBuilder {
     /// An ungrouped policy writes no due window without events. A grouped
     /// policy follows the IP rows of each window with its marker, and closes a
     /// due window without IP rows from [`Self::marked_from`] on with the
-    /// marker `[0, generation]`, but only once a stream has passed it by event
-    /// time; until then it and every later window stay open.
+    /// marker `[0, generation]`.
     ///
     /// A grouped policy warns for each due window in which it refused IPs for
     /// the cap, and for each due window, from the one of the first event any
-    /// stream received on, whose internal network is empty, even while that
-    /// window cannot close yet.
+    /// stream received on, whose internal network is empty.
     pub(super) fn close_due(&mut self, clock: &PassClock) -> Vec<IngestFrame> {
         let mut written = Vec::new();
         loop {
@@ -702,34 +701,18 @@ impl WindowBuilder {
         written
     }
 
-    /// Returns how far a grouped policy closes windows when every window
-    /// before `due` is due: up to the first window from [`Self::marked_from`]
-    /// on that has no IP rows and that no stream has passed by event time, or
-    /// `due` if there is none. An ungrouped policy closes up to `due`.
+    /// Returns how far windows close when every window before `due` is due:
+    /// up to `due`, except that a grouped policy closes nothing before
+    /// [`Self::marked_from`] is known.
     ///
-    /// A grouped policy closes nothing before [`Self::marked_from`] is known:
-    /// no window has IP rows yet and no stream has passed one by event time,
-    /// and the first event may still belong to any window from
-    /// [`Self::current`] on, which must then be open to count it and get its
-    /// marker.
+    /// Until then no window has IP rows, and the first event may still belong
+    /// to any window from [`Self::current`] on, which must then be open to
+    /// count it and get its marker.
     fn closable_until(&self, due: i64) -> i64 {
-        if self.generation.is_none() {
-            return due;
-        }
-        let Some(marked_from) = self.marked_from else {
+        if self.generation.is_some() && self.marked_from.is_none() {
             return self.current;
-        };
-        let passed_by_events = self
-            .streams
-            .iter()
-            .map(|stream| self.events_pass_limit(stream))
-            .max()
-            .unwrap_or(i64::MIN);
-        let mut start = self.current.max(marked_from).max(passed_by_events);
-        while start < due && self.open.contains_key(&start) {
-            start = start.saturating_add(self.window_size_secs);
         }
-        start.min(due)
+        due
     }
 
     /// Closes the windows of a grouped policy from the earliest not yet due up
@@ -774,14 +757,6 @@ impl WindowBuilder {
             Some(held) => limit.min(held.window_start.saturating_sub(self.window_size_secs)),
             None => limit,
         }
-    }
-
-    /// Returns the start of the earliest window `stream` has not passed by
-    /// the events it received, whether or not it has ended.
-    fn events_pass_limit(&self, stream: &StreamState) -> i64 {
-        stream
-            .watermark
-            .map_or(i64::MIN, |watermark| self.limit_below(watermark))
     }
 
     /// Returns the start of the earliest window whose end plus the grace is
@@ -867,7 +842,8 @@ impl WindowBuilder {
     }
 
     /// Warns once about each window before `due`, which is due whether or not
-    /// it can close yet: those that refused IPs for the cap, and, for a
+    /// it can close yet (a grouped policy without a checkpoint closes none
+    /// before its first event): those that refused IPs for the cap, and, for a
     /// grouped policy from the window of the first event any stream received
     /// on, those whose internal network is empty.
     fn warn_due(&mut self, due: i64) {
@@ -3582,86 +3558,239 @@ mod tests {
         rows(&flatten(written))
     }
 
-    /// A grouped window without IP rows is due by the idle rule, but closes
-    /// only once its stream passes it by event time; until then a later
-    /// window with IP rows waits behind it. The event that passes them closes
-    /// them in order, each empty one with `[0, generation]`.
+    /// A grouped window without IP rows closes by the idle rule like any other
+    /// once its stream is past its replay end and quiet: no event has to pass
+    /// it. The window with IP rows after it then closes by the same rule, in
+    /// time order, and so does every later empty window the wall clock is
+    /// past, each with `[0, generation]`.
     #[test]
-    fn empty_window_closes_only_once_a_stream_passes_it_by_event_time() {
+    fn empty_window_closes_by_the_idle_rule_after_the_replay_end() {
         let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
         let mut builder = single(&by_source(&["10.0.0.1"]), start).unwrap();
         let origin = Instant::now();
-        let far = datetime_from_utc("2024/1/17 00:00:00");
-        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), far);
+        let at = |after_secs, wall: &str| {
+            clock_at(
+                origin,
+                Duration::from_secs(after_secs),
+                datetime_from_utc(wall),
+            )
+        };
 
         // 00:00 counts nothing; 01:00 counts 10.0.0.1. Neither event passes
         // 00:00 by event time.
+        let replaying = at(0, "2024/1/17 00:00:00");
         assert_eq!(
-            deliver(&mut builder, 0, "2024/1/15 00:20:00", EXTERNAL, &at(0)).len(),
+            deliver(&mut builder, 0, "2024/1/15 00:20:00", EXTERNAL, &replaying).len(),
             0
         );
         assert_eq!(
-            deliver(&mut builder, 0, "2024/1/15 01:05:00", "10.0.0.1", &at(0)).len(),
+            deliver(
+                &mut builder,
+                0,
+                "2024/1/15 01:05:00",
+                "10.0.0.1",
+                &replaying
+            )
+            .len(),
             0
         );
         assert!(builder.replay_end(0, origin));
         assert!(
-            builder.close_rows(&at(3600)).is_empty(),
-            "past the replay end, quiet and the wall clock past: not passed by event time"
-        );
-        assert_eq!(
-            builder.open.keys().copied().collect::<Vec<_>>(),
-            [datetime_from_utc("2024/1/15 01:00:00")],
-            "the window with IP rows waits"
+            builder.close_rows(&at(29, "2024/1/17 00:00:00")).is_empty(),
+            "quiet for less than 30 s"
         );
 
-        let written = deliver(&mut builder, 0, "2024/1/15 03:20:00", EXTERNAL, &at(3600));
+        // 02:00 ends at 03:00, and the wall clock is not yet past that plus
+        // the grace.
+        let written = builder.close_rows(&at(30, "2024/1/15 03:14:59"));
         assert_eq!(
-            written,
+            rows(&written),
             [
                 marker("2024/1/15 00:00:00", 0),
                 row("42/10.0.0.1", "2024/1/15 01:00:00", [1.0, 0.0, 0.0, 0.0]),
                 marker("2024/1/15 01:00:00", 1),
+            ]
+        );
+
+        let written = builder.close_rows(&at(60, "2024/1/15 04:15:00"));
+        assert_eq!(
+            rows(&written),
+            [
                 marker("2024/1/15 02:00:00", 0),
+                marker("2024/1/15 03:00:00", 0),
             ]
         );
         assert_eq!(
             builder.last_closed.as_ref().map(|window| window.start_secs),
-            Some(datetime_from_utc("2024/1/15 02:00:00")),
+            Some(datetime_from_utc("2024/1/15 03:00:00")),
             "an empty window becomes the last closed window"
         );
         assert!(
-            builder.close_rows(&at(7200)).is_empty(),
-            "03:00 is due by the idle rule only"
+            builder.close_rows(&at(90, "2024/1/15 05:14:59")).is_empty(),
+            "04:00 is not past the wall clock minus the grace"
         );
     }
 
-    /// With two streams, a window without IP rows stays open while both pass
-    /// it only by the idle rule, and closes once one of them passes it by
-    /// event time.
+    /// With two streams, a window without IP rows stays open while one of
+    /// them is still replaying, however long it is quiet and however late the
+    /// wall clock, and closes by the idle rule once both are past their
+    /// replay end and quiet.
     #[test]
-    fn empty_window_closes_once_one_of_two_streams_passes_it_by_event_time() {
+    fn empty_window_of_two_streams_closes_by_the_idle_rule_after_both_replay_ends() {
         let mut builder = pair(&by_source(&["10.0.0.1"]));
         let origin = Instant::now();
-        let far = datetime_from_utc("2024/1/17 00:00:00");
-        let at = |after_secs| clock_at(origin, Duration::from_secs(after_secs), far);
+        let at = |after_secs, wall: &str| {
+            clock_at(
+                origin,
+                Duration::from_secs(after_secs),
+                datetime_from_utc(wall),
+            )
+        };
+        let replaying = at(0, "2024/1/17 00:00:00");
         assert_eq!(
-            deliver(&mut builder, 0, "2024/1/15 00:20:00", EXTERNAL, &at(0)).len(),
+            deliver(&mut builder, 0, "2024/1/15 00:20:00", EXTERNAL, &replaying).len(),
             0
         );
         assert_eq!(
-            deliver(&mut builder, 1, "2024/1/15 00:30:00", EXTERNAL, &at(0)).len(),
+            deliver(&mut builder, 1, "2024/1/15 00:30:00", EXTERNAL, &replaying).len(),
             0
         );
         assert!(builder.replay_end(0, origin));
-        assert!(builder.replay_end(1, origin));
         assert!(
-            builder.close_rows(&at(3600)).is_empty(),
-            "both streams pass it only by the idle rule"
+            builder
+                .close_rows(&at(86_400, "2024/1/17 00:00:00"))
+                .is_empty(),
+            "stream 1 is still replaying"
         );
 
-        let written = deliver(&mut builder, 0, "2024/1/15 01:20:00", EXTERNAL, &at(3600));
-        assert_eq!(written, [marker("2024/1/15 00:00:00", 0)]);
+        assert!(builder.replay_end(1, origin + Duration::from_hours(24)));
+        assert!(
+            builder
+                .close_rows(&at(86_429, "2024/1/15 01:15:00"))
+                .is_empty()
+        );
+        let written = builder.close_rows(&at(86_430, "2024/1/15 01:15:00"));
+        assert_eq!(rows(&written), [marker("2024/1/15 00:00:00", 0)]);
+    }
+
+    /// A request resumed from its checkpoint whose stream delivers no event
+    /// at all closes the checkpoint window with `[0, generation]` by the idle
+    /// rule once the stream is past its replay end, quiet for 30 s, and the
+    /// wall clock past the window's end plus the grace.
+    #[test]
+    fn empty_window_without_any_event_closes_by_idle_after_the_replay_end() {
+        let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
+        let mut builder = single(&by_source(&["10.0.0.1"]), start).unwrap();
+        let origin = Instant::now();
+        let at = |after_secs, wall: &str| {
+            clock_at(
+                origin,
+                Duration::from_secs(after_secs),
+                datetime_from_utc(wall),
+            )
+        };
+        assert!(builder.replay_end(0, origin));
+        assert!(
+            builder.close_rows(&at(29, "2024/1/15 01:15:00")).is_empty(),
+            "quiet for less than 30 s"
+        );
+        assert!(
+            builder.close_rows(&at(30, "2024/1/15 01:14:59")).is_empty(),
+            "the wall clock is not past the window's end plus the grace"
+        );
+        let written = builder.close_rows(&at(30, "2024/1/15 01:15:00"));
+        assert_eq!(rows(&written), [marker("2024/1/15 00:00:00", 0)]);
+    }
+
+    /// Before its replay end, a stream never passes a window without IP rows
+    /// by idle time, however long it is quiet and however late the wall
+    /// clock; with two streams, one replay end is not enough either.
+    #[test]
+    fn empty_window_does_not_close_by_idle_before_the_replay_end() {
+        let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
+        let policy = by_source(&["10.0.0.1"]);
+        let origin = Instant::now();
+        let far = clock_at(
+            origin,
+            Duration::from_hours(24 * 30),
+            datetime_from_utc("2024/2/15 00:00:00"),
+        );
+
+        let mut builder = single(&policy, start).unwrap();
+        assert!(builder.close_rows(&far).is_empty(), "one stream replaying");
+        assert_eq!(builder.current, datetime_from_utc("2024/1/15 00:00:00"));
+
+        let mut builder = pair(&policy);
+        assert!(builder.replay_end(0, origin));
+        assert!(
+            builder.close_rows(&far).is_empty(),
+            "one of two streams replaying"
+        );
+        assert_eq!(builder.current, datetime_from_utc("2024/1/15 00:00:00"));
+    }
+
+    /// A sparse policy with 6-hour windows, resumed from its checkpoint, whose
+    /// only event comes during the replay in the window after the
+    /// checkpoint's: the empty checkpoint window closes with `[0, generation]`
+    /// by the idle rule after the replay end, although no event passed it,
+    /// and the window of the event closes by the same rule 6 hours later.
+    #[test]
+    fn sparse_policy_closes_its_empty_window_by_idle_without_a_later_event() {
+        let mut policy = create_policy(
+            GROUPED_ID,
+            6 * SECS_PER_HOUR,
+            5 * SECS_PER_MINUTE,
+            0,
+            Measure::Count,
+        );
+        policy.group_by = Some(EndpointRole::Source);
+        policy.counterpart_scope = CounterpartScope::Any;
+        policy.internal_networks = of_hosts(&["10.0.0.1"]);
+        let start = nanos(datetime_from_utc("2024/1/15 06:00:00"));
+        let mut builder = single(&policy, start).unwrap();
+        let origin = Instant::now();
+        let at = |after_secs, wall: &str| {
+            clock_at(
+                origin,
+                Duration::from_secs(after_secs),
+                datetime_from_utc(wall),
+            )
+        };
+
+        let replaying = at(0, "2024/1/15 12:10:00");
+        assert_eq!(
+            deliver(
+                &mut builder,
+                0,
+                "2024/1/15 12:10:00",
+                "10.0.0.1",
+                &replaying
+            )
+            .len(),
+            0
+        );
+        assert!(builder.replay_end(0, origin));
+
+        assert!(builder.close_rows(&at(30, "2024/1/15 12:14:59")).is_empty());
+        let written = builder.close_rows(&at(30, "2024/1/15 12:15:00"));
+        assert_eq!(rows(&written), [marker("2024/1/15 06:00:00", 0)]);
+
+        assert!(builder.close_rows(&at(30, "2024/1/15 18:14:59")).is_empty());
+        let written = builder.close_rows(&at(30, "2024/1/15 18:15:00"));
+        let mut values = vec![0.0; 72];
+        values[2] = 1.0;
+        values.push(GENERATION as f64);
+        assert_eq!(
+            rows(&written),
+            [
+                (
+                    "42/10.0.0.1".to_owned(),
+                    datetime_from_utc("2024/1/15 12:00:00"),
+                    values
+                ),
+                marker("2024/1/15 12:00:00", 1),
+            ]
+        );
     }
 
     /// A late event counted in a closed window without IP rows writes its row
@@ -3681,6 +3810,79 @@ mod tests {
                 row("42/10.0.0.1", "2024/1/15 00:00:00", [0.0, 0.0, 1.0, 0.0]),
                 marker("2024/1/15 00:00:00", 1),
             ]]
+        );
+    }
+
+    /// Late events for windows without IP rows that closed by the idle rule
+    /// follow the rules for any closed window: in the last closed window, the
+    /// new row and the marker `[1, generation]` go in one frame; in an older
+    /// one, the event is dropped and counted in the dropped-events warning.
+    #[test]
+    fn late_event_in_an_empty_window_closed_by_idle_follows_the_late_rules() {
+        let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
+        let mut builder = single(&by_source(&["10.0.0.1"]), start).unwrap();
+        let origin = Instant::now();
+        let at = |after_secs| {
+            clock_at(
+                origin,
+                Duration::from_secs(after_secs),
+                datetime_from_utc("2024/1/15 02:15:00"),
+            )
+        };
+        assert!(builder.replay_end(0, origin));
+        assert_eq!(
+            rows(&builder.close_rows(&at(30))),
+            [
+                marker("2024/1/15 00:00:00", 0),
+                marker("2024/1/15 01:00:00", 0),
+            ]
+        );
+
+        let late = |builder: &mut WindowBuilder, datetime: &str| {
+            let timestamp = nanos(datetime_from_utc(datetime));
+            builder.receive(0, timestamp, at(60).now);
+            let mut frames = builder.close_due(&at(60));
+            frames.extend(
+                builder
+                    .add(0, timestamp, &conn_between("10.0.0.1", EXTERNAL))
+                    .expect("add should succeed"),
+            );
+            frames
+                .into_iter()
+                .map(|frame| rows(&frame.into_rows()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            late(&mut builder, "2024/1/15 01:30:00"),
+            [vec![
+                row("42/10.0.0.1", "2024/1/15 01:00:00", [0.0, 0.0, 1.0, 0.0]),
+                marker("2024/1/15 01:00:00", 1),
+            ]]
+        );
+        let older = late(&mut builder, "2024/1/15 00:30:00");
+        assert!(
+            older.is_empty(),
+            "older than the last closed window: {older:?}"
+        );
+        assert_eq!(builder.dropped, 1);
+
+        let (_, lines) = logged(|| builder.close_rows(&at(120)));
+        assert!(
+            containing(&lines, "Dropped late events").is_empty(),
+            "nothing closes yet: {lines:?}"
+        );
+        let (written, lines) = logged(|| {
+            builder.close_rows(&clock_at(
+                origin,
+                Duration::from_secs(120),
+                datetime_from_utc("2024/1/15 03:15:00"),
+            ))
+        });
+        assert_eq!(rows(&written), [marker("2024/1/15 02:00:00", 0)]);
+        assert_eq!(
+            containing(&lines, "Dropped late events").len(),
+            1,
+            "{lines:?}"
         );
     }
 
@@ -3717,10 +3919,10 @@ mod tests {
     }
 
     /// A window whose internal network is empty is warned about once, when it
-    /// becomes due, even when it becomes due by the idle rule alone and so
-    /// cannot close yet. Closing it later warns no more.
+    /// becomes due, also when it becomes due by the idle rule, which then
+    /// closes it with `[0, generation]`. Later closes warn no more.
     #[test]
-    fn empty_network_warns_when_a_window_is_due_by_idle_before_it_closes() {
+    fn empty_network_warns_once_when_a_window_closes_by_idle() {
         let start = nanos(datetime_from_utc("2024/1/15 00:00:00"));
         let mut builder = single(&by_source(&[]), start).unwrap();
         let origin = Instant::now();
@@ -3739,7 +3941,11 @@ mod tests {
             written.extend(builder.close_rows(&at(120)));
             written
         });
-        assert_eq!(written.len(), 0, "due by the idle rule only: {written:?}");
+        assert_eq!(
+            rows(&written),
+            [marker("2024/1/15 00:00:00", 0)],
+            "closed by the idle rule"
+        );
         let warnings = containing(&lines, warning);
         assert_eq!(warnings.len(), 1, "00:00 once: {lines:?}");
         assert!(
@@ -3752,7 +3958,7 @@ mod tests {
 
         let (written, lines) =
             logged(|| deliver(&mut builder, 0, "2024/1/15 01:20:00", "10.0.0.1", &at(180)));
-        assert_eq!(written, [marker("2024/1/15 00:00:00", 0)]);
+        assert_eq!(written.len(), 0, "{written:?}");
         assert!(containing(&lines, warning).is_empty(), "{lines:?}");
     }
 
@@ -3808,9 +4014,10 @@ mod tests {
     /// Without a checkpoint, idle time after an empty replay with an empty
     /// internal network warns about no window, and does not skip one either:
     /// the window of the first event, already due when it arrives, is warned
-    /// about once and closes with `[0, generation]` once an event passes it.
+    /// about once and closes with `[0, generation]` by the idle rule once the
+    /// stream is quiet again.
     #[test]
-    fn unresumed_empty_network_warns_for_the_first_event_window_after_idle() {
+    fn unresumed_empty_network_warns_for_and_closes_the_first_event_window_by_idle() {
         let mut builder = single(&by_source(&[]), 0).unwrap();
         let origin = Instant::now();
         let wall = datetime_from_utc("2024/1/15 01:20:00");
@@ -3828,10 +4035,14 @@ mod tests {
 
         let (written, lines) = logged(|| {
             let mut written = deliver(&mut builder, 0, "2024/1/15 00:30:00", "10.0.0.1", &at(180));
+            assert!(written.is_empty(), "quiet for less than 30 s: {written:?}");
+            written.extend(rows(&builder.close_rows(&at(209))));
+            assert!(written.is_empty(), "quiet for less than 30 s: {written:?}");
+            written.extend(rows(&builder.close_rows(&at(210))));
             written.extend(rows(&builder.close_rows(&at(240))));
             written
         });
-        assert!(written.is_empty(), "due by the idle rule only: {written:?}");
+        assert_eq!(written, [marker("2024/1/15 00:00:00", 0)]);
         let warnings = containing(&lines, warning);
         assert_eq!(warnings.len(), 1, "00:00 once: {lines:?}");
         assert!(
@@ -3844,7 +4055,7 @@ mod tests {
 
         let (written, lines) =
             logged(|| deliver(&mut builder, 0, "2024/1/15 01:20:00", "10.0.0.1", &at(300)));
-        assert_eq!(written, [marker("2024/1/15 00:00:00", 0)]);
+        assert!(written.is_empty(), "{written:?}");
         assert!(containing(&lines, warning).is_empty(), "{lines:?}");
     }
 
