@@ -53,7 +53,7 @@ use crate::cancellation::SHUTDOWN_TIMEOUT as SHUTDOWN_DRAIN_TIMEOUT;
 use crate::client::{self, Certs, SERVER_RETRY_INTERVAL};
 use crate::policy::{PolicyHandle, StreamPolicy};
 
-pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.28.0";
+pub(crate) const REQUIRED_GIGANTO_VERSION: &str = "0.39.0";
 const TIME_SERIES_CHANNEL_SIZE: usize = 1;
 const FORCED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
