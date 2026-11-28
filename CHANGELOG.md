@@ -4,6 +4,12 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0](https://github.com/aicers/crusher/compare/0.13.0...0.14.0) - 2026-11-28
+
+### Added
+
+- [**breaking**] announce protocol 0.54.0 to the Manager and retry crusher-side TLS failures ([#450](https://github.com/aicers/crusher/pull/450))
+
 ## [0.13.0](https://github.com/aicers/crusher/compare/0.12.4...0.13.0) - 2026-11-28
 
 ### Added
