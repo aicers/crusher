@@ -1661,6 +1661,87 @@ log_path = "/tmp/crusher.log"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn incoming_accept_failure_waits_before_reconnecting() {
+        let (_, _, _, certs) = load_test_certs();
+        let manager = ScriptedManager::spawn(&certs, vec![Ok(Vec::new()), Ok(Vec::new())]);
+        let reload = Arc::new(Notify::new());
+        let client = session_test_client(manager.addr, reload.clone());
+        let (first, first_id) = client.connect_with_id().await.unwrap();
+        let server = manager.connected.recv().await.unwrap();
+        let mut running = client.clone();
+        let incoming = tokio::spawn(async move { running.handle_incoming().await });
+
+        tokio::time::timeout(Duration::from_secs(SERVER_RETRY_INTERVAL + 5), async {
+            // With no pushed stream, this lock is held only by the pending accept.
+            while first.incoming.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            let closed_at = tokio::time::Instant::now();
+            server.close(ApplicationCode::default(), b"fail pending accept");
+            let replacement = manager.connected.recv().await.unwrap();
+            assert!(closed_at.elapsed() >= Duration::from_secs(SERVER_RETRY_INTERVAL));
+            assert!(!incoming.is_finished(), "accept failure must not terminate");
+            let (second, second_id) = client.connect_with_id().await.unwrap();
+            assert_eq!(second_id, first_id + 1);
+            assert_ne!(second.handle.id(), first.handle.id());
+            assert!(!Arc::ptr_eq(&second.incoming, &first.incoming));
+            replacement.send_config_update_cmd().await.unwrap();
+            reload.notified().await;
+        })
+        .await
+        .expect("accept failure retries on a fresh session after the interval");
+
+        incoming.abort();
+        let _ = incoming.await;
+        manager.handle.abort();
+        let _ = manager.handle.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incoming_runner_failure_terminates_the_handler() {
+        let (_, _, _, certs) = load_test_certs();
+        let manager = ScriptedManager::spawn(&certs, vec![Ok(Vec::new())]);
+        let reload = Arc::new(Notify::new());
+        let mut client = session_test_client(manager.addr, reload.clone());
+        client.connect().await.unwrap();
+        let server = manager.connected.recv().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut incoming = Box::pin(client.handle_incoming());
+            let mut command = Box::pin(server.send_config_update_cmd());
+            let mut handled = Box::pin(reload.notified());
+            // Stop driving the sender as soon as dispatch occurs, so its command
+            // stream remains open while the runner is inside it.
+            std::future::poll_fn(|cx| {
+                assert!(incoming.as_mut().poll(cx).is_pending());
+                if handled.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(());
+                }
+                assert!(command.as_mut().poll(cx).is_pending());
+                std::task::Poll::Pending
+            })
+            .await;
+
+            server.close(ApplicationCode::default(), b"fail active runner");
+            let error = incoming.await.unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<AgentRunError>(),
+                Some(AgentRunError::Session(_) | AgentRunError::ResponseWrite(_))
+            ));
+            assert!(needs_health_check(&error));
+            assert!(
+                manager.connected.is_empty(),
+                "runner failure must not retry"
+            );
+        })
+        .await
+        .expect("runner failure propagates out of handle_incoming");
+
+        manager.handle.abort();
+        let _ = manager.handle.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn connect_uses_the_managers_address_family() {
         for address in ["127.0.0.1:0", "[::1]:0"] {
             let (_, _, _, certs) = load_test_certs();
