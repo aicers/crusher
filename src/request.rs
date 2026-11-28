@@ -235,6 +235,7 @@ impl Client {
                     {
                         synced = Some(id);
                     }
+                    // The incoming guard intentionally spans acceptance and command handling.
                     match connection.incoming.lock().await.accept().await {
                         Ok(stream) => {
                             stream.run(self, |_| Ok(())).await?;
@@ -2235,7 +2236,7 @@ log_path = "/tmp/crusher.log"
         let (server_addr, _handshake_count, server_handle) = spawn_handshake_only_server(&certs);
 
         // Start with empty bytes so the first reconnect attempt fails at
-        // builder construction. This proves the client is reading from
+        // client_config_from_pem with a ClientPemError. This proves it reads from
         // the shared store rather than baking the bytes in at construction.
         let shared = SharedTlsBytes::new(TlsBytes::new(Vec::new(), Vec::new(), Vec::new()));
         let client = Client::new(
@@ -2250,7 +2251,7 @@ log_path = "/tmp/crusher.log"
             .expect("connect returns within timeout");
         assert!(
             first.is_err(),
-            "empty shared bytes must fail at builder construction"
+            "empty shared bytes must fail in client_config_from_pem"
         );
 
         // Swap in valid bytes; this models the reload-time refresh.
@@ -2268,7 +2269,7 @@ log_path = "/tmp/crusher.log"
         server_handle.abort();
     }
 
-    /// The shared store must not drop the existing `Connection` when
+    /// The shared store must not drop the existing session when
     /// bytes are swapped. Only a later reconnect attempt sees the new
     /// material, so an already established connection stays alive across
     /// a reload.
