@@ -4,6 +4,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/manager.rs"]
+mod test_manager;
+
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -227,7 +230,7 @@ impl review_protocol::server::Handler for UnregisteredManager {
 
 /// Returns the QUIC configuration of a Manager that authenticates with the
 /// test certificates and requires them of its client.
-fn manager_server_config() -> quinn::ServerConfig {
+fn manager_server_config() -> std::sync::Arc<rustls::ServerConfig> {
     let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let read = |name: &str| std::fs::read(tests.join(name)).expect("read test certificate");
     let certs = rustls_pemfile::certs(&mut read("cert.pem").as_slice())
@@ -255,33 +258,27 @@ fn manager_server_config() -> quinn::ServerConfig {
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
         .expect("build server TLS configuration");
-    quinn::ServerConfig::with_crypto(std::sync::Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
-            .expect("build QUIC server configuration"),
-    ))
+    std::sync::Arc::new(crypto)
 }
 
 /// Serves every connection with [`UnregisteredManager`].
-async fn serve_unregistered_manager(endpoint: quinn::Endpoint) {
-    while let Some(connecting) = endpoint.accept().await {
-        tokio::spawn(async move {
-            let Ok(connection) = connecting.await else {
+async fn serve_unregistered_manager(endpoint: review_protocol::session::ServerListener) {
+    let mut connections = tokio::task::JoinSet::new();
+    while let Ok(Some(connecting)) = endpoint.accept().await {
+        connections.spawn(async move {
+            let Ok((_handle, mut incoming)) = test_manager::accept(connecting).await else {
                 return;
             };
-            let address = connection.remote_address();
-            if review_protocol::server::handshake(&connection, address, ">=0", "0.49.0")
-                .await
-                .is_err()
+            let handler = std::sync::Arc::new(UnregisteredManager);
+            while let Ok(review_protocol::session::ServerStream::Requests(stream)) =
+                incoming.accept().await
             {
-                return;
-            }
-            let mut handler = UnregisteredManager;
-            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-                let _ = review_protocol::server::handle(&mut handler, &mut send, &mut recv, "test")
-                    .await;
+                let _ = stream.run(handler.clone()).await;
             }
         });
     }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
 }
 
 /// A Crusher whose Manager has no configuration for it yet logs the wait at
@@ -290,14 +287,13 @@ async fn serve_unregistered_manager(endpoint: quinn::Endpoint) {
 fn unregistered_wait_under_journal_is_one_warning() {
     let runtime = tokio::runtime::Runtime::new().expect("build runtime");
     let endpoint = runtime.block_on(async {
-        quinn::Endpoint::server(
+        test_manager::listener(
             manager_server_config(),
             "[::1]:0".parse().expect("valid address"),
         )
-        .expect("bind the fake Manager")
     });
     let manager_addr = endpoint.local_addr().expect("fake Manager address");
-    runtime.spawn(serve_unregistered_manager(endpoint));
+    let manager_task = runtime.spawn(serve_unregistered_manager(endpoint));
 
     let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let path = |name: &str| tests.join(name).to_str().expect("UTF-8 path").to_string();
@@ -364,5 +360,9 @@ fn unregistered_wait_under_journal_is_one_warning() {
         "{}",
         warnings[0]
     );
+    manager_task.abort();
+    runtime.block_on(async {
+        let _ = manager_task.await;
+    });
     drop(runtime);
 }

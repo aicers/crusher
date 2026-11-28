@@ -1212,11 +1212,24 @@ fn start_reload_policy_manager(
     Arc<Notify>,
     tokio::task::JoinHandle<()>,
 ) {
-    let endpoint = Endpoint::server(
-        config_server(),
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+    let certs = cert_key();
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let client_auth = WebPkiClientVerifier::builder_with_provider(
+        Arc::new(certs.ca_certs.clone()),
+        provider.clone(),
     )
-    .expect("manager endpoint");
+    .build()
+    .expect("build Manager client verifier");
+    let tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("default TLS versions")
+        .with_client_cert_verifier(client_auth)
+        .with_single_cert(certs.certs.clone(), certs.key.clone_key())
+        .expect("Manager TLS");
+    let endpoint = crate::test_manager::listener(
+        Arc::new(tls),
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+    );
     let address = endpoint.local_addr().expect("manager address");
     let shutdown = Arc::new(Notify::new());
     let shutdown_for_task = shutdown.clone();
@@ -1227,46 +1240,27 @@ fn start_reload_policy_manager(
         sync_events: sync_send,
     };
     let server_handle = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 connecting = endpoint.accept() => {
-                    let Some(connecting) = connecting else {
-                        break;
-                    };
-                    let mut handler = handler.clone();
-                    tokio::spawn(async move {
-                        let Ok(connection) = connecting.await else {
-                            return;
-                        };
-                        let address = connection.remote_address();
-                        if review_protocol::server::handshake(
-                            &connection,
-                            address,
-                            ">=0",
-                            crate::request::REQUIRED_MANAGER_VERSION,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
-                        }
-                        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-                            let _ = review_protocol::server::handle(
-                                &mut handler,
-                                &mut send,
-                                &mut recv,
-                                "test",
-                            )
-                            .await;
+                    let Ok(Some(connecting)) = connecting else { break; };
+                    let handler = Arc::new(handler.clone());
+                    connections.spawn(async move {
+                        let Ok((_handle, mut incoming)) = crate::test_manager::accept(connecting).await else { return; };
+                        while let Ok(review_protocol::session::ServerStream::Requests(stream)) = incoming.accept().await {
+                            let _ = stream.run(handler.clone()).await;
                         }
                     });
                 }
                 () = shutdown_for_task.notified() => {
-                    endpoint.close(0_u32.into(), &[]);
+                    endpoint.close(&[]);
                     break;
                 }
             }
         }
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     });
     (address, sync_recv, shutdown, server_handle)
 }

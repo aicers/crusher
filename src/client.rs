@@ -12,12 +12,10 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const SERVER_RETRY_INTERVAL: u64 = 3;
 
 /// Raw PEM-encoded TLS material used by the manager/control reconnect
-/// path to build a fresh `review_protocol::client::ConnectionBuilder` on
-/// every reconnect attempt.
+/// path to build fresh session TLS configuration on every reconnect attempt.
 ///
-/// The manager/control path keeps the bytes (rather than a pre-built
-/// `ConnectionBuilder`) so that a later reload can atomically swap in
-/// rotated material without tearing down the currently active connection.
+/// The manager/control path keeps the bytes so that a later reload can
+/// atomically swap in rotated material without tearing down the active connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TlsBytes {
     pub(crate) cert: Vec<u8>,

@@ -5,10 +5,12 @@ mod policy;
 mod request;
 mod settings;
 mod subscribe;
+#[cfg(test)]
+#[path = "../tests/support/manager.rs"]
+mod test_manager;
 
 use std::fmt;
 use std::fs;
-use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -411,14 +413,7 @@ async fn run_main(args: CmdLineArgs) -> Result<()> {
                     return Err(e);
                 }
                 log_run_error(&e);
-                let health_check = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                    matches!(
-                        e.kind(),
-                        ErrorKind::ConnectionAborted
-                            | ErrorKind::ConnectionReset
-                            | ErrorKind::TimedOut
-                    )
-                });
+                let health_check = request::needs_health_check(&e);
                 match request_client
                     .enter_idle_mode(health_check, tls_reload.clone(), shutdown.clone())
                     .await
