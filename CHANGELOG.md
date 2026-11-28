@@ -4,6 +4,30 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0](https://github.com/aicers/crusher/compare/0.12.4...0.13.0) - 2026-11-28
+
+### Added
+
+- [**breaking**] mark completed windows and write generations for per-IP series ([#443](https://github.com/aicers/crusher/pull/443))
+- split grouped policies into one time series per internal IP ([#441](https://github.com/aicers/crusher/pull/441))
+- [**breaking**] run policies over all their sensors and close windows by event time ([#440](https://github.com/aicers/crusher/pull/440))
+- [**breaking**] follow the time-series generation policy schema ([#438](https://github.com/aicers/crusher/pull/438))
+
+### Fixed
+
+- [**breaking**] announce version 0.39.0 so Giganto 0.39.0 accepts the connection ([#448](https://github.com/aicers/crusher/pull/448))
+
+### Other
+
+- *(deps)* update Cargo.lock before the 0.13.0 release ([#452](https://github.com/aicers/crusher/pull/452))
+- close empty per-IP windows by the idle rule after replay end ([#446](https://github.com/aicers/crusher/pull/446))
+- cover grouped IP rows sharing one ingest stream in series-id order ([#444](https://github.com/aicers/crusher/pull/444))
+- *(deps)* [**breaking**] bump giganto-client to 0.30.0 ([#439](https://github.com/aicers/crusher/pull/439))
+- update shared instruction blocks to 0.6.4 ([#430](https://github.com/aicers/crusher/pull/430))
+- update shared instruction blocks to 0.6.3 ([#429](https://github.com/aicers/crusher/pull/429))
+- automate releases with release-plz
+- Run CI on pull requests into any branch ([#421](https://github.com/aicers/crusher/pull/421))
+
 ## [0.12.4] - 2026-11-14
 
 ### Security
