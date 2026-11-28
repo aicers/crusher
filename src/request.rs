@@ -1,11 +1,20 @@
+use std::collections::BTreeSet;
 use std::future::Future;
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use review_protocol::{
-    client::{Connection, ConnectionBuilder},
+    AgentInfo,
     request::Handler as _,
+    session::{
+        AgentConnector, AgentHandle, AgentIncoming, AgentRunError, AgentTransportOptions,
+        ClientPemError, CloseReason, SessionError, SessionOptions, TransportCloseKind,
+        TransportFailure, client_config_from_pem,
+    },
     types::{Status, TimeSeriesGenerationPolicy},
 };
 use tokio::{
@@ -18,8 +27,6 @@ use crate::cancellation::CancellationCoordinator;
 use crate::client::{SERVER_RETRY_INTERVAL, SharedTlsBytes};
 use crate::policy::PolicyHandle;
 
-pub(crate) const REQUIRED_MANAGER_VERSION: &str = "0.49.0";
-
 #[derive(Debug, PartialEq, Eq)]
 enum ConnectErrorDisposition {
     Retry,
@@ -31,11 +38,14 @@ enum ConnectErrorDisposition {
 /// it does before this instance is configured (`… unregistered`). The main
 /// loop treats this as a normal wait.
 #[derive(Debug)]
-pub(crate) struct ConfigUnavailable(pub(crate) std::io::Error);
+pub(crate) struct ConfigUnavailable(pub(crate) SessionError);
 
 impl std::fmt::Display for ConfigUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
+        match &self.0 {
+            SessionError::RemoteRejection(reason) => formatter.write_str(reason),
+            error => error.fmt(formatter),
+        }
     }
 }
 
@@ -47,18 +57,8 @@ impl std::error::Error for ConfigUnavailable {
 
 /// Separates the Manager's refusal to supply a configuration from a failed
 /// exchange.
-///
-/// review-protocol returns the Manager's own error message as an
-/// `ErrorKind::Other` error. A failed exchange usually has a specific kind, but
-/// quinn also reports some lost connections (a transport error, a locally
-/// closed connection) as `ErrorKind::Other`, so those are recognized by their
-/// source.
-fn classify_config_error(error: std::io::Error) -> anyhow::Error {
-    let connection_lost = error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<quinn::ConnectionError>())
-        .is_some();
-    if error.kind() == ErrorKind::Other && !connection_lost {
+fn classify_config_error(error: SessionError) -> anyhow::Error {
+    if matches!(error, SessionError::RemoteRejection(_)) {
         anyhow::Error::new(ConfigUnavailable(error))
     } else {
         anyhow::Error::new(error).context("Failed to get the configuration from the Manager server")
@@ -85,25 +85,54 @@ pub(crate) enum IdleExitReason {
     Shutdown,
 }
 
-fn classify_connect_error(error: &anyhow::Error) -> ConnectErrorDisposition {
-    if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
-        return match io_error.kind() {
-            ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::TimedOut => {
-                ConnectErrorDisposition::Retry
-            }
-            ErrorKind::InvalidData => ConnectErrorDisposition::InvalidPeerCertificate,
-            _ => ConnectErrorDisposition::Other,
-        };
-    }
+fn retryable_session_error(error: &SessionError) -> bool {
+    let SessionError::Transport { source, .. } = error else {
+        return false;
+    };
+    matches!(
+        source,
+        TransportFailure::Closed {
+            reason: CloseReason::Application { .. }
+                | CloseReason::Transport(
+                    TransportCloseKind::Crypto { .. }
+                        | TransportCloseKind::IdleTimeout
+                        | TransportCloseKind::Reset
+                        | TransportCloseKind::Other
+                ),
+            ..
+        } | TransportFailure::StreamFailed(_)
+            | TransportFailure::Other(_)
+    )
+}
 
-    ConnectErrorDisposition::Other
+/// Returns whether a failed Manager exchange calls for a health-check-only wait.
+pub(crate) fn needs_health_check(error: &anyhow::Error) -> bool {
+    if let Some(error) = error.downcast_ref::<SessionError>() {
+        return retryable_session_error(error);
+    }
+    match error.downcast_ref::<AgentRunError>() {
+        Some(AgentRunError::Session(error) | AgentRunError::ResponseWrite(error)) => {
+            retryable_session_error(error)
+        }
+        _ => false,
+    }
+}
+
+fn classify_connect_error(error: &anyhow::Error) -> ConnectErrorDisposition {
+    if error.downcast_ref::<ClientPemError>().is_some() {
+        ConnectErrorDisposition::InvalidPeerCertificate
+    } else if needs_health_check(error) {
+        ConnectErrorDisposition::Retry
+    } else {
+        ConnectErrorDisposition::Other
+    }
 }
 
 /// Shared storage for the active manager/control connection.
 ///
 /// The connection lives behind an `Arc<Mutex<...>>` so that cloning a
 /// [`Client`] (for example, to pass into a spawned task) preserves
-/// access to the same underlying `review_protocol::client::Connection`.
+/// access to the same underlying session.
 /// That way the connection survives the common `run()` shutdown ->
 /// respawn cycle triggered by SIGHUP: the spawned task exits, but the
 /// retained handle in `main` keeps the connection alive so the next
@@ -117,8 +146,16 @@ type SharedConnection = Arc<Mutex<ConnectionSlot>>;
 /// reconnect from a reuse of the same connection.
 #[derive(Default)]
 struct ConnectionSlot {
-    connection: Option<Connection>,
+    connection: Option<ManagerConnection>,
     id: u64,
+}
+
+/// Keeps the request handle paired with its connection's unique incoming owner.
+/// The mutex preserves that owner across cancellation and run-task respawns.
+#[derive(Clone)]
+struct ManagerConnection {
+    handle: AgentHandle,
+    incoming: Arc<Mutex<AgentIncoming>>,
 }
 
 #[derive(Clone)]
@@ -162,7 +199,7 @@ impl Client {
     ///
     /// Returns whether the list was applied. A failed pull changes nothing, so
     /// every policy and checkpoint is kept.
-    async fn sync_time_series_generation_policies(&mut self, connection: &Connection) -> bool {
+    async fn sync_time_series_generation_policies(&mut self, connection: &AgentHandle) -> bool {
         match connection.get_time_series_generation_policy_list().await {
             Ok(policies) => {
                 info!(
@@ -192,13 +229,15 @@ impl Client {
             match self.connect_with_id().await {
                 Ok((connection, id)) => {
                     if synced != Some(id)
-                        && self.sync_time_series_generation_policies(&connection).await
+                        && self
+                            .sync_time_series_generation_policies(&connection.handle)
+                            .await
                     {
                         synced = Some(id);
                     }
-                    match connection.accept_bi().await {
-                        Ok((mut send, mut recv)) => {
-                            review_protocol::request::handle(self, &mut send, &mut recv).await?;
+                    match connection.incoming.lock().await.accept().await {
+                        Ok(stream) => {
+                            stream.run(self, |_| Ok(())).await?;
                         }
                         Err(e) => {
                             warn!("Failed to accept bidirectional stream: {:?}, retrying", e);
@@ -227,50 +266,68 @@ impl Client {
         }
     }
 
-    async fn connect(&self) -> Result<Connection> {
+    async fn connect(&self) -> Result<AgentHandle> {
         self.connect_with_id()
             .await
-            .map(|(connection, _)| connection)
+            .map(|(connection, _)| connection.handle)
     }
 
     /// Returns the live connection, establishing one if needed, with its ID.
-    async fn connect_with_id(&self) -> Result<(Connection, u64)> {
+    async fn connect_with_id(&self) -> Result<(ManagerConnection, u64)> {
         // Fast path: if a live connection is already installed, return a
         // clone without holding the mutex across an async boundary.
         {
             let guard = self.connection.lock().await;
             if let Some(conn) = guard.connection.as_ref()
-                && conn.close_reason().is_none()
+                && conn.handle.close_reason().is_none()
             {
                 return Ok((conn.clone(), guard.id));
             }
         }
 
-        // Snapshot the shared TLS bytes so each reconnect attempt builds a
-        // `ConnectionBuilder` from the current material, picking up any
-        // rotation that landed since the previous attempt. The mutex is
-        // intentionally not held across this await: a rare duplicate
-        // reconnect during a race is preferable to using the shared
-        // connection mutex as the async connect guard.
+        // Each attempt uses a fresh snapshot, so rotation affects the next
+        // reconnect while leaving the installed session alive.
         let tls = self.tls_bytes.snapshot();
-        let mut conn_builder = ConnectionBuilder::new(
-            &self.server_name,
-            self.server_address,
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-            REQUIRED_MANAGER_VERSION,
-            self.status,
-            &tls.cert,
-            &tls.key,
+        let roots = tls.ca_certs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let tls = client_config_from_pem(&tls.cert, &tls.key, &roots)?;
+        let address = SocketAddr::new(
+            match self.server_address.ip() {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            },
+            0,
+        );
+        let connector = AgentConnector::bind(
+            address,
+            tls,
+            AgentTransportOptions::default(),
+            SessionOptions::legacy_compatible(),
         )?;
-        conn_builder.root_certs(&tls.ca_certs)?;
-        let new_conn = conn_builder.connect().await?;
+        let agent = AgentInfo {
+            agent_name: env!("CARGO_PKG_NAME").to_string(),
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: review_protocol::PROTOCOL_VERSION.to_string(),
+            status: self.status,
+            addr: address,
+            capabilities: BTreeSet::new(),
+            active_trust_epoch: None,
+            manifest_formats: None,
+            provisioning_fingerprint: None,
+            audit_health: None,
+        };
+        let (handle, incoming) = connector
+            .connect(self.server_address, &self.server_name, &agent)
+            .await?;
+        let new_conn = ManagerConnection {
+            handle,
+            incoming: Arc::new(Mutex::new(incoming)),
+        };
 
         // Reacquire the lock and install the new connection only if
         // another caller has not already installed a live one.
         let mut guard = self.connection.lock().await;
         if let Some(existing) = guard.connection.as_ref()
-            && existing.close_reason().is_none()
+            && existing.handle.close_reason().is_none()
         {
             return Ok((existing.clone(), guard.id));
         }
@@ -378,15 +435,15 @@ impl Client {
     }
 
     async fn try_connect(&mut self, health_check: bool) -> Result<()> {
-        let connection = self.connect().await?;
+        let (connection, _) = self.connect_with_id().await?;
         if health_check {
             return Ok(());
         }
-        let (mut send, mut recv) = connection.accept_bi().await?;
+        let stream = connection.incoming.lock().await.accept().await?;
         let mut idle_mode_handler = IdleModeHandler {
             config_reload: self.config_reload.clone(),
         };
-        review_protocol::request::handle(&mut idle_mode_handler, &mut send, &mut recv).await?;
+        stream.run(&mut idle_mode_handler, |_| Ok(())).await?;
         Ok(())
     }
 }
@@ -462,8 +519,8 @@ mod tests {
     };
     use std::time::Duration;
 
-    use quinn::{Endpoint, ServerConfig, crypto::rustls::QuicServerConfig};
     use review_protocol::request::Handler;
+    use review_protocol::session::{ApplicationCode, ServerHandle, ServerStream};
     use review_protocol::types::{
         CounterpartScope, GroupByUnit, HostNetworkGroup, Measure, RawEventKind,
         TimeSeriesGenerationPolicy,
@@ -474,6 +531,7 @@ mod tests {
     use crate::cancellation::CancellationCoordinator;
     use crate::client::{Certs, TlsBytes};
     use crate::policy::PolicyHandle;
+    use crate::test_manager;
 
     const CERT_PATH: &str = "tests/cert.pem";
     const KEY_PATH: &str = "tests/key.pem";
@@ -532,7 +590,7 @@ mod tests {
         (cert_pem, key_pem, ca_certs_pem, certs)
     }
 
-    fn create_test_server_config(certs: &Certs) -> ServerConfig {
+    fn create_test_server_config(certs: &Certs) -> Arc<rustls::ServerConfig> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let client_auth = WebPkiClientVerifier::builder_with_provider(
             Arc::new(certs.ca_certs.clone()),
@@ -548,9 +606,7 @@ mod tests {
             .with_single_cert(certs.certs.clone(), certs.key.clone_key())
             .expect("build server tls config");
 
-        ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(server_crypto).expect("build quic server config"),
-        ))
+        Arc::new(server_crypto)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1091,78 +1147,221 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handle_incoming_returns_invalid_peer_certificate_error() {
+    async fn handle_incoming_retries_server_name_mismatch() {
         let (cert_pem, key_pem, ca_certs_pem, certs) = load_test_certs();
-        let server_endpoint = Endpoint::server(
+        let listener = test_manager::listener(
             create_test_server_config(&certs),
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-        )
-        .expect("create server endpoint");
-        let server_addr = server_endpoint.local_addr().expect("read server address");
-        let _server_task = tokio::spawn(async move {
-            while let Some(conn) = server_endpoint.accept().await {
-                tokio::spawn(async move {
-                    let _ = conn.await;
-                });
+            "[::1]:0".parse().unwrap(),
+        );
+        let server_addr = listener.local_addr().unwrap();
+        let (failed_send, failed_recv) = async_channel::unbounded();
+        let server_task = tokio::spawn(async move {
+            while let Some(pending) = listener.accept().await.unwrap() {
+                assert!(pending.handshake().await.is_err());
+                failed_send.send(()).await.unwrap();
             }
         });
-
-        let tls_bytes = SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem));
         let mut client = Client::new(
             server_addr,
             "mismatched-server-name".to_string(),
-            tls_bytes,
+            SharedTlsBytes::new(TlsBytes::new(cert_pem, key_pem, ca_certs_pem)),
             Arc::new(Notify::new()),
         );
+        let Err(error) = client.connect().await else {
+            panic!("server name must fail verification");
+        };
+        assert_eq!(
+            classify_connect_error(&error),
+            ConnectErrorDisposition::Retry
+        );
+        failed_recv.recv().await.unwrap();
+        let incoming = tokio::spawn(async move { client.handle_incoming().await });
+        tokio::time::timeout(Duration::from_secs(SERVER_RETRY_INTERVAL + 5), async {
+            failed_recv.recv().await.unwrap();
+            failed_recv.recv().await.unwrap();
+        })
+        .await
+        .expect("server-name mismatch is retried on the next interval");
+        assert!(!incoming.is_finished());
+        incoming.abort();
+        let _ = incoming.await;
+        server_task.abort();
+        let _ = server_task.await;
+    }
 
-        let result = tokio::time::timeout(Duration::from_secs(3), client.handle_incoming())
-            .await
-            .expect("No timeout");
-        let err = result.expect_err("Expected certificate validation error");
-        assert_eq!(err.to_string(), "Invalid peer certificate contents");
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_incoming_returns_invalid_peer_certificate_error() {
+        let (cert, key, roots, _) = load_test_certs();
+        let mut client =
+            session_test_client("127.0.0.1:0".parse().unwrap(), Arc::new(Notify::new()));
+        for bytes in [
+            TlsBytes::new(Vec::new(), key.clone(), roots.clone()),
+            TlsBytes::new(cert.clone(), Vec::new(), roots),
+            TlsBytes::new(cert, key, Vec::new()),
+        ] {
+            client.tls_bytes.replace(bytes);
+            let error = client
+                .handle_incoming()
+                .await
+                .expect_err("unusable PEM is terminal");
+            assert_eq!(error.to_string(), "Invalid peer certificate contents");
+        }
     }
 
     #[test]
-    fn classify_connect_error_marks_invalid_data_as_peer_certificate_error() {
-        let err = anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid peer cert",
-        ));
+    fn classify_connect_error_marks_client_pem_error_as_invalid_certificate() {
+        let error = anyhow::Error::new(ClientPemError::NoCertificate);
         assert_eq!(
-            classify_connect_error(&err),
+            classify_connect_error(&error),
             ConnectErrorDisposition::InvalidPeerCertificate
         );
     }
 
+    fn transport_error(reason: CloseReason) -> SessionError {
+        SessionError::Transport {
+            certainty: review_protocol::session::OutcomeCertainty::Unknown,
+            source: TransportFailure::Closed {
+                reason,
+                source: Box::new(std::io::Error::other("test close")),
+            },
+        }
+    }
+
     #[test]
-    fn classify_connect_error_marks_connection_reset_as_retryable() {
-        let err = anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "connection reset",
-        ));
-        assert_eq!(classify_connect_error(&err), ConnectErrorDisposition::Retry);
+    fn classify_connect_error_and_health_check_transport_dispositions() {
+        for (reason, retry) in [
+            (
+                CloseReason::Application {
+                    code: ApplicationCode::default(),
+                    reason: Vec::new(),
+                },
+                true,
+            ),
+            (
+                CloseReason::Transport(TransportCloseKind::Crypto { alert: Some(42) }),
+                true,
+            ),
+            (
+                CloseReason::Transport(TransportCloseKind::IdleTimeout),
+                true,
+            ),
+            (CloseReason::Transport(TransportCloseKind::Reset), true),
+            (CloseReason::Transport(TransportCloseKind::Other), true),
+            (CloseReason::Local, false),
+            (
+                CloseReason::Transport(TransportCloseKind::VersionMismatch),
+                false,
+            ),
+            (
+                CloseReason::Transport(TransportCloseKind::ConnectionIdExhausted),
+                false,
+            ),
+        ] {
+            for wrapped in 0..3 {
+                let error = transport_error(reason.clone());
+                let error = match wrapped {
+                    0 => anyhow::Error::new(error),
+                    1 => anyhow::Error::new(AgentRunError::Session(error)),
+                    _ => anyhow::Error::new(AgentRunError::ResponseWrite(error)),
+                }
+                .context("outer context");
+                assert_eq!(
+                    needs_health_check(&error),
+                    retry,
+                    "{reason:?}, wrapper {wrapped}"
+                );
+                assert_eq!(
+                    classify_connect_error(&error),
+                    if retry {
+                        ConnectErrorDisposition::Retry
+                    } else {
+                        ConnectErrorDisposition::Other
+                    }
+                );
+            }
+        }
+        for source in [
+            TransportFailure::StreamFailed(Box::new(std::io::Error::other("stream"))),
+            TransportFailure::Other(Box::new(std::io::Error::other("connect"))),
+        ] {
+            let error = anyhow::Error::new(SessionError::Transport {
+                certainty: review_protocol::session::OutcomeCertainty::NotSent,
+                source,
+            });
+            assert_eq!(
+                classify_connect_error(&error),
+                ConnectErrorDisposition::Retry
+            );
+            assert!(needs_health_check(&error));
+        }
+    }
+
+    #[test]
+    fn non_transport_session_errors_are_terminal_and_only_remote_rejection_is_a_wait() {
+        use review_protocol::session::{FrameError, OutcomeCertainty};
+        for error in [
+            SessionError::StreamStopped {
+                code: ApplicationCode::default(),
+            },
+            SessionError::Malformed {
+                certainty: None,
+                source: Box::new(std::io::Error::other("bad data")),
+            },
+            SessionError::IncompatibleProtocol {
+                version: review_protocol::PROTOCOL_VERSION.to_string(),
+                required: "<0.54.0".to_string(),
+            },
+            SessionError::RemoteRejection("unregistered".to_string()),
+            SessionError::LimitExceeded {
+                certainty: None,
+                source: FrameError::InvalidLimit,
+            },
+            SessionError::Deadline {
+                certainty: OutcomeCertainty::NotSent,
+                source: None,
+            },
+        ] {
+            assert!(!retryable_session_error(&error));
+            let unavailable = matches!(error, SessionError::RemoteRejection(_));
+            let error = anyhow::Error::new(error).context("connect failed");
+            assert_eq!(
+                classify_connect_error(&error),
+                ConnectErrorDisposition::Other
+            );
+            assert!(!needs_health_check(&error));
+            let error = error.downcast::<SessionError>().unwrap();
+            assert_eq!(
+                classify_config_error(error)
+                    .downcast_ref::<ConfigUnavailable>()
+                    .is_some(),
+                unavailable
+            );
+        }
+        let error = anyhow::Error::new(AgentRunError::AuthorizationDenied {
+            service: review_protocol::service_id::SERVER_CONFIG_GET,
+            source: review_protocol::auth::AuthorizationError::new("denied"),
+        });
+        assert!(!needs_health_check(&error));
     }
 
     #[test]
     fn classify_config_error_marks_only_the_managers_reason_as_a_wait() {
-        let refused = classify_config_error(std::io::Error::other("001.crusher unregistered"));
+        let refused = classify_config_error(SessionError::RemoteRejection(
+            "001.crusher unregistered".to_string(),
+        ));
         let reason = refused
             .downcast_ref::<ConfigUnavailable>()
             .expect("the Manager's reason is a wait");
         assert_eq!(reason.to_string(), "001.crusher unregistered");
-
-        // quinn reports these lost connections as `ErrorKind::Other` too.
-        for lost in [
-            quinn::ConnectionError::LocallyClosed,
-            quinn::ConnectionError::CidsExhausted,
+        for reason in [
+            CloseReason::Local,
+            CloseReason::Transport(TransportCloseKind::ConnectionIdExhausted),
+            CloseReason::Transport(TransportCloseKind::Reset),
         ] {
-            let error = classify_config_error(lost.into());
+            let error = classify_config_error(transport_error(reason));
             assert!(error.downcast_ref::<ConfigUnavailable>().is_none());
-            assert!(error.downcast_ref::<std::io::Error>().is_some());
+            assert!(error.downcast_ref::<SessionError>().is_some());
         }
-
-        let reset = classify_config_error(std::io::ErrorKind::ConnectionReset.into());
-        assert!(reset.downcast_ref::<ConfigUnavailable>().is_none());
     }
 
     // =========================================================================
@@ -1239,31 +1438,19 @@ log_path = "/tmp/crusher.log"
     /// answers requests with `TestManagerHandler`. Returns the server address
     /// and a handle to the driver task.
     fn spawn_test_manager_server(certs: &Certs) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let server_endpoint = Endpoint::server(
+        let server_endpoint = test_manager::listener(
             create_test_server_config(certs),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-        )
-        .expect("create server endpoint");
+        );
         let server_addr = server_endpoint.local_addr().expect("read server address");
 
         let server_task = tokio::spawn(async move {
-            if let Some(conn) = server_endpoint.accept().await {
-                let connection = conn.await.expect("accept connection");
-                let addr = connection.remote_address();
-                let _agent_info = review_protocol::server::handshake(
-                    &connection,
-                    addr,
-                    ">=0",
-                    REQUIRED_MANAGER_VERSION,
-                )
-                .await
-                .expect("handshake");
-
-                let mut handler = TestManagerHandler;
-                while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-                    review_protocol::server::handle(&mut handler, &mut send, &mut recv, "test")
-                        .await
-                        .ok();
+            if let Ok(Some(conn)) = server_endpoint.accept().await {
+                let (_connection, mut incoming) =
+                    test_manager::accept(conn).await.expect("handshake");
+                let handler = Arc::new(TestManagerHandler);
+                while let Ok(ServerStream::Requests(stream)) = incoming.accept().await {
+                    let _ = stream.run(handler.clone()).await;
                 }
             }
         });
@@ -1391,7 +1578,8 @@ log_path = "/tmp/crusher.log"
     struct ScriptedManager {
         addr: SocketAddr,
         pulls: Arc<AtomicUsize>,
-        latest_conn: Arc<std::sync::Mutex<Option<quinn::Connection>>>,
+        latest_conn: Arc<std::sync::Mutex<Option<ServerHandle>>>,
+        connected: async_channel::Receiver<ServerHandle>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -1400,50 +1588,39 @@ log_path = "/tmp/crusher.log"
             certs: &Certs,
             responses: Vec<Result<Vec<TimeSeriesGenerationPolicy>, String>>,
         ) -> Self {
-            let server_endpoint = Endpoint::server(
+            let server_endpoint = test_manager::listener(
                 create_test_server_config(certs),
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-            )
-            .expect("create server endpoint");
+            );
             let addr = server_endpoint.local_addr().expect("read server address");
             let handler = ScriptedPullHandler {
                 responses: Arc::new(std::sync::Mutex::new(responses.into())),
                 pulls: Arc::new(AtomicUsize::new(0)),
             };
             let pulls = handler.pulls.clone();
-            let latest_conn: Arc<std::sync::Mutex<Option<quinn::Connection>>> =
+            let latest_conn: Arc<std::sync::Mutex<Option<ServerHandle>>> =
                 Arc::new(std::sync::Mutex::new(None));
             let latest_conn_for_task = latest_conn.clone();
+            let (connected_send, connected) = async_channel::unbounded();
             let handle = tokio::spawn(async move {
-                while let Some(conn) = server_endpoint.accept().await {
-                    let mut handler = handler.clone();
+                let mut connections = tokio::task::JoinSet::new();
+                while let Ok(Some(conn)) = server_endpoint.accept().await {
+                    let handler = handler.clone();
                     let latest_conn = latest_conn_for_task.clone();
-                    tokio::spawn(async move {
-                        let Ok(connection) = conn.await else {
+                    let connected_send = connected_send.clone();
+                    connections.spawn(async move {
+                        let Ok((connection, mut incoming)) = test_manager::accept(conn).await
+                        else {
                             return;
                         };
-                        let addr = connection.remote_address();
-                        if review_protocol::server::handshake(
-                            &connection,
-                            addr,
-                            ">=0",
-                            REQUIRED_MANAGER_VERSION,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
-                        }
                         *latest_conn.lock().expect("latest_conn lock") = Some(connection.clone());
-                        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-                            review_protocol::server::handle(
-                                &mut handler,
-                                &mut send,
-                                &mut recv,
-                                "test",
-                            )
+                        connected_send
+                            .send(connection)
                             .await
-                            .ok();
+                            .expect("connection receiver retained");
+                        let handler = Arc::new(handler);
+                        while let Ok(ServerStream::Requests(stream)) = incoming.accept().await {
+                            let _ = stream.run(handler.clone()).await;
                         }
                     });
                 }
@@ -1452,11 +1629,12 @@ log_path = "/tmp/crusher.log"
                 addr,
                 pulls,
                 latest_conn,
+                connected,
                 handle,
             }
         }
 
-        fn connection(&self) -> quinn::Connection {
+        fn connection(&self) -> ServerHandle {
             self.latest_conn
                 .lock()
                 .expect("latest_conn lock")
@@ -1465,10 +1643,307 @@ log_path = "/tmp/crusher.log"
         }
 
         async fn push(&self, policies: &[TimeSeriesGenerationPolicy]) {
-            review_protocol::server::Connection::from_quinn(self.connection())
+            self.connection()
                 .send_time_series_generation_policies(policies)
                 .await
                 .expect("push time-series generation policies");
+        }
+    }
+
+    fn session_test_client(address: SocketAddr, config_reload: Arc<Notify>) -> Client {
+        let (cert, key, roots, _) = load_test_certs();
+        Client::new(
+            address,
+            "localhost".to_string(),
+            SharedTlsBytes::new(TlsBytes::new(cert, key, roots)),
+            config_reload,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_uses_the_managers_address_family() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let (_, _, _, certs) = load_test_certs();
+            let listener =
+                test_manager::listener(create_test_server_config(&certs), address.parse().unwrap());
+            let address = listener.local_addr().unwrap();
+            let client = session_test_client(address, Arc::new(Notify::new()));
+            let (agent, server) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(client.connect(), async {
+                    let pending = listener.accept().await.unwrap().unwrap();
+                    test_manager::accept(pending).await.unwrap()
+                })
+            })
+            .await
+            .expect("connect using the Manager's address family");
+            let agent = agent.unwrap();
+            assert!(agent.close_reason().is_none());
+            let review_protocol::session::HandshakeMetadata::Agent(info) = server.0.metadata()
+            else {
+                panic!("agent handshake metadata");
+            };
+            // The server replaces the advertised placeholder with the peer address.
+            assert_eq!(info.addr.ip(), address.ip());
+            assert_ne!(info.addr.port(), 0);
+            assert_eq!(info.status, Status::Ready);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_incoming_terminates_when_manager_refuses_protocol() {
+        use review_protocol::session::{
+            ProtocolWindow, ServerListener, ServerListenerOptions, ServerTransportOptions,
+        };
+
+        let (_, _, _, certs) = load_test_certs();
+        let listener = ServerListener::bind(
+            "[::1]:0".parse().unwrap(),
+            create_test_server_config(&certs),
+            ServerListenerOptions {
+                transport: ServerTransportOptions::default(),
+                session: SessionOptions::legacy_compatible(),
+                protocol: ProtocolWindow::new(">=0", "0.49.0").unwrap(),
+                handshake_timeout: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        let mut client =
+            session_test_client(listener.local_addr().unwrap(), Arc::new(Notify::new()));
+        let (error, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client.handle_incoming(), async {
+                let pending = listener.accept().await.unwrap().unwrap();
+                assert!(matches!(
+                    pending.handshake().await,
+                    Err(SessionError::IncompatibleProtocol { .. })
+                ));
+            })
+        })
+        .await
+        .expect("protocol refusal is terminal");
+        let error = error.unwrap_err();
+        assert!(error.to_string().contains("is incompatible with"));
+    }
+
+    fn assert_not_supported<T: std::fmt::Debug>(result: &Result<T, SessionError>) {
+        assert!(
+            matches!(result, Err(SessionError::RemoteRejection(reason)) if reason == "not supported"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_session_serves_commands_and_rejects_node_requests() {
+        use review_protocol::types::node::{NodeObservationRequest, NodePowerRequest};
+        let (_, _, _, certs) = load_test_certs();
+        let manager = ScriptedManager::spawn(&certs, vec![Ok(vec![create_test_policy(1)])]);
+        let config_reload = Arc::new(Notify::new());
+        let mut client = session_test_client(manager.addr, config_reload.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let coordinator = CancellationCoordinator::new();
+        let (policies, actor) =
+            crate::policy::spawn_policy_actor(dir.path().join("time_data.json"), &coordinator)
+                .await
+                .unwrap();
+        client.set_policy_handle(policies.clone());
+        let incoming = tokio::spawn(async move { client.handle_incoming().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let server = manager.connected.recv().await.unwrap();
+            assert!(matches!(server.metadata(), review_protocol::session::HandshakeMetadata::Agent(info) if info.status == Status::Ready));
+            server.send_config_update_cmd().await.unwrap();
+            config_reload.notified().await;
+            assert_eq!(manager.pulls.load(Ordering::SeqCst), 1);
+            assert_eq!(sorted_policy_ids(&policies), [1]);
+            server.send_time_series_generation_policies(&[create_test_policy(2)]).await.unwrap();
+            assert_eq!(sorted_policy_ids(&policies), [2]);
+            assert_not_supported(&server.node_power(NodePowerRequest::GracefulReboot).await);
+            assert_not_supported(&server.node_power(NodePowerRequest::GracefulShutdown).await);
+            assert_not_supported(&server.node_observation(NodeObservationRequest::ResourceUsage).await);
+            assert_not_supported(&server.node_observation(NodeObservationRequest::ProcessList).await);
+            assert_not_supported(&server.send_run_detector_once(1).await);
+        }).await.expect("Ready commands complete");
+        stop_incoming_handler(policies, incoming, actor).await;
+        manager.handle.abort();
+        let _ = manager.handle.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_respawn_serves_commands_on_the_retained_session() {
+        let (_, _, _, certs) = load_test_certs();
+        let manager = ScriptedManager::spawn(&certs, vec![Ok(Vec::new()), Ok(Vec::new())]);
+        let reload = Arc::new(Notify::new());
+        let mut client = session_test_client(manager.addr, reload.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let policy_coordinator = CancellationCoordinator::new();
+        let (policies, actor) = crate::policy::spawn_policy_actor(
+            dir.path().join("time_data.json"),
+            &policy_coordinator,
+        )
+        .await
+        .unwrap();
+        client.set_policy_handle(policies.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let first_coordinator = CancellationCoordinator::new();
+            let coordinator = first_coordinator.clone();
+            let mut running = client.clone();
+            let first_run = tokio::spawn(async move { running.run(coordinator).await });
+            let server = manager.connected.recv().await.unwrap();
+            let id = client.connect().await.unwrap().id();
+            server.send_config_update_cmd().await.unwrap();
+            reload.notified().await;
+            first_coordinator.request_cancellation("TLS reload");
+            first_run.await.unwrap().unwrap();
+            let second_coordinator = CancellationCoordinator::new();
+            let coordinator = second_coordinator.clone();
+            let mut running = client.clone();
+            let second_run = tokio::spawn(async move { running.run(coordinator).await });
+            server
+                .send_time_series_generation_policies(&[create_test_policy(7)])
+                .await
+                .unwrap();
+            assert_eq!(sorted_policy_ids(&policies), [7]);
+            assert_eq!(client.connect().await.unwrap().id(), id);
+            assert_eq!(manager.pulls.load(Ordering::SeqCst), 2);
+            assert!(manager.connected.is_empty(), "no second handshake");
+            second_coordinator.request_cancellation("test done");
+            second_run.await.unwrap().unwrap();
+        })
+        .await
+        .expect("respawn retains the handle and incoming owner");
+        drop(client);
+        drop(policies);
+        actor.await.unwrap().unwrap();
+        manager.handle.abort();
+        let _ = manager.handle.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_session_serves_one_stream_and_advertises_idle() {
+        let (_, _, _, certs) = load_test_certs();
+        let manager = ScriptedManager::spawn(&certs, Vec::new());
+        let config_reload = Arc::new(Notify::new());
+        let mut client = session_test_client(manager.addr, config_reload.clone());
+        client.status = Status::Idle;
+        let mut running = client.clone();
+        let incoming = tokio::spawn(async move { running.try_connect(false).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let server = manager.connected.recv().await.unwrap();
+            assert!(matches!(server.metadata(), review_protocol::session::HandshakeMetadata::Agent(info) if info.status == Status::Idle));
+            server.send_config_update_cmd().await.unwrap();
+            config_reload.notified().await;
+            incoming.await.unwrap().unwrap();
+            assert_eq!(manager.pulls.load(Ordering::SeqCst), 0);
+            // The one stream ended, and the session remains available for a rerun.
+            assert!(server.close_reason().is_none());
+        }).await.expect("Idle command stream ends");
+        manager.handle.abort();
+        let _ = manager.handle.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_session_rejects_policies_node_requests_and_other_commands() {
+        use review_protocol::types::node::{NodeObservationRequest, NodePowerRequest};
+
+        let (_, _, _, certs) = load_test_certs();
+        let manager = ScriptedManager::spawn(&certs, Vec::new());
+        let reload = Arc::new(Notify::new());
+        let mut client = session_test_client(manager.addr, reload.clone());
+        client.status = Status::Idle;
+        let handle = client.connect().await.unwrap();
+        let server = manager.connected.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Each typed operation opens one stream, and Idle returns at its end.
+            let policies = [create_test_policy(1)];
+            let (completed, response) = tokio::join!(
+                client.try_connect(false),
+                server.send_time_series_generation_policies(&policies)
+            );
+            completed.unwrap();
+            assert_not_supported(&response);
+            for request in [
+                NodePowerRequest::GracefulReboot,
+                NodePowerRequest::GracefulShutdown,
+            ] {
+                let (completed, response) =
+                    tokio::join!(client.try_connect(false), server.node_power(request));
+                completed.unwrap();
+                assert_not_supported(&response);
+            }
+            for request in [
+                NodeObservationRequest::ResourceUsage,
+                NodeObservationRequest::ProcessList,
+            ] {
+                let (completed, response) =
+                    tokio::join!(client.try_connect(false), server.node_observation(request));
+                completed.unwrap();
+                assert_not_supported(&response);
+            }
+            let (completed, response) =
+                tokio::join!(client.try_connect(false), server.send_run_detector_once(1));
+            completed.unwrap();
+            assert_not_supported(&response);
+            assert_eq!(manager.pulls.load(Ordering::SeqCst), 0);
+            assert!(handle.close_reason().is_none());
+            assert!(
+                tokio::time::timeout(Duration::ZERO, reload.notified())
+                    .await
+                    .is_err()
+            );
+        })
+        .await
+        .expect("Idle rejects unsupported commands on a reusable session");
+        manager.handle.abort();
+        let _ = manager.handle.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_config_distinguishes_manager_rejection_from_connection_loss() {
+        use review_protocol::session::ServerRequest;
+        for lose_connection in [false, true] {
+            let (_, _, _, certs) = load_test_certs();
+            let listener = test_manager::listener(
+                create_test_server_config(&certs),
+                "127.0.0.1:0".parse().unwrap(),
+            );
+            let address = listener.local_addr().unwrap();
+            let server_task = tokio::spawn(async move {
+                let pending = listener.accept().await.unwrap().unwrap();
+                let (server, mut incoming) = test_manager::accept(pending).await.unwrap();
+                let ServerStream::Requests(mut stream) = incoming.accept().await.unwrap() else {
+                    panic!("configuration request stream");
+                };
+                let Some(ServerRequest::GetConfig { reply, .. }) = stream.next().await.unwrap()
+                else {
+                    panic!("get_config request");
+                };
+                if lose_connection {
+                    server.close(ApplicationCode::default(), b"lost during get_config");
+                    drop(reply);
+                } else {
+                    reply
+                        .respond(Err("001.crusher unregistered".to_string()))
+                        .await
+                        .unwrap();
+                    stream.finish().unwrap();
+                    server.closed().await;
+                }
+            });
+            let mut client = session_test_client(address, Arc::new(Notify::new()));
+            let error = tokio::time::timeout(Duration::from_secs(5), client.get_config())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ConfigUnavailable>().is_none(),
+                lose_connection
+            );
+            if lose_connection {
+                assert!(error.downcast_ref::<SessionError>().is_some());
+                assert!(needs_health_check(&error));
+            } else {
+                assert_eq!(error.to_string(), "001.crusher unregistered");
+            }
+            server_task.abort();
+            let _ = server_task.await;
         }
     }
 
@@ -1561,7 +2036,9 @@ log_path = "/tmp/crusher.log"
 
         // A change made while disconnected reaches Crusher through the pull
         // on the next connection.
-        manager.connection().close(0u32.into(), b"manager restart");
+        manager
+            .connection()
+            .close(ApplicationCode::default(), b"manager restart");
         wait_until("the new connection is pulled", || {
             sorted_policy_ids(&policy_handle) == [30]
         })
@@ -1638,38 +2115,26 @@ log_path = "/tmp/crusher.log"
     fn spawn_handshake_only_server(
         certs: &Certs,
     ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-        let server_endpoint = Endpoint::server(
+        let server_endpoint = test_manager::listener(
             create_test_server_config(certs),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-        )
-        .expect("create server endpoint");
+        );
         let server_addr = server_endpoint.local_addr().expect("read server address");
         let handshake_count = Arc::new(AtomicUsize::new(0));
         let counter = handshake_count.clone();
         let handle = tokio::spawn(async move {
-            while let Some(conn) = server_endpoint.accept().await {
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok(Some(conn)) = server_endpoint.accept().await {
                 let counter = counter.clone();
-                tokio::spawn(async move {
-                    let Ok(connection) = conn.await else {
+                connections.spawn(async move {
+                    let Ok((_connection, mut incoming)) = test_manager::accept(conn).await else {
                         return;
                     };
-                    let addr = connection.remote_address();
-                    if review_protocol::server::handshake(
-                        &connection,
-                        addr,
-                        ">=0",
-                        REQUIRED_MANAGER_VERSION,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
                     counter.fetch_add(1, Ordering::SeqCst);
                     // Keep the connection open; we only care that the
                     // handshake completed, so that the client side has
                     // observed the presented client certificate.
-                    while connection.accept_bi().await.is_ok() {}
+                    while incoming.accept().await.is_ok() {}
                 });
             }
         });
@@ -1713,7 +2178,7 @@ log_path = "/tmp/crusher.log"
         let connected = tokio::time::timeout(Duration::from_secs(5), client.connect())
             .await
             .expect("connect returns within timeout")
-            .expect("rotated bytes must produce a valid ConnectionBuilder");
+            .expect("rotated bytes must produce a valid session");
         assert!(
             connected.close_reason().is_none(),
             "rebuilt connection must be alive"
@@ -1808,7 +2273,7 @@ log_path = "/tmp/crusher.log"
         addr: SocketAddr,
         peer_certs: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         handshake_count: Arc<AtomicUsize>,
-        latest_conn: Arc<std::sync::Mutex<Option<quinn::Connection>>>,
+        latest_conn: Arc<std::sync::Mutex<Option<ServerHandle>>>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -1872,60 +2337,43 @@ log_path = "/tmp/crusher.log"
     /// post-reload reconnect actually sends the rotated client cert on
     /// the wire rather than merely producing another valid handshake.
     ///
-    /// The returned `latest_conn` handle lets the test close the most
-    /// recently accepted session from the server side, which is the only
-    /// way to trigger a reconnect on the client without relying on a
-    /// client-side `close()` API that `review_protocol::client::Connection`
-    /// does not expose.
+    /// The returned `latest_conn` handle lets the test trigger a reconnect
+    /// by closing the most recently accepted session from the server side.
     fn spawn_server_tracking_peer_certs(certs: &Certs) -> PeerCertTrackingServer {
-        let server_endpoint = Endpoint::server(
+        let server_endpoint = test_manager::listener(
             create_test_server_config(certs),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-        )
-        .expect("create server endpoint");
+        );
         let server_addr = server_endpoint.local_addr().expect("read server address");
         let peer_certs: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let handshake_count = Arc::new(AtomicUsize::new(0));
-        let latest_conn: Arc<std::sync::Mutex<Option<quinn::Connection>>> =
+        let latest_conn: Arc<std::sync::Mutex<Option<ServerHandle>>> =
             Arc::new(std::sync::Mutex::new(None));
         let peer_certs_for_task = peer_certs.clone();
         let handshake_count_for_task = handshake_count.clone();
         let latest_conn_for_task = latest_conn.clone();
         let handle = tokio::spawn(async move {
-            while let Some(conn) = server_endpoint.accept().await {
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok(Some(conn)) = server_endpoint.accept().await {
                 let peer_certs = peer_certs_for_task.clone();
                 let handshake_count = handshake_count_for_task.clone();
                 let latest_conn = latest_conn_for_task.clone();
-                tokio::spawn(async move {
-                    let Ok(connection) = conn.await else {
+                connections.spawn(async move {
+                    let Ok((connection, mut incoming)) = test_manager::accept(conn).await else {
                         return;
                     };
-                    if let Some(identity) = connection.peer_identity()
-                        && let Ok(chain) =
-                            identity.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-                        && let Some(leaf) = chain.first()
+                    if let Some(chain) = connection.peer_certificates()
+                        && let Some(leaf) = chain.chain().first()
                     {
                         peer_certs
                             .lock()
                             .expect("peer_certs lock")
-                            .push(leaf.as_ref().to_vec());
-                    }
-                    let addr = connection.remote_address();
-                    if review_protocol::server::handshake(
-                        &connection,
-                        addr,
-                        ">=0",
-                        REQUIRED_MANAGER_VERSION,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
+                            .push(leaf.clone());
                     }
                     handshake_count.fetch_add(1, Ordering::SeqCst);
                     *latest_conn.lock().expect("latest_conn lock") = Some(connection.clone());
-                    while connection.accept_bi().await.is_ok() {}
+                    while incoming.accept().await.is_ok() {}
                 });
             }
         });
@@ -1997,7 +2445,7 @@ log_path = "/tmp/crusher.log"
             .expect("latest_conn lock")
             .as_ref()
             .expect("server has a live connection")
-            .close(0u32.into(), b"rotate");
+            .close(ApplicationCode::default(), b"rotate");
 
         // Wait for the close frame to propagate.
         for _ in 0..50 {
@@ -2042,8 +2490,7 @@ log_path = "/tmp/crusher.log"
     /// Exercises the real SIGHUP reload handoff: `main.rs` notifies
     /// `shutdown` on `tls_reload`, which drives `request_client.run()`
     /// to exit. With the shared connection storage, dropping the
-    /// spawned task must NOT drop the underlying
-    /// `review_protocol::client::Connection`, because the outer `main`
+    /// spawned task must NOT drop the underlying session, because the outer `main`
     /// scope (modeled here by the retained `client` handle) keeps a
     /// clone of the shared `Arc`. The next reconnect attempt must
     /// observe the existing session rather than reopening a new one,

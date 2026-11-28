@@ -251,6 +251,14 @@ pub(crate) fn stream_record(kind: PolicyRawEventKind) -> Result<RequestStreamRec
         | PolicyRawEventKind::FileCreateTime
         | PolicyRawEventKind::NetworkConnect
         | PolicyRawEventKind::ProcessTerminate
+        | PolicyRawEventKind::DriverLoad
+        | PolicyRawEventKind::CreateRemoteThread
+        | PolicyRawEventKind::RawAccessRead
+        | PolicyRawEventKind::ProcessAccess
+        | PolicyRawEventKind::RegistryObjectAddDel
+        | PolicyRawEventKind::WindowsEventLog
+        | PolicyRawEventKind::Journald
+        | PolicyRawEventKind::Auditd
         | PolicyRawEventKind::ImageLoad
         | PolicyRawEventKind::FileCreate
         | PolicyRawEventKind::RegistryValueSet

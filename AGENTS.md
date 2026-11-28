@@ -553,9 +553,9 @@ Where the crate handles key material or secrets:
     `subscribe::Client::new` in `src/subscribe.rs` creates, which
     `ingest_connect` and `publish_connect` connect through with the
     configured server name.
-  - Central Manager: `connect_with_id` in `src/request.rs` passes the CA
-    bundles to review-protocol's `ConnectionBuilder` through `root_certs`,
-    and review-protocol builds the same kind of configuration.
+  - Central Manager: `connect_with_id` in `src/request.rs` calls
+    review-protocol's `client_config_from_pem` to build the client
+    configuration over the configured CA bundles.
 - `load_tls_material_with_bytes` in `src/main.rs` calls `client_config` only
   to reject TLS material that cannot form a client configuration, such as a
   key that does not match its certificate. It verifies no certificate.
